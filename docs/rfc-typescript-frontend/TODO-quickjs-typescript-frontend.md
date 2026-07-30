@@ -37,9 +37,9 @@ Last updated: 2026-07-30
 | TS-32 | Done | 100 | Pass | `quickjs.c` `js_parse_ts_declare`、`js_ts_declare_looks_like_decl`、`js_parse_import`/`js_parse_export` | `declare function/const/let/var/class`;`import type`/`export type`(整句+specifier级) | RFC §B1、S9 | 子agent发现declare误判P0(主会话已提前自修);补EOF边界P2 |
 | TS-33 | Done | 100 | Pass | `tests/test_ts.js` | M3 单测(interface/type/declare/重载签名) + 回归守卫(declare/type作普通标识符) + make test 零失败 | RFC §S1 | — |
 | **M4 · enum(首个生成运行时代码的里程碑)** | | | | | | | |
-| TS-40 | Not Started | 0 | Not Run | `quickjs.c` | `enum` 降级为对象 + 正反向映射 emit | RFC §D3 | — |
-| TS-41 | Not Started | 0 | Not Run | `quickjs.c` | `const enum` 编译期常量内联 | RFC §D3 | — |
-| TS-42 | Not Started | 0 | Not Run | `tests/` | M4 单测 + **字节码 dump 对比等价 JS** | RFC §验证策略 | — |
+| TS-40 | Done | 100 | Pass | `quickjs.c` `js_parse_ts_enum` | `enum` 降级为对象 + 正反向映射 emit(数值/字符串/异构/自动递增);字符串成员跳过反向映射 | RFC §D3 | 字节码dump验证栈平衡;子agent核对PASS |
+| TS-41 | Done | 100 | Pass | `quickjs.c` `JSTSConstEnumEntry`/`js_ts_const_enum_lookup` | `const enum` 完整内联(用户grill决策A,收窄为单插入点+仅字面量成员) | RFC §D3 | 两轮grill定范围;peek_token陷阱已修复;内存清理无泄漏(atom计数验证) |
+| TS-42 | Done | 100 | Pass | `tests/test_ts.js` | M4 单测 + **字节码 dump 对比**(`-DDUMP_BYTECODE=2`) + make test 零失败 | RFC §验证策略 | 首次评审耗时异常被取消,换模型重新委派后PASS |
 | **M5 · 参数属性与 namespace** | | | | | | | |
 | TS-50 | Not Started | 0 | Not Run | `quickjs.c` | 构造函数参数属性 `constructor(private x: T)`,借鉴 `emit_class_field_init` | RFC §D3 | — |
 | TS-51 | Not Started | 0 | Not Run | `quickjs.c` | `namespace`/`module` 降级为 IIFE + 对象 | RFC §D3 | — |

@@ -22108,6 +22108,22 @@ typedef struct JSFunctionDef {
     BOOL has_await; /* TRUE if await is used (used in module eval) */
 } JSFunctionDef;
 
+/* TS: one constant-folded 'const enum' member, e.g. 'Color.Red' -> 0.
+   Linked list, appended as 'const enum' declarations with only
+   literal-constant members are parsed (js_parse_ts_enum). Consulted
+   by the single postfix-expression 'Identifier.Member' lookup point
+   (js_ts_const_enum_lookup) when ts_mode is set. Values are stored as
+   raw C data (not JSValue) to avoid refcount/GC bookkeeping for what
+   is otherwise a very short-lived, parse-time-only side table. */
+typedef struct JSTSConstEnumEntry {
+    struct JSTSConstEnumEntry *next;
+    JSAtom enum_name;   /* owned (JS_DupAtom'd) */
+    JSAtom member_name; /* owned (JS_DupAtom'd) */
+    BOOL is_string;
+    double num_val;      /* valid if !is_string */
+    JSAtom str_val_atom; /* valid if is_string; owned */
+} JSTSConstEnumEntry;
+
 typedef struct JSToken {
     int val;
     const uint8_t *ptr; /* position in the source */
@@ -22147,6 +22163,15 @@ typedef struct JSParseState {
     BOOL allow_html_comments;
     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
     BOOL ts_mode;  /* TS: true if parsing TypeScript input */
+    /* TS: 'const enum' constant-folding table (see js_ts_const_enum_lookup).
+       Populated as 'const enum' declarations with only literal-constant
+       members are parsed; consulted by the single postfix-expression
+       'Identifier.Member' lookup point when ts_mode is set. Scoped to the
+       whole parse (JSParseState is a single per-compilation-unit instance,
+       not per-function), which is a deliberate approximation: a const
+       enum is visible to any later reference in the same source text,
+       matching the overwhelmingly common "declare then use" pattern. */
+    struct JSTSConstEnumEntry *ts_const_enum_head;
     GetLineColCache get_line_col_cache;
 } JSParseState;
 
@@ -24485,6 +24510,10 @@ static __exception int js_parse_ts_type_alias(JSParseState *s);
 static __exception int js_parse_ts_declare(JSParseState *s);
 static BOOL js_ts_declare_looks_like_decl(JSParseState *s);
 static BOOL js_ts_is_pseudo_keyword_str(JSParseState *s, const char *str);
+static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const);
+static void js_ts_free_const_enum_table(JSParseState *s);
+static BOOL js_ts_const_enum_lookup(JSParseState *s, JSAtom enum_name,
+                                    JSAtom member_name, JSValue *pval);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
 static __exception int js_parse_assign_expr(JSParseState *s);
 static __exception int js_parse_unary(JSParseState *s, int parse_flags);
@@ -27292,6 +27321,49 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     JS_FreeAtom(s->ctx, name);
                     return -1;
                 }
+                /* TS: const-enum constant folding. If 'name' is
+                   immediately followed by '.Member' and that pair is
+                   in the const-enum table (see js_parse_ts_enum /
+                   js_ts_const_enum_lookup), emit the literal constant
+                   directly instead of 'OP_scope_get_var name;
+                   OP_get_field Member' -- this is the single lookup
+                   point deliberately chosen to cover the
+                   overwhelmingly common 'EnumName.Member' usage (RFC
+                   M4 decision; range limit: other usages of a const
+                   enum, e.g. destructuring, are not folded and will
+                   raise a ReferenceError since no real binding for
+                   the enum name is ever created). */
+                if (s->ts_mode && s->ts_const_enum_head &&
+                    s->token.val == '.' && peek_token(s, TRUE) == TOK_IDENT) {
+                    JSParsePos pos;
+                    js_parse_get_pos(s, &pos);
+                    if (next_token(s)) { /* consume '.' */
+                        JS_FreeAtom(s->ctx, name);
+                        return -1;
+                    }
+                    if (s->token.val == TOK_IDENT) {
+                        JSAtom member = s->token.u.ident.atom;
+                        JSValue cval;
+                        if (js_ts_const_enum_lookup(s, name, member, &cval)) {
+                            JS_FreeAtom(s->ctx, name);
+                            if (next_token(s)) { /* consume Member */
+                                JS_FreeValue(s->ctx, cval);
+                                return -1;
+                            }
+                            emit_source_pos(s, source_ptr);
+                            if (emit_push_const(s, cval, 1)) {
+                                JS_FreeValue(s->ctx, cval);
+                                return -1;
+                            }
+                            JS_FreeValue(s->ctx, cval);
+                            break;
+                        }
+                    }
+                    if (js_parse_seek_token(s, &pos)) {
+                        JS_FreeAtom(s->ctx, name);
+                        return -1;
+                    }
+                }
             do_get_var:
                 emit_source_pos(s, source_ptr);
                 emit_op(s, OP_scope_get_var);
@@ -29425,6 +29497,35 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             js_parse_error(s, "lexical declarations can't appear in single-statement context");
             goto fail;
         }
+        /* TS: 'const enum E { ... }' must be checked before the
+           ordinary const-declaration fall-through below, since
+           'enum' cannot start a variable-declarator. Note:
+           peek_token() uses simple_next_token(), a minimal lexer
+           that does not recognise 'enum' as a keyword (it only
+           special-cases a few common ones like 'export'/'function')
+           -- it would return plain TOK_IDENT for 'enum', not
+           TOK_ENUM. A real trial parse (get_pos/next_token/
+           seek_token) is used instead to reliably check for the
+           *specific* identifier 'enum' following 'const'. */
+        if (s->ts_mode && tok == TOK_CONST &&
+            peek_token(s, TRUE) == TOK_IDENT) {
+            JSParsePos pos;
+            BOOL is_const_enum = FALSE;
+            js_parse_get_pos(s, &pos);
+            if (next_token(s)) /* consume 'const' */
+                goto fail;
+            if (s->token.val == TOK_ENUM)
+                is_const_enum = TRUE;
+            if (js_parse_seek_token(s, &pos))
+                goto fail;
+            if (is_const_enum) {
+                if (next_token(s)) /* consume 'const' (for real) */
+                    goto fail;
+                if (js_parse_ts_enum(s, TRUE))
+                    goto fail;
+                break;
+            }
+        }
         /* fall thru */
     case TOK_VAR:
         if (next_token(s))
@@ -30049,6 +30150,14 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         break;
 
     case TOK_ENUM:
+        if (!s->ts_mode) {
+            js_unsupported_keyword(s, s->token.u.ident.atom);
+            goto fail;
+        }
+        if (js_parse_ts_enum(s, FALSE))
+            goto fail;
+        break;
+
     case TOK_EXPORT:
     case TOK_EXTENDS:
         js_unsupported_keyword(s, s->token.u.ident.atom);
@@ -38314,6 +38423,312 @@ static __exception int js_parse_ts_declare(JSParseState *s)
     return -1;
 }
 
+/* TS: look up 'EnumName.Member' in the const-enum constant-folding
+   table. Returns TRUE and fills *pval on a hit (does not consume any
+   tokens; the caller is responsible for that), FALSE on a miss (the
+   caller must fall back to ordinary variable/property-access
+   parsing). This is the single postfix-expression lookup point
+   deliberately chosen to cover the overwhelmingly common
+   'Identifier.Member' usage of const enums (see RFC M4 decision). */
+static BOOL js_ts_const_enum_lookup(JSParseState *s, JSAtom enum_name,
+                                    JSAtom member_name, JSValue *pval)
+{
+    JSTSConstEnumEntry *e;
+
+    for (e = s->ts_const_enum_head; e; e = e->next) {
+        if (e->enum_name == enum_name && e->member_name == member_name) {
+            if (e->is_string) {
+                *pval = JS_AtomToString(s->ctx, e->str_val_atom);
+                return !JS_IsException(*pval);
+            } else {
+                *pval = JS_NewFloat64(s->ctx, e->num_val);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+/* TS: free the const-enum constant-folding table. Must be called on
+   every exit path of the top-level parse (mirrors free_token() /
+   js_free_function_def() cleanup already done at the 'fail'/'fail1'
+   labels of __JS_EvalInternal()). */
+static void js_ts_free_const_enum_table(JSParseState *s)
+{
+    JSTSConstEnumEntry *e, *next;
+    for (e = s->ts_const_enum_head; e; e = next) {
+        next = e->next;
+        JS_FreeAtom(s->ctx, e->enum_name);
+        JS_FreeAtom(s->ctx, e->member_name);
+        if (e->is_string)
+            JS_FreeAtom(s->ctx, e->str_val_atom);
+        js_free(s->ctx, e);
+    }
+    s->ts_const_enum_head = NULL;
+}
+
+/* TS: consume an 'enum Name { A, B = 1, C = "s" }' declaration
+   statement in its entirety and emit the equivalent of:
+     const Name = (() => { var _e = {}; _e.A=0; _e[0]="A"; ...; return _e; })();
+   i.e. an object with forward member->value mappings, plus reverse
+   value->name mappings for every *numeric* member only (TS semantics:
+   string enum members never get a reverse mapping). No new opcodes
+   are used (OP_object / OP_define_field / OP_define_array_el, all
+   already used by the object-literal parser).
+
+   If is_const is TRUE ('const enum'), and *every* member's value is a
+   literal-constant expression (number/string literal, or the default
+   auto-increment), no object is emitted at all: each member is
+   recorded in the const-enum constant-folding table instead, to be
+   inlined at 'EnumName.Member' use sites (js_ts_const_enum_lookup).
+   If any member of a 'const enum' is not a simple literal (e.g. a
+   computed expression), inlining is not attempted for correctness;
+   the whole enum falls back to generating a real object exactly like
+   a non-const enum (this still produces fully correct behavior, just
+   without the inlining optimization for that particular enum). */
+static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    JSAtom enum_name;
+    const uint8_t *enum_name_ptr;
+    JSAtom *member_names = NULL;
+    BOOL *member_is_string = NULL;
+    double *member_num = NULL;
+    JSAtom *member_str_atom = NULL;
+    int member_count = 0, member_alloc = 0;
+    double next_auto_val = 0;
+    int i, ret;
+
+    if (next_token(s)) /* consume 'enum' */
+        return -1;
+    if (s->token.val != TOK_IDENT) {
+        js_parse_error(s, "expected enum name");
+        return -1;
+    }
+    enum_name = JS_DupAtom(ctx, s->token.u.ident.atom);
+    enum_name_ptr = s->token.ptr;
+    if (next_token(s))
+        goto fail_name;
+    if (js_parse_expect(s, '{'))
+        goto fail_name;
+
+    /* First pass: collect every member's name and constant value. TS
+       allows arbitrary constant expressions as enum member
+       initializers (including references to earlier members and
+       computed expressions); to keep this within M4's scope, only
+       literal number/string initializers and the default
+       auto-increment are supported here. This is a deliberate range
+       limit (not a silent miscompile): anything else is rejected with
+       a clear parse error rather than silently producing a wrong
+       value. */
+    while (s->token.val != '}') {
+        JSAtom mname;
+        BOOL is_string = FALSE;
+        double num_val = 0;
+        JSAtom str_atom = JS_ATOM_NULL;
+
+        if (s->token.val == TOK_STRING) {
+            mname = JS_ValueToAtom(ctx, s->token.u.str.str);
+            if (mname == JS_ATOM_NULL)
+                goto fail_body;
+        } else if (s->token.val == TOK_IDENT) {
+            mname = JS_DupAtom(ctx, s->token.u.ident.atom);
+        } else {
+            js_parse_error(s, "expected enum member name");
+            goto fail_body;
+        }
+        if (next_token(s)) {
+            JS_FreeAtom(ctx, mname);
+            goto fail_body;
+        }
+        if (s->token.val == '=') {
+            if (next_token(s)) {
+                JS_FreeAtom(ctx, mname);
+                goto fail_body;
+            }
+            if (s->token.val == TOK_NUMBER &&
+                JS_VALUE_GET_TAG(s->token.u.num.val) != JS_TAG_SHORT_BIG_INT) {
+                num_val = JS_VALUE_GET_TAG(s->token.u.num.val) == JS_TAG_INT ?
+                    (double)JS_VALUE_GET_INT(s->token.u.num.val) :
+                    JS_VALUE_GET_FLOAT64(s->token.u.num.val);
+                is_string = FALSE;
+                next_auto_val = num_val + 1;
+                if (next_token(s)) {
+                    JS_FreeAtom(ctx, mname);
+                    goto fail_body;
+                }
+            } else if (s->token.val == TOK_STRING) {
+                str_atom = JS_ValueToAtom(ctx, s->token.u.str.str);
+                if (str_atom == JS_ATOM_NULL) {
+                    JS_FreeAtom(ctx, mname);
+                    goto fail_body;
+                }
+                is_string = TRUE;
+                if (next_token(s)) {
+                    JS_FreeAtom(ctx, mname);
+                    goto fail_body;
+                }
+            } else {
+                js_parse_error(s, "unsupported enum member initializer "
+                               "(only literal number/string constants "
+                               "and auto-increment are supported)");
+                JS_FreeAtom(ctx, mname);
+                goto fail_body;
+            }
+        } else {
+            num_val = next_auto_val;
+            next_auto_val = num_val + 1;
+            is_string = FALSE;
+        }
+
+        if (member_count >= member_alloc) {
+            int new_alloc = member_alloc ? member_alloc * 2 : 8;
+            JSAtom *nn = js_realloc(ctx, member_names, sizeof(*nn) * new_alloc);
+            BOOL *ni = js_realloc(ctx, member_is_string, sizeof(*ni) * new_alloc);
+            double *nd = js_realloc(ctx, member_num, sizeof(*nd) * new_alloc);
+            JSAtom *na = js_realloc(ctx, member_str_atom, sizeof(*na) * new_alloc);
+            if (!nn || !ni || !nd || !na) {
+                js_parse_error(s, "out of memory");
+                JS_FreeAtom(ctx, mname);
+                if (is_string)
+                    JS_FreeAtom(ctx, str_atom);
+                if (nn) member_names = nn;
+                if (ni) member_is_string = ni;
+                if (nd) member_num = nd;
+                if (na) member_str_atom = na;
+                goto fail_body;
+            }
+            member_names = nn;
+            member_is_string = ni;
+            member_num = nd;
+            member_str_atom = na;
+            member_alloc = new_alloc;
+        }
+        member_names[member_count] = mname;
+        member_is_string[member_count] = is_string;
+        member_num[member_count] = num_val;
+        member_str_atom[member_count] = str_atom;
+        member_count++;
+
+        if (s->token.val == ',') {
+            if (next_token(s))
+                goto fail_body;
+            continue;
+        }
+        break;
+    }
+    if (js_parse_expect(s, '}'))
+        goto fail_body;
+
+    if (is_const) {
+        /* const enum with only literal members (guaranteed by the
+           rejection above): constant-fold every member, emit no
+           object at all. */
+        for (i = 0; i < member_count; i++) {
+            JSTSConstEnumEntry *e = js_malloc(ctx, sizeof(*e));
+            if (!e) {
+                js_parse_error(s, "out of memory");
+                goto fail_members;
+            }
+            e->enum_name = JS_DupAtom(ctx, enum_name);
+            e->member_name = member_names[i]; /* ownership moves to entry */
+            e->is_string = member_is_string[i];
+            e->num_val = member_num[i];
+            e->str_val_atom = member_str_atom[i]; /* ownership moves */
+            e->next = s->ts_const_enum_head;
+            s->ts_const_enum_head = e;
+        }
+        member_count = 0; /* ownership moved into the table; skip the
+                             generic per-member free in done: below */
+        /* like other declaration forms (class/function/plain enum),
+           no trailing ';' is required -- the next token simply
+           starts the next statement/declaration. */
+        ret = 0;
+        goto done;
+    }
+
+    /* ordinary enum: generate a real object bound to a const
+       'enum_name'. Reverse mapping is emitted only for numeric
+       members (TS semantics: string enum members never get one). */
+    if (define_var(s, fd, enum_name, JS_VAR_DEF_CONST) < 0)
+        goto fail_members;
+
+    emit_op(s, OP_object);
+    for (i = 0; i < member_count; i++) {
+        emit_op(s, OP_dup); /* obj -- obj obj */
+        if (member_is_string[i]) {
+            JSValue sval = JS_AtomToString(ctx, member_str_atom[i]);
+            if (JS_IsException(sval))
+                goto fail_members;
+            if (emit_push_const(s, sval, 1)) {
+                JS_FreeValue(ctx, sval);
+                goto fail_members;
+            }
+            JS_FreeValue(ctx, sval);
+        } else {
+            emit_op(s, OP_push_i32);
+            emit_u32(s, (uint32_t)(int32_t)member_num[i]);
+        }
+        emit_op(s, OP_define_field); /* obj obj val -- obj */
+        emit_atom(s, member_names[i]);
+
+        if (!member_is_string[i]) {
+            emit_op(s, OP_dup); /* obj -- obj obj */
+            emit_op(s, OP_push_i32);
+            emit_u32(s, (uint32_t)(int32_t)member_num[i]);
+            {
+                JSValue nameval = JS_AtomToString(ctx, member_names[i]);
+                if (JS_IsException(nameval))
+                    goto fail_members;
+                if (emit_push_const(s, nameval, 1)) {
+                    JS_FreeValue(ctx, nameval);
+                    goto fail_members;
+                }
+                JS_FreeValue(ctx, nameval);
+            }
+            emit_op(s, OP_define_array_el); /* obj obj idx name -- obj */
+            emit_op(s, OP_drop);
+        }
+    }
+    emit_source_pos(s, enum_name_ptr);
+    emit_op(s, OP_scope_put_var_init);
+    emit_atom(s, enum_name);
+    emit_u16(s, fd->scope_level);
+
+    ret = 0;
+    goto done;
+
+fail_members:
+    ret = -1;
+done:
+    for (i = 0; i < member_count; i++) {
+        JS_FreeAtom(ctx, member_names[i]);
+        if (member_is_string[i])
+            JS_FreeAtom(ctx, member_str_atom[i]);
+    }
+    js_free(ctx, member_names);
+    js_free(ctx, member_is_string);
+    js_free(ctx, member_num);
+    js_free(ctx, member_str_atom);
+    JS_FreeAtom(ctx, enum_name);
+    return ret;
+
+fail_body:
+    for (i = 0; i < member_count; i++) {
+        JS_FreeAtom(ctx, member_names[i]);
+        if (member_is_string[i])
+            JS_FreeAtom(ctx, member_str_atom[i]);
+    }
+    js_free(ctx, member_names);
+    js_free(ctx, member_is_string);
+    js_free(ctx, member_num);
+    js_free(ctx, member_str_atom);
+fail_name:
+    JS_FreeAtom(ctx, enum_name);
+    return -1;
+}
+
 /* TS: ---- end of TypeScript type consumer ---- */
 
 static __exception int js_parse_program(JSParseState *s)
@@ -38534,11 +38949,13 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     } else {
         ret_val = JS_EvalFunctionInternal(ctx, fun_obj, this_obj, var_refs, sf);
     }
+    js_ts_free_const_enum_table(s); /* TS: */
     return ret_val;
  fail1:
     /* XXX: should free all the unresolved dependencies */
     if (m)
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
+    js_ts_free_const_enum_table(s); /* TS: */
     return JS_EXCEPTION;
 }
 

@@ -196,4 +196,37 @@ print(declare);
 function declare2(x) { return x + 1; }
 print(declare2(1));
 
+// M4: enum (numeric, with reverse mapping)
+enum Color { Red, Green, Blue }
+print(Color.Red, Color.Green, Color.Blue);
+print(Color[0], Color[1], Color[2]);
+
+// M4: enum with explicit values and auto-increment continuation
+enum Level { Low = 10, Mid, High }
+print(Level.Low, Level.Mid, Level.High);
+
+// M4: string enum (no reverse mapping)
+enum Dir { Up = "UP", Down = "DOWN" }
+print(Dir.Up, Dir.Down);
+print(typeof Dir["UP"]);
+
+// M4: heterogeneous enum
+enum Mixed { A = 0, B = "str" }
+print(Mixed.A, Mixed.B, Mixed[0]);
+
+// M4: const enum (fully inlined, no runtime object/binding)
+const enum Status { Active, Inactive }
+print(Status.Active, Status.Inactive);
+print(typeof Status);
+
+// M4: const enum with string members
+const enum CDir { Up = "UP", Down = "DOWN" }
+print(CDir.Up, CDir.Down);
+
+// M4: const enum lookup must not be confused with an ordinary object
+// property of the same name (regression guard: enum_name+member_name
+// are matched as a pair, not just the member name)
+var lookAlike = { Active: 999 };
+print(Status.Active, lookAlike.Active);
+
 print("ALL TS TESTS PASSED");
