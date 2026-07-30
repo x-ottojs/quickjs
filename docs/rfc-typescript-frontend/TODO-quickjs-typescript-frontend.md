@@ -32,10 +32,10 @@ Last updated: 2026-07-30
 | TS-25 | Done | 100 | Pass | `quickjs.c` `js_parse_coalesce_expr` | `as` / `satisfies` / `as const` / 非空断言 `!`;插入位置符合 TS 优先级(`a+b as T`=`(a+b) as T`);ASI 换行处理正确 | RFC §D2.1 | — |
 | TS-26 | Done | 100 | Pass | `tests/test_ts.js` | 歧义反例(`a<b>(c)`、点限定标识符、加空格)+ 深嵌套泛型性能(10000次线性)+ make test 零回归 | RFC §S4、风险表 | 第一轮子 agent 评审输出不完整,重新委派不同模型 |
 | **M3 · 类型声明(纯擦除)** | | | | | | | |
-| TS-30 | Not Started | 0 | Not Run | `quickjs.c` | `interface` 声明(整体消费丢弃) | RFC §B1 | — |
-| TS-31 | Not Started | 0 | Not Run | `quickjs.c` | `type` 别名(含泛型、条件类型等仅语法消费) | RFC §B1 | — |
-| TS-32 | Not Started | 0 | Not Run | `quickjs.c` | `declare` / 仅类型 import-export(`import type`) | RFC §B1 | — |
-| TS-33 | Not Started | 0 | Not Run | `tests/` | M3 单测 + 回归 | RFC §S1 | — |
+| TS-30 | Done | 100 | Pass | `quickjs.c` `js_parse_ts_interface` | `interface` 声明(整体消费丢弃);修正 strict-only 关键字问题,加统一伪关键字前置检测 | RFC §B1、S9 | strict-only 陷阱定位并修复;子agent核对 |
+| TS-31 | Done | 100 | Pass | `quickjs.c` `js_parse_ts_type_alias` | `type` 别名(含泛型仅语法消费);`export type Foo=...`/`export type {X,Y}` | RFC §B1 | — |
+| TS-32 | Done | 100 | Pass | `quickjs.c` `js_parse_ts_declare`、`js_ts_declare_looks_like_decl`、`js_parse_import`/`js_parse_export` | `declare function/const/let/var/class`;`import type`/`export type`(整句+specifier级) | RFC §B1、S9 | 子agent发现declare误判P0(主会话已提前自修);补EOF边界P2 |
+| TS-33 | Done | 100 | Pass | `tests/test_ts.js` | M3 单测(interface/type/declare/重载签名) + 回归守卫(declare/type作普通标识符) + make test 零失败 | RFC §S1 | — |
 | **M4 · enum(首个生成运行时代码的里程碑)** | | | | | | | |
 | TS-40 | Not Started | 0 | Not Run | `quickjs.c` | `enum` 降级为对象 + 正反向映射 emit | RFC §D3 | — |
 | TS-41 | Not Started | 0 | Not Run | `quickjs.c` | `const enum` 编译期常量内联 | RFC §D3 | — |

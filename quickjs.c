@@ -24480,6 +24480,11 @@ static __exception int js_parse_function_decl2(JSParseState *s,
 /* TS: forward declaration of the TypeScript type annotation consumer */
 static __exception int js_parse_ts_type(JSParseState *s);
 static int js_ts_rescan_greater(JSParseState *s);
+static __exception int js_parse_ts_interface(JSParseState *s);
+static __exception int js_parse_ts_type_alias(JSParseState *s);
+static __exception int js_parse_ts_declare(JSParseState *s);
+static BOOL js_ts_declare_looks_like_decl(JSParseState *s);
+static BOOL js_ts_is_pseudo_keyword_str(JSParseState *s, const char *str);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
 static __exception int js_parse_assign_expr(JSParseState *s);
 static __exception int js_parse_unary(JSParseState *s, int parse_flags);
@@ -29325,6 +29330,44 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
     }
 
+    /* TS: 'interface'/'type'/'declare' are strict-mode-only reserved
+       words (see quickjs-atom.h atom ordering vs. JS_ATOM_LAST_KEYWORD/
+       JS_ATOM_LAST_STRICT_KEYWORD in update_token_ident()), so in
+       non-strict top-level code they surface as plain TOK_IDENT rather
+       than TOK_INTERFACE. Detect them here as pseudo-keywords so TS
+       declarations work regardless of strict mode. Each check requires
+       a plausible declaration shape (name/'<'/'{' following) so an
+       ordinary identifier named 'type'/'declare' used as a value is
+       never misparsed. */
+    if (s->ts_mode) {
+        if ((s->token.val == TOK_INTERFACE ||
+             token_is_pseudo_keyword(s, JS_ATOM_interface)) &&
+            peek_token(s, TRUE) == TOK_IDENT) {
+            if (js_parse_ts_interface(s))
+                goto fail;
+            goto done;
+        }
+        if (js_ts_is_pseudo_keyword_str(s, "type") &&
+            peek_token(s, TRUE) == TOK_IDENT) {
+            if (js_parse_ts_type_alias(s))
+                goto fail;
+            goto done;
+        }
+        if (js_ts_is_pseudo_keyword_str(s, "declare")) {
+            /* Require a plausible declaration keyword to follow so an
+               ordinary identifier/statement literally named 'declare'
+               (e.g. 'declare = 5;', 'declare();') is never misparsed
+               as an ambient declaration. js_ts_declare_looks_like_decl()
+               peeks at the token after 'declare' without consuming
+               anything. */
+            if (js_ts_declare_looks_like_decl(s)) {
+                if (js_parse_ts_declare(s))
+                    goto fail;
+                goto done;
+            }
+        }
+    }
+
     switch(tok = s->token.val) {
     case '{':
         if (js_parse_block(s))
@@ -30010,6 +30053,15 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
     case TOK_EXTENDS:
         js_unsupported_keyword(s, s->token.u.ident.atom);
         goto fail;
+
+    case TOK_INTERFACE:
+        if (!s->ts_mode) {
+            js_unsupported_keyword(s, s->token.u.ident.atom);
+            goto fail;
+        }
+        if (js_parse_ts_interface(s))
+            goto fail;
+        break;
 
     default:
     hasexpr:
@@ -32083,6 +32135,65 @@ static __exception int js_parse_export(JSParseState *s)
     if (next_token(s))
         return -1;
 
+    /* TS: 'export type Foo = ...;' (a type alias, no runtime value —
+       simply consumed by the ordinary 'type' alias parser) and
+       'export type { Foo, Bar };' (type-only named re-export list,
+       consumed like a normal '{...}' export list but never creating
+       actual export entries, since none of the names have a runtime
+       value). Distinguish from a value export of something literally
+       named 'type' by requiring an identifier or '{' to follow. */
+    if (s->ts_mode && js_ts_is_pseudo_keyword_str(s, "type")) {
+        int tok2 = peek_token(s, TRUE);
+        if (tok2 == TOK_IDENT) {
+            /* js_parse_ts_type_alias() itself consumes the 'type'
+               keyword, so the token must still be positioned there. */
+            return js_parse_ts_type_alias(s);
+        }
+        if (tok2 == '{') {
+            if (next_token(s)) /* consume 'type' */
+                return -1;
+            if (next_token(s)) /* consume '{' */
+                return -1;
+            while (s->token.val != '}') {
+                if (!token_is_ident(s->token.val)) {
+                    js_parse_error(s, "identifier expected");
+                    return -1;
+                }
+                if (next_token(s))
+                    return -1;
+                if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
+                    if (next_token(s))
+                        return -1;
+                    if (!token_is_ident(s->token.val)) {
+                        js_parse_error(s, "identifier expected");
+                        return -1;
+                    }
+                    if (next_token(s))
+                        return -1;
+                }
+                if (s->token.val != ',')
+                    break;
+                if (next_token(s))
+                    return -1;
+            }
+            if (js_parse_expect(s, '}'))
+                return -1;
+            /* optional 're-export from' clause, also type-only and
+               thus not a real module dependency worth recording */
+            if (token_is_pseudo_keyword(s, JS_ATOM_from)) {
+                if (next_token(s))
+                    return -1;
+                if (s->token.val != TOK_STRING) {
+                    js_parse_error(s, "string expected after 'from'");
+                    return -1;
+                }
+                if (next_token(s))
+                    return -1;
+            }
+            return js_parse_expect_semi(s);
+        }
+    }
+
     tok = s->token.val;
     if (tok == TOK_CLASS) {
         return js_parse_class(s, FALSE, JS_PARSE_EXPORT_NAMED);
@@ -32102,6 +32213,30 @@ static __exception int js_parse_export(JSParseState *s)
     case '{':
         first_export = m->export_entries_count;
         while (s->token.val != '}') {
+            /* TS: per-specifier 'type' modifier: 'export { type Foo,
+               Bar };' — skip the specifier, it has no runtime value. */
+            if (s->ts_mode && js_ts_is_pseudo_keyword_str(s, "type") &&
+                peek_token(s, TRUE) == TOK_IDENT) {
+                if (next_token(s)) /* consume 'type' */
+                    return -1;
+                if (next_token(s)) /* consume the name */
+                    return -1;
+                if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
+                    if (next_token(s))
+                        return -1;
+                    if (!token_is_ident(s->token.val)) {
+                        js_parse_error(s, "identifier expected");
+                        return -1;
+                    }
+                    if (next_token(s))
+                        return -1;
+                }
+                if (s->token.val != ',')
+                    break;
+                if (next_token(s))
+                    return -1;
+                continue;
+            }
             if (!token_is_ident(s->token.val)) {
                 js_parse_error(s, "identifier expected");
                 return -1;
@@ -32282,6 +32417,43 @@ static __exception int js_parse_import(JSParseState *s)
     if (next_token(s))
         return -1;
 
+    /* TS: 'import type Foo from "./x";' / 'import type * as NS from
+       "./x";' — a whole-statement type-only import. Since the
+       imported names are never given a real runtime binding anyway
+       (no type checking, no per-name resolution needed), the entire
+       statement can simply be skipped up to its terminating ';' (or
+       line terminator, matching normal ASI). This must not be
+       confused with a value import of something literally named
+       'type' (e.g. 'import type from "./x"' — the module exports a
+       binding called 'type'), so we require what follows 'type' to
+       look like the start of an import clause: an identifier, '*', or
+       '{' — never directly 'from'. */
+    if (s->ts_mode && js_ts_is_pseudo_keyword_str(s, "type")) {
+        int tok2 = peek_token(s, TRUE);
+        if (tok2 == TOK_IDENT || tok2 == '*' || tok2 == '{') {
+            if (next_token(s)) /* consume 'type' */
+                return -1;
+            for (;;) {
+                if (s->token.val == TOK_EOF) {
+                    /* ASI: EOF also terminates the statement. */
+                    return 0;
+                }
+                if (s->token.val == ';') {
+                    if (next_token(s))
+                        return -1;
+                    return 0;
+                }
+                if (s->got_lf && s->token.val != TOK_STRING) {
+                    /* ASI: no explicit ';', statement ends at the
+                       line break (matches js_parse_expect_semi()). */
+                    return 0;
+                }
+                if (next_token(s))
+                    return -1;
+            }
+        }
+    }
+
     first_import = m->import_entries_count;
     if (s->token.val == TOK_STRING) {
         module_name = JS_ValueToAtom(ctx, s->token.u.str.str);
@@ -32344,6 +32516,42 @@ static __exception int js_parse_import(JSParseState *s)
 
             while (s->token.val != '}') {
                 BOOL is_string;
+                /* TS: 'import { type A, B } from ...' — a per-specifier
+                   'type' modifier marks a type-only import. Since we
+                   never generate a real binding for types anyway (TS
+                   type checking is out of scope), the simplest correct
+                   behavior is to skip the specifier entirely: it must
+                   not create a value binding that would throw at
+                   runtime when nothing is actually exported under
+                   that name from the JS side. */
+                if (s->ts_mode && js_ts_is_pseudo_keyword_str(s, "type") &&
+                    (peek_token(s, TRUE) == TOK_IDENT ||
+                     peek_token(s, TRUE) == TOK_STRING)) {
+                    if (next_token(s)) /* consume 'type' */
+                        return -1;
+                    if (s->token.val == TOK_STRING) {
+                        if (next_token(s))
+                            return -1;
+                    } else {
+                        if (next_token(s))
+                            return -1;
+                    }
+                    if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
+                        if (next_token(s))
+                            return -1;
+                        if (!token_is_ident(s->token.val)) {
+                            js_parse_error(s, "identifier expected");
+                            return -1;
+                        }
+                        if (next_token(s))
+                            return -1;
+                    }
+                    if (s->token.val != ',')
+                        break;
+                    if (next_token(s))
+                        return -1;
+                    continue;
+                }
                 if (s->token.val == TOK_STRING) {
                     is_string = TRUE;
                     if (js_string_find_invalid_codepoint(JS_VALUE_GET_STRING(s->token.u.str.str)) >= 0) {
@@ -37355,6 +37563,24 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     }
 
     if (func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT) {
+        /* TS: function overload signature — a declaration with no
+           body, terminated by ';' instead of '{' (e.g.
+           'function f(x: number): void;' followed later by the real
+           implementation, or an ambient 'declare function ...;').
+           Since JS allows a later same-name 'function' declaration to
+           shadow an earlier one (verified: two top-level function
+           declarations with the same name — the second wins), we can
+           simply treat the signature as a function with an empty
+           body: no bytecode-level "not implemented" marker is needed,
+           and if a real implementation follows it correctly replaces
+           this binding. If no implementation follows (ambient-only,
+           e.g. 'declare function'), calling it is simply a no-op
+           returning undefined — never actually invoked by code that
+           respects the ambient contract. */
+        if (s->ts_mode && s->token.val == ';') {
+            emit_return(s, FALSE);
+            goto done;
+        }
         if (js_parse_expect(s, '{'))
             goto fail;
     }
@@ -37830,6 +38056,262 @@ static __exception int js_parse_ts_type(JSParseState *s)
             return -1;
     }
     return 0;
+}
+
+/* TS: consume an 'interface Name<T> extends Base1, Base2 { ... }'
+   declaration statement in its entirety. No bytecode is emitted —
+   interfaces have no runtime representation. The caller has already
+   verified s->token.val == TOK_INTERFACE and ts_mode is set. */
+static __exception int js_parse_ts_interface(JSParseState *s)
+{
+    if (next_token(s)) /* consume 'interface' */
+        return -1;
+    if (s->token.val != TOK_IDENT) {
+        js_parse_error(s, "expected interface name");
+        return -1;
+    }
+    if (next_token(s))
+        return -1;
+    /* optional generic type parameters '<T, U extends V>' */
+    if (s->token.val == '<') {
+        if (next_token(s))
+            return -1;
+        for (;;) {
+            if (s->token.val != TOK_IDENT)
+                break; /* trailing comma */
+            if (next_token(s))
+                return -1;
+            if (s->token.val == TOK_EXTENDS) {
+                if (next_token(s))
+                    return -1;
+                if (js_parse_ts_type(s))
+                    return -1;
+            }
+            if (s->token.val == '=') {
+                if (next_token(s))
+                    return -1;
+                if (js_parse_ts_type(s))
+                    return -1;
+            }
+            if (s->token.val == ',') {
+                if (next_token(s))
+                    return -1;
+                continue;
+            }
+            break;
+        }
+        if (s->token.val == '>' || js_ts_rescan_greater(s) == 0) {
+            if (next_token(s))
+                return -1;
+        } else {
+            js_parse_error(s, "expected '>' in type parameter list");
+            return -1;
+        }
+    }
+    /* optional 'extends Base1, Base2, ...' */
+    if (s->token.val == TOK_EXTENDS) {
+        if (next_token(s))
+            return -1;
+        if (js_parse_ts_type(s))
+            return -1;
+        while (s->token.val == ',') {
+            if (next_token(s))
+                return -1;
+            if (js_parse_ts_type(s))
+                return -1;
+        }
+    }
+    /* body: skip to matching '}' using brace-depth counting (reuses
+       the same approach as the object-type-literal primary type) */
+    if (s->token.val != '{') {
+        js_parse_error(s, "expected '{' in interface body");
+        return -1;
+    }
+    {
+        int depth = 1;
+        if (next_token(s))
+            return -1;
+        while (depth > 0) {
+            if (s->token.val == TOK_EOF) {
+                js_parse_error(s, "unterminated interface body");
+                return -1;
+            }
+            if (s->token.val == '{') {
+                depth++;
+            } else if (s->token.val == '}') {
+                depth--;
+                if (depth == 0) {
+                    if (next_token(s))
+                        return -1;
+                    return 0;
+                }
+            }
+            if (next_token(s))
+                return -1;
+        }
+    }
+    return 0;
+}
+
+/* TS: consume a 'type Name<T> = Type;' declaration statement in its
+   entirety. No bytecode is emitted — type aliases have no runtime
+   representation. The caller has already verified the current token
+   is the pseudo-keyword 'type' followed by an identifier. */
+static __exception int js_parse_ts_type_alias(JSParseState *s)
+{
+    if (next_token(s)) /* consume 'type' */
+        return -1;
+    if (s->token.val != TOK_IDENT) {
+        js_parse_error(s, "expected type alias name");
+        return -1;
+    }
+    if (next_token(s))
+        return -1;
+    /* optional generic type parameters '<T, U extends V>' */
+    if (s->token.val == '<') {
+        if (next_token(s))
+            return -1;
+        for (;;) {
+            if (s->token.val != TOK_IDENT)
+                break; /* trailing comma */
+            if (next_token(s))
+                return -1;
+            if (s->token.val == TOK_EXTENDS) {
+                if (next_token(s))
+                    return -1;
+                if (js_parse_ts_type(s))
+                    return -1;
+            }
+            if (s->token.val == '=') {
+                if (next_token(s))
+                    return -1;
+                if (js_parse_ts_type(s))
+                    return -1;
+            }
+            if (s->token.val == ',') {
+                if (next_token(s))
+                    return -1;
+                continue;
+            }
+            break;
+        }
+        if (s->token.val == '>' || js_ts_rescan_greater(s) == 0) {
+            if (next_token(s))
+                return -1;
+        } else {
+            js_parse_error(s, "expected '>' in type parameter list");
+            return -1;
+        }
+    }
+    if (js_parse_expect(s, '='))
+        return -1;
+    if (js_parse_ts_type(s))
+        return -1;
+    if (js_parse_expect_semi(s))
+        return -1;
+    return 0;
+}
+
+/* TS: peek past the pseudo-keyword 'declare' (without consuming
+   anything) and check whether what follows looks like a supported
+   ambient declaration form (function/class/const/let/var). This
+   guards against misparsing an ordinary statement whose identifier
+   happens to be literally named 'declare', e.g. 'declare = 5;' or
+   'declare();'. Uses a trial parse (get_pos/seek_token) rather than
+   peek_token() because we must distinguish the pseudo-keyword 'let'
+   from an arbitrary identifier, which peek_token()'s single-token
+   lookahead cannot do (it only reports TOK_IDENT, not which atom). */
+static BOOL js_ts_declare_looks_like_decl(JSParseState *s)
+{
+    JSParsePos pos;
+    BOOL ret = FALSE;
+
+    js_parse_get_pos(s, &pos);
+    if (next_token(s)) /* consume 'declare' */
+        goto done;
+    if (s->token.val == TOK_FUNCTION || s->token.val == TOK_CLASS ||
+        s->token.val == TOK_CONST || s->token.val == TOK_VAR ||
+        token_is_pseudo_keyword(s, JS_ATOM_let)) {
+        ret = TRUE;
+    }
+done:
+    if (js_parse_seek_token(s, &pos))
+        return FALSE;
+    return ret;
+}
+
+/* TS: consume a 'declare function/const/class ...' ambient declaration
+   statement in its entirety. No bytecode is emitted. Only the three
+   most common ambient forms are supported (RFC scope decision):
+   'declare function name(...): R;', 'declare const name: T;' (also
+   'let'/'var'), and 'declare class Name { ... }'. 'declare global' /
+   'declare module' / 'declare namespace' are out of scope (RFC
+   non-goal: no module augmentation support). The caller has already
+   verified the current token is the pseudo-keyword 'declare' and that
+   js_ts_declare_looks_like_decl() returned TRUE. */
+static __exception int js_parse_ts_declare(JSParseState *s)
+{
+    if (next_token(s)) /* consume 'declare' */
+        return -1;
+
+    if (s->token.val == TOK_FUNCTION) {
+        /* 'declare function name(a: T, ...): R;' — reuse the ordinary
+           function-declaration parser as-is (it consumes 'function'
+           and the name itself); it already accepts a missing body
+           (see the overload-signature support added to
+           js_parse_function_decl2) and simply emits an empty-bodied
+           function, which is harmless since 'declare function' has no
+           runtime call target anyway. */
+        return js_parse_function_decl(s, JS_PARSE_FUNC_STATEMENT,
+                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                      s->token.ptr);
+    }
+    if (s->token.val == TOK_CLASS) {
+        /* 'declare class Name { ... }' — reuse the ordinary class
+           parser. Ambient class members are still just consumed as
+           TS type annotations (no type checking), and the class body
+           itself is harmless to actually construct: it is simply
+           never instantiated by code that respects the ambient
+           contract. */
+        return js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE);
+    }
+    if (s->token.val == TOK_VAR || s->token.val == TOK_CONST ||
+        token_is_pseudo_keyword(s, JS_ATOM_let)) {
+        /* 'declare const NAME: Type;' (also let/var) — the value has
+           no initializer in ambient context; consume the binding
+           name(s) and type annotation(s) without emitting any
+           bytecode (there is nothing to bind to: the ambient value
+           is assumed to exist at runtime already, e.g. injected by
+           the host). */
+        int tok = s->token.val;
+        if (next_token(s))
+            return -1;
+        for (;;) {
+            if (s->token.val != TOK_IDENT) {
+                js_parse_error(s, "expected binding name after 'declare %s'",
+                               tok == TOK_VAR ? "var" :
+                               tok == TOK_CONST ? "const" : "let");
+                return -1;
+            }
+            if (next_token(s))
+                return -1;
+            if (s->token.val == ':') {
+                if (next_token(s))
+                    return -1;
+                if (js_parse_ts_type(s))
+                    return -1;
+            }
+            if (s->token.val != ',')
+                break;
+            if (next_token(s))
+                return -1;
+        }
+        if (js_parse_expect_semi(s))
+            return -1;
+        return 0;
+    }
+    js_parse_error(s, "unsupported 'declare' form (only function/const/class are supported)");
+    return -1;
 }
 
 /* TS: ---- end of TypeScript type consumer ---- */

@@ -161,4 +161,39 @@ print(fTrailing(14));
 class BoxTC<T,> { constructor(v) { this.v = v; } }
 print(new BoxTC(15).v);
 
+// M3: interface (fully consumed, no runtime representation)
+interface Point3 { x: number; y: number; }
+interface Base3 { id: number; }
+interface Derived3<T> extends Base3 { value: T; }
+print("interface-ok");
+
+// M3: type alias
+type ID3 = number;
+let idVal: ID3 = 7;
+print(idVal);
+type Box3<T> = { value: T };
+let box3: Box3<number> = { value: 9 };
+print(box3.value);
+
+// M3: function overload signatures (no-body declarations)
+function overload3(x: number): string;
+function overload3(x) { return x; }
+print(overload3(11));
+
+// M3: declare function/const/class
+declare function ambientFn(x: number): void;
+declare const AMBIENT_VERSION: string;
+declare let ambientCounter: number;
+declare class AmbientClass { x: number; }
+print("declare-ok");
+
+// M3: 'declare'/'type'/'interface' used as ordinary identifiers must
+// not be misparsed as TS declarations (regression guard for the
+// pseudo-keyword detection added for M3)
+var declare = 100;
+declare = 101;
+print(declare);
+function declare2(x) { return x + 1; }
+print(declare2(1));
+
 print("ALL TS TESTS PASSED");

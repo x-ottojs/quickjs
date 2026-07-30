@@ -18,10 +18,10 @@ M2a `>` token 重扫(Done — 已推送,阻断级前置已解除)
 M2b 泛型与断言(歧义消解核心,风险最高)(Done — 已推送,2 轮子agent评审)
    │
    ▼
-M3  类型声明(interface/type/declare + 重载签名,纯擦除)  ◄── 下一步
+M3  类型声明(interface/type/declare + 重载签名,纯擦除)(Done — 已推送,strict-only关键字陷阱固化)
    │   └─ 至此 B1 完成,可独立交付
    ▼
-M4  enum + const enum(首个生成运行时代码,含最小 binder)
+M4  enum + const enum(首个生成运行时代码,含最小 binder)  ◄── 下一步
    │
    ▼
 M5  参数属性 + namespace(声明合并)
@@ -260,14 +260,46 @@ TODO refs: TS-22 ~ TS-26
 ---
 
 # Milestone M3: 类型声明(纯擦除)
-Status: Not Started
-Progress: 0%
+Status: Done
+Progress: 100%
 Depends on: M2b
 RFC refs: §B1
-Context budget: 约 60k / 120k
+Context budget: 约 90k / 120k(实际,含 strict-only 关键字问题的调试与两处子agent发现修复)
 TODO refs: TS-30 ~ TS-33
 
-`interface` / `type` / `declare` / `import type` 整体消费丢弃。依赖 M2 因为类型别名可含泛型。至此 **B1 阶段完成,可独立交付**。
+`interface` / `type` / `declare` / `import type`/`export type` 整体消费丢弃;函数重载签名(空函数体方案)。**B1 阶段(可擦除语法)全部完成,可独立交付价值**。
+
+## 关键实现发现:strict-only 保留字问题(重要事项,已固化经验)
+
+`TOK_INTERFACE`/`TOK_ENUM` 等枚举值不是无条件生成的:`update_token_ident()`(quickjs.c:22757)机制显示,只有 atom 序号 `<= JS_ATOM_LAST_KEYWORD`(`= JS_ATOM_super`)的标识符无条件转 token;序号在 `JS_ATOM_LAST_KEYWORD` 与 `JS_ATOM_LAST_STRICT_KEYWORD`(`= JS_ATOM_yield`)之间的(`interface` 恰好落在此区间),**只在 strict mode 下**才转换成对应 token。
+
+**影响**:顶层非 strict 脚本里,`interface` 保持为普通 `TOK_IDENT`,单纯 `case TOK_INTERFACE:` 分支完全不可达。初版实现踩了这个坑(症状:`interface Point {...}` 报 "expecting ';'"),定位后在 `js_parse_statement_or_decl` 的语句 switch **之前**新增统一的伪关键字检测块,同时识别 `TOK_INTERFACE` token 与 `token_is_pseudo_keyword(JS_ATOM_interface)`,`type`/`declare` 同理用 `js_ts_is_pseudo_keyword_str`。
+
+## 子 agent 独立核对与自我修复时序
+
+主会话在委派评审**期间**独立发现并修复了同一个 P0 问题(`declare` 伪关键字检测缺少"看起来像声明"的 peek 守卫,导致 `declare = 101;` 这种把 `declare` 当普通变量名的合法代码被误判为 ambient 声明报错)。子 agent(Opus-4.8)评审判 **FAIL**,精确指出了同一处 `quickjs.c:29355`(评审时的行号,基于修复前的代码状态);核对后发现该问题已被主会话修复(新增 `js_ts_declare_looks_like_decl` trial-parse 守卫),补充验证全部通过。
+
+评审同时指出一处次要边界问题(P2):`import type Foo from "./x"` 若文件以此结尾且**无分号无换行**(纯 EOF),会误报 "unterminated import statement" 而非按 ASI 成功——已修复(EOF 视为语句终止)。
+
+第三处(P3,`declare class` 会真正构造 class 对象并绑定 const,偏离 TS ambient "无运行时表示"语义)经评审自评为"设计权衡,当前选择可接受",记录为已知限制不修复:复用现有 `js_parse_class` 是最小改动方案,若要严格贴合 ambient 语义需要自定义 class-body 跳过逻辑,成本明显更高而收益有限(ambient class 极少被真正实例化,即使生成了绑定也不影响正常代码路径)。
+
+## 验证结果
+
+- `interface`:基础声明、泛型 `<T>`、`extends` 多重继承 —— 全部通过。
+- `type` 别名:基础、泛型、`export type Foo = ...`、`export type { X, Y }`、`import { type A, B }` —— 全部通过。
+- `declare`:`function`/`const`/`let`/`var`/`class` —— 全部通过。
+- 函数重载签名:`function f(x:T):R;` + 真实实现,后者覆盖前者(已验证同名 function 声明可覆盖是合法 JS 语义)。
+- **回归守卫(本轮新增)**:`declare`/`type`/`interface` 作普通变量名/函数名时不被误判(`declare = 101`、`function declare2(x){}` 等)。
+- `make test` 零失败。
+
+## 结案
+
+- 迭代目的:完成 B1 阶段(可擦除语法)最后一块——类型声明,使 TS 前端具备独立交付价值。
+- 迭代前问题:`interface`/`type`/`declare`/函数重载签名/`import type` 均未实现。
+- 如何迭代:摸底语句分派入口 → 发现并修正 strict-only 关键字陷阱(interface 初版实现失败,定位根因,改为统一伪关键字前置检测)→ grill 确认 declare/import type 范围 → 实现 5 项 → 子 agent 评审期间主会话自查发现并修复 declare 误判 P0 → 评审确认修复有效并发现 1 处次要边界(已修)、1 处设计权衡(记录不改)。
+- 最终结果:TS-30~TS-33 全部 `Done`。B1 阶段完成,可推进 M4(enum,首个触及字节码生成层)。**重要事项固化**:任何新增 TS 伪关键字检测,必须用 trial-parse(get_pos/seek_token)或至少 peek_token 验证"后续形态像声明",不能只判断当前 token 是伪关键字就直接进入声明分支——这是本轮 P0 的直接根因,已作为经验写入。
+
+**M4 前瞻性核实(避免重复踩坑)**:已验证 `enum` 的 atom 序号在 `quickjs-atom.h` 中排在 `super` 之前(第 61 行 vs 65 行),即 `enum` **不是** strict-only 关键字,在非 strict 模式下已被词法层无条件转成 `TOK_ENUM`(实测 `enum Foo{A}` 直接命中 `js_unsupported_keyword` 分支,证明 token 匹配成功)。**M4 不会重复本轮 M3 的 strict-only 关键字陷阱**,可直接在语句 switch 的 `case TOK_ENUM:` 处接入,无需 M3 式的前置伪关键字检测块。
 
 ---
 

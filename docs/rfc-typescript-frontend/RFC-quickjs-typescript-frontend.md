@@ -218,6 +218,7 @@ B1(可擦除)与 B2(生成代码)风险量级不同:B1 局限于 parser 层;B2 �
 - **S6 · 断言强度必须经"现状穷举"校准**(继承前置 RFC R9,已三次触发)。估算"新增 X 的收益/工作量"前,必须先穷举"现状已实现多少 X"。本 RFC 的 D2/D3 即是该规则的产物——先确认回溯设施与 emit 原语已存在,才敢定 P2 路径。
 - **S7 · 上游 merge 友好**。本仓库是 `bellard/quickjs` 镜像。改动须尽量集中、可辨识:新增代码优先放在独立区块并加 `/* TS: ... */` 标记;避免大范围重排既有代码,降低未来 merge 冲突面。
 - **S8 · 不以性能为理由做任何改动**。前置 RFC 实测证明类型驱动优化收益仅 3-8%。任何以"顺便优化性能"为名的改动须走单独 RFC(→ 立项理由)。
+- **S9 · TS 伪关键字识别禁止只判"当前 token 是伪关键字"就进入声明分支,必须验证后续形态(M3 固化,阻断级 bug 的根因)**。`interface`/`enum` 等属于 `JS_ATOM_LAST_KEYWORD` 与 `JS_ATOM_LAST_STRICT_KEYWORD` 之间的 strict-only 关键字(`update_token_ident`,`quickjs.c:22757`),在非 strict 顶层代码中不会被词法层转成对应 `TOK_*`,必须用 `token_is_pseudo_keyword`/`js_ts_is_pseudo_keyword_str` 识别。**但仅识别伪关键字不够**——必须再用 `peek_token` 或 trial-parse(`get_pos`/`seek_token`)验证紧跟的 token 形态确实像声明,否则会把 `declare = 5;`、`declare();`、`declare.x` 这类把伪关键字用作普通标识符的合法代码误判为声明语句并报错。M3 的 `declare` 分支初版正是漏了这一验证,被子 agent 判 FAIL(但已在评审进行时由主会话自查修复)。**每新增一个 TS 伪关键字检测点,必须同时写一条"该词作普通标识符使用"的回归测试**(参考 `tests/test_ts.js` 的 `declare`/`declare2` 用例)。
 
 ## 目标架构
 
