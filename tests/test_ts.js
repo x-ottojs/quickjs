@@ -229,4 +229,86 @@ print(CDir.Up, CDir.Down);
 var lookAlike = { Active: 999 };
 print(Status.Active, lookAlike.Active);
 
+// M5: constructor parameter properties (non-derived)
+class PointND {
+    constructor(private x: number, public y: number, readonly z: number) {}
+}
+var pnd = new PointND(1, 2, 3);
+print(pnd.x, pnd.y, pnd.z);
+
+// M5: constructor parameter properties (derived, 'this' only usable
+// after super())
+class BaseD { constructor() { this.baseVal = 100; } }
+class DerivedD extends BaseD {
+    constructor(private x: number) { super(); }
+}
+var dd = new DerivedD(7);
+print(dd.x, dd.baseVal);
+
+// M5: parameter properties coexisting with class fields
+class MixedPP {
+    z = 99;
+    constructor(private x: number) {}
+}
+var mpp = new MixedPP(5);
+print(mpp.x, mpp.z);
+
+// M5: namespace basic declaration + export const/function
+namespace Basic {
+    export const value = 42;
+    export function greet() { return "hi from ns"; }
+}
+print(Basic.value, Basic.greet());
+
+// M5: non-exported names inside a namespace are not leaked onto the
+// namespace object
+namespace WithSecret {
+    const secret = 1;
+    export const pub = secret + 1;
+}
+print(WithSecret.pub, typeof WithSecret.secret);
+
+// M5: same-name namespace declaration merging (multiple blocks)
+namespace Merged {
+    export const a = 1;
+}
+namespace Merged {
+    export const b = 2;
+}
+print(Merged.a, Merged.b);
+
+// M5: namespace/class merging, direction 1 (class declared first)
+class Album1 {
+    constructor(t) { this.title = t; }
+}
+namespace Album1 {
+    export function create(t) { return new Album1(t); }
+}
+var alb1 = Album1.create("dir1");
+print(alb1.title, alb1 instanceof Album1);
+
+// M5: namespace/class merging, direction 2 (namespace declared first)
+namespace Album2 {
+    export const label = "unknown";
+}
+class Album2 {
+    constructor(t) { this.title = t; }
+}
+var alb2 = new Album2("dir2");
+print(alb2.title, Album2.label, alb2 instanceof Album2);
+
+// M5: namespace/function merging (both directions work "for free"
+// since function declarations are var-like and reassignable)
+function fnFirst() { return "fn"; }
+namespace fnFirst {
+    export const tag = "A";
+}
+print(fnFirst(), fnFirst.tag);
+
+namespace fnSecond {
+    export const tag = "B";
+}
+function fnSecond() { return "fn2 " + fnSecond.tag; }
+print(fnSecond());
+
 print("ALL TS TESTS PASSED");

@@ -24,10 +24,10 @@ M3  类型声明(interface/type/declare + 重载签名,纯擦除)(Done — 已�
 M4  enum + const enum(首个生成运行时代码,含最小 binder)(Done — 已推送,peek_token陷阱固化+const enum内联)
    │
    ▼
-M5  参数属性 + namespace(声明合并)  ◄── 下一步
+M5  参数属性 + namespace(声明合并)(Done — 已推送,3个strict-only/关键字bug+OP_copy_data_properties位编码验证)
    │
    ▼
-M6a 装饰器 legacy(优先 — 真实项目依赖,含参数装饰器+metadata)
+M6a 装饰器 legacy(优先 — 真实项目依赖,含参数装饰器+metadata)  ◄── 下一步
    │
    ▼
 M6b 装饰器 stage 3(标准生态,双后端切换)
@@ -360,14 +360,59 @@ put_var_init 0: Color
 ---
 
 # Milestone M5: 参数属性与 namespace
-Status: Not Started
-Progress: 0%
+Status: Done
+Progress: 100%
 Depends on: M4
 RFC refs: §D3
-Context budget: 约 75k / 120k
+Context budget: 约 110k / 120k(实际,本 RFC 至今最大改动:触及 class 核心构造路径 + OP_copy_data_properties 位编码字节码 + 手写嵌套函数体解析)
 TODO refs: TS-50 ~ TS-52
 
-参数属性借鉴 `emit_class_field_init`(`quickjs.c:25184`)在构造函数首部注入 `this.x = x`;`namespace` 降级为 IIFE + 对象。
+**本 RFC 至今风险最高的里程碑,已完成。** 参数属性完整支持派生/非派生两种时序;namespace 完整支持声明合并两个方向(含 class/function)。
+
+## 关键决策(三轮 grill)
+
+1. **参数属性时序范围**:摸底发现原计划"复用 `emit_class_field_init`"不成立——非派生类的该调用点在**参数解析之前**,而参数属性赋值需要参数已解析完;派生类的调用点在用户代码 `super()` 表达式解析路径中,非固定位置。用户选 **A(完整支持派生+非派生)**,需同时改动 `js_parse_function_decl2`(非派生,挪调用点到参数解析后)与 `js_parse_postfix_expr` 的 `FUNC_CALL_SUPER_CTOR` 两处(派生)。
+2. **namespace 与 class/function 合并方向**:摸底发现"方向1(class在前)"只需查表复用绑定(低风险),"方向2(namespace在前)"需要真正的运行时属性合并(高风险,需用 `OP_copy_data_properties` 位编码字节码,插入 `js_parse_class` 核心绑定路径)。**两轮 grill 用户均坚持完整支持两个方向**,最终采用现有位编码字节码(不新增 opcode)精确复刻对象展开语法的编码模式,已通过子 agent 逐位解码核对确认正确。
+
+## 实现过程中的重大调试(比 M1-M4 加总更多)
+
+- **strict-only 关键字陷阱(第三次,S9(a))**:`private`/`public`/`protected` 是 strict-mode 保留字,在 class 体(总是 strict)内会被词法层转成 `TOK_PRIVATE` 等专用 token,而非 `TOK_IDENT`——用 `js_ts_is_pseudo_keyword_str` 检测必然失败。改用 `token.val == TOK_PRIVATE/PUBLIC/PROTECTED` 直接判断(`readonly` 无预定义 atom,仍用伪关键字检测)。
+- **强制关键字误判为伪关键字**:`export` 的 atom 序号在 `super` 之前,是**无条件强制关键字**(非 strict-only、非纯上下文关键字),namespace 内部 `export` 检测最初错误地用了 `token_is_pseudo_keyword`,必然失败。改用 `s->token.val == TOK_EXPORT`。
+- **`define_var` 返回值语义误用**:`define_var` 在 `fd->is_global_var`(顶层脚本/eval)场景下返回固定占位值 `GLOBAL_VAR_OFFSET`,不是可用的局部变量 slot。namespace 首次声明最初用 `OP_get_loc`/`OP_put_loc` 访问这个返回值,在顶层直接读到错误位置(`N` 求值为 `undefined`)。改用 `OP_scope_get_var`/`OP_scope_put_var`(按 atom 名字访问,兼容全局与局部两种场景)。
+- **`js_parse_function_decl2` 的 `func_name` 参数契约**:该函数对 `JS_PARSE_FUNC_STATEMENT` 要求 `func_name` 必须是 `JS_ATOM_NULL`(函数名从 token 流自解析,不接受外部传入)。namespace 内 `export function NAME(){}` 需要提前知道 `NAME`(用于挂载到命名空间对象),但不能违反这个契约——改用 trial-parse(`get_pos`/`next_token`/`seek_token`)预读函数名后立即回退,再让 `js_parse_function_decl` 正常自解析。
+- **class/namespace 混合绑定类型冲突**:namespace 用 `var` 绑定,class 用 `let` 绑定,合并时若两处都各自调用 `define_var`,会产生"invalid redefinition of lexical identifier"/"invalid redefinition of global identifier"。修复:检测到合并时,后声明的一方跳过 `define_var`,只对已有绑定做值层面操作(方向1:直接复用;方向2:`OP_copy_data_properties` 合并属性后 `OP_scope_put_var` 重新赋值,不用 `_init` 变体)。
+- **namespace/function 合并"免费"生效**:未专门处理,但两个方向都自然工作——因为 `function` 声明本身是 `var`-like、可重新赋值,与 namespace 的 `Name || (Name={})` 复用逻辑天然兼容,不像 `class`(let,不可重复声明)需要显式合并逻辑。
+
+## 实现
+
+- `js_ts_emit_param_properties`:遍历 `JSFunctionDef.ts_param_prop_names`(参数解析时收集),emit `this.NAME = ARG` 系列(`OP_scope_get_var this` + `OP_get_arg` + `OP_define_field` + `OP_drop`,栈净变化为 0)。非派生类调用点挪到参数列表解析完成后;派生类在两处 `FUNC_CALL_SUPER_CTOR`(`OP_apply`/`OP_call_constructor` 两种调用形态)的 `emit_class_field_init` 之后追加调用。
+- `js_parse_ts_namespace`:手写嵌套函数体构造(参考 `js_parse_function_class_fields_init` 范式但改为真实参数+真实语句解析),IIFE 参数为命名空间对象,`export const/let/var/function` 挂载到参数对象(`js_ts_parse_namespace_member`),非 export 语句走普通 `js_parse_statement_or_decl`。
+- `JSTSMergeableDecl` 链表(挂 `JSParseState.ts_merge_head`):记录 namespace/class/function 绑定身份,供声明合并双向查询。
+- `js_parse_class` 绑定收尾处新增方向2检测:若发现同名已是 `JS_TS_MERGE_NAMESPACE`,用 `OP_copy_data_properties`(mask=`2|(1<<2)|(0<<5)`,与现有对象展开语法完全一致的编码)把命名空间对象属性复制到新建类对象上。
+
+## 范围限制(已记录,非隐藏 bug)
+
+- 嵌套 namespace `A.B.C` 不支持,遇到给出清晰编译错误(而非静默误判)。
+- namespace 导出的 `class`/`interface`/嵌套 `namespace` 不会被挂载到父命名空间对象上(只有 `const`/`let`/`var`/`function` 四种导出形式被复制);这些声明仍作为命名空间体内的普通局部绑定可用,只是访问 `N.SomeExportedClass` 会得到 `undefined` 而非报错——这是可观察的差异,不是静默错误。
+
+## 验证结果
+
+- 参数属性:非派生类(`public`/`private`/`protected`/`readonly` 四种修饰符)、派生类(`super()` 后正确访问 `this`)、与类字段混用 —— 全部通过,含字节码 dump 验证(`get_loc this / get_arg x / define_field x / drop`)。
+- namespace:基础声明、函数导出、局部变量不泄漏、同名多段合并、方向1(class在前)、方向2(namespace在前,`OP_copy_data_properties`)、三段合并(namespace+class+namespace)、function 双向合并 —— 全部通过。
+- 零回归:纯 JS class(含类表达式)、TS class 无 namespace 合并场景 —— 行为不变。
+- 内存管理:多次重复运行相同代码,atom 计数稳定不增长(merge 表清理正确)。
+- `make test` 零失败。
+
+## 子 agent 独立核对
+
+判 **PASS**,重点核对了本里程碑唯一的高风险手写字节码(`OP_copy_data_properties` 位编码)——逐位解码验证 `target=sp[-3]`/`source=sp[-2]`/`excludeList=sp[-1]` 与栈布局精确匹配,且与现有对象展开语法的编码模式完全一致。全部结论与主会话 12 项实测无矛盾。
+
+## 结案
+
+- 迭代目的:完成 B2 阶段第二个里程碑,验证"完整支持双向声明合并"这类高复杂度需求在 RFC 约束(S3 不新增 opcode、S9 断言强度校准)下的可行边界。
+- 迭代前问题:参数属性的两种时序、namespace 与 class/function 合并的两个方向均未实现,且初步摸底显示比预期复杂得多(单一注入点方案不成立)。
+- 如何迭代:摸底发现方案不成立 → 两轮 grill 确认范围(用户坚持完整支持而非收窄)→ 实现参数属性(两处注入点)→ 调试 3 个真实 bug(strict-only 关键字、强制关键字误判、`define_var` 返回值语义)→ 实现 namespace(手写函数体构造 + 双向合并)→ 调试 2 个真实 bug(`func_name` 契约、绑定类型冲突)→ 字节码 dump 验证 → 子 agent 核对。
+- 最终结果:TS-50~TS-52 全部 `Done`。B2 阶段第二个里程碑完成,可推进 M6。**本轮踩坑数量(5 个真实 bug)是本 RFC 至今单里程碑最多**,已固化的经验:S9 规则(strict-only/强制/伪关键字三类判断必须先核实 atom 在 `quickjs-atom.h` 中的真实位置,不能凭直觉分类)、`define_var` 返回值在 `is_global_var` 场景下的特殊语义(新固化经验,未写入 S9 但应视为同类陷阱)。
 
 ---
 

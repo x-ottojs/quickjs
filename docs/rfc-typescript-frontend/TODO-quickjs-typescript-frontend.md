@@ -41,9 +41,9 @@ Last updated: 2026-07-30
 | TS-41 | Done | 100 | Pass | `quickjs.c` `JSTSConstEnumEntry`/`js_ts_const_enum_lookup` | `const enum` 完整内联(用户grill决策A,收窄为单插入点+仅字面量成员) | RFC §D3 | 两轮grill定范围;peek_token陷阱已修复;内存清理无泄漏(atom计数验证) |
 | TS-42 | Done | 100 | Pass | `tests/test_ts.js` | M4 单测 + **字节码 dump 对比**(`-DDUMP_BYTECODE=2`) + make test 零失败 | RFC §验证策略 | 首次评审耗时异常被取消,换模型重新委派后PASS |
 | **M5 · 参数属性与 namespace** | | | | | | | |
-| TS-50 | Not Started | 0 | Not Run | `quickjs.c` | 构造函数参数属性 `constructor(private x: T)`,借鉴 `emit_class_field_init` | RFC §D3 | — |
-| TS-51 | Not Started | 0 | Not Run | `quickjs.c` | `namespace`/`module` 降级为 IIFE + 对象 | RFC §D3 | — |
-| TS-52 | Not Started | 0 | Not Run | `tests/` | M5 单测 + 字节码 dump 对比 | RFC §验证策略 | — |
+| TS-50 | Done | 100 | Pass | `quickjs.c` `js_ts_emit_param_properties` | 构造函数参数属性(派生+非派生两种时序);`public`/`private`/`protected`/`readonly` | RFC §D3、S9(a) | 修复strict-only陷阱;子agent核对PASS |
+| TS-51 | Done | 100 | Pass | `quickjs.c` `js_parse_ts_namespace`/`JSTSMergeableDecl` | `namespace` 降级为 IIFE + 对象;声明合并两方向(含class/function) | RFC §D3、S9(c)、S10 | `OP_copy_data_properties`位编码逐位核对PASS;修复3个真实bug |
+| TS-52 | Done | 100 | Pass | `tests/test_ts.js` | M5 单测 + 字节码 dump 对比 | RFC §验证策略 | 12项场景+零回归+内存泄漏检查全通过 |
 | **M6a · 装饰器 legacy(优先,真实项目依赖)** | | | | | | | |
 | TS-60 | Not Started | 0 | Not Run | `quickjs.c` lexer | 新增 `@` 词法 token(当前零支持)+ 处理 `@` 后 regexp/division 上下文 | RFC §D2.2(g) | — |
 | TS-61 | Not Started | 0 | Not Run | `quickjs.c` | 双后端 emit 架构骨架(可切换 legacy/stage3,避免反向返工) | RFC §D3.4 | — |

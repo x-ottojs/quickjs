@@ -22106,6 +22106,22 @@ typedef struct JSFunctionDef {
 
     JSModuleDef *module; /* != NULL when parsing a module */
     BOOL has_await; /* TRUE if await is used (used in module eval) */
+
+    /* TS: parameter properties collected while parsing this function's
+       parameter list, e.g. 'constructor(private x: T)'. Only ever
+       populated for JS_PARSE_FUNC_CLASS_CONSTRUCTOR /
+       JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR. Consumed (and freed)
+       once 'this.NAME = NAME' has been emitted for every entry: for a
+       non-derived constructor, right after emit_class_field_init() at
+       the top of the function (quickjs.c, before parameter parsing is
+       *reached* is too early -- the emit happens right after argument
+       parsing completes instead, see js_ts_emit_param_properties());
+       for a derived constructor, right after the 'super(...)' call's
+       own emit_class_field_init() (js_parse_postfix_expr,
+       FUNC_CALL_SUPER_CTOR branch), since 'this' only becomes usable
+       at that point. */
+    JSAtom *ts_param_prop_names;
+    int ts_param_prop_count;
 } JSFunctionDef;
 
 /* TS: one constant-folded 'const enum' member, e.g. 'Color.Red' -> 0.
@@ -22123,6 +22139,31 @@ typedef struct JSTSConstEnumEntry {
     double num_val;      /* valid if !is_string */
     JSAtom str_val_atom; /* valid if is_string; owned */
 } JSTSConstEnumEntry;
+
+/* TS: what kind of mergeable declaration a top-level name is bound
+   to, for 'namespace' declaration merging (js_parse_ts_namespace) and
+   for the class/function side of that merge (js_parse_class /
+   js_parse_function_decl2's constructor path). Only scoped to the
+   top level of a single parse (same approximation as the const-enum
+   table: JSParseState is one instance per compilation unit). */
+typedef enum {
+    JS_TS_MERGE_NAMESPACE,
+    JS_TS_MERGE_CLASS,
+    JS_TS_MERGE_FUNCTION,
+} JSTSMergeKind;
+
+typedef struct JSTSMergeableDecl {
+    struct JSTSMergeableDecl *next;
+    JSAtom name; /* owned (JS_DupAtom'd) */
+    JSTSMergeKind kind;
+    /* for JS_TS_MERGE_NAMESPACE: the local variable slot (fd->vars[]
+       index, NOT ARGUMENT_VAR_OFFSET-tagged) holding the namespace
+       object, so a later 'class Name {}'/'function Name(){}' can
+       copy its own members into that same object (direction 2 of the
+       merge) before rebinding Name. -1 if not yet known (e.g. this
+       entry actually describes a class/function, not a namespace). */
+    int namespace_var_idx;
+} JSTSMergeableDecl;
 
 typedef struct JSToken {
     int val;
@@ -22172,6 +22213,10 @@ typedef struct JSParseState {
        enum is visible to any later reference in the same source text,
        matching the overwhelmingly common "declare then use" pattern. */
     struct JSTSConstEnumEntry *ts_const_enum_head;
+    /* TS: 'namespace' / class / function declaration-merging table
+       (see JSTSMergeableDecl above). Same whole-parse scoping
+       approximation as ts_const_enum_head. */
+    struct JSTSMergeableDecl *ts_merge_head;
     GetLineColCache get_line_col_cache;
 } JSParseState;
 
@@ -24508,10 +24553,18 @@ static int js_ts_rescan_greater(JSParseState *s);
 static __exception int js_parse_ts_interface(JSParseState *s);
 static __exception int js_parse_ts_type_alias(JSParseState *s);
 static __exception int js_parse_ts_declare(JSParseState *s);
+static __exception int js_parse_ts_namespace(JSParseState *s);
 static BOOL js_ts_declare_looks_like_decl(JSParseState *s);
 static BOOL js_ts_is_pseudo_keyword_str(JSParseState *s, const char *str);
 static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const);
 static void js_ts_free_const_enum_table(JSParseState *s);
+static void js_ts_free_merge_table(JSParseState *s);
+static JSTSMergeableDecl *js_ts_merge_lookup(JSParseState *s, JSAtom name);
+static JSTSMergeableDecl *js_ts_merge_record(JSParseState *s, JSAtom name,
+                                             JSTSMergeKind kind,
+                                             int namespace_var_idx);
+static __exception int js_ts_emit_param_properties(JSParseState *s,
+                                                    JSFunctionDef *fd);
 static BOOL js_ts_const_enum_lookup(JSParseState *s, JSAtom enum_name,
                                     JSAtom member_name, JSValue *pval);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
@@ -25494,6 +25547,59 @@ static void emit_class_field_init(JSParseState *s)
     emit_op(s, OP_drop);
 }
 
+/* TS: emit 'this.NAME = NAME' for every parameter property collected
+   in fd->ts_param_prop_names (see the parameter-parsing loop in
+   js_parse_function_decl2). Called once per constructor: right after
+   emit_class_field_init() for a non-derived constructor (parameter
+   list fully parsed by then), or right after the matching
+   emit_class_field_init() call for a derived constructor's
+   'super(...)' expression (where 'this' first becomes usable).
+   Consumes (frees) the list so it is only ever emitted once even if
+   -- in principle -- more than one super() call site could reach
+   this function (not valid JS, but defensive regardless). No-op if
+   the list is empty (the common case: no parameter properties). */
+static __exception int js_ts_emit_param_properties(JSParseState *s,
+                                                    JSFunctionDef *fd)
+{
+    int i, arg_idx;
+
+    for (i = 0; i < fd->ts_param_prop_count; i++) {
+        JSAtom name = fd->ts_param_prop_names[i];
+
+        arg_idx = -1;
+        {
+            int j;
+            for (j = 0; j < fd->arg_count; j++) {
+                if (fd->args[j].var_name == name) {
+                    arg_idx = j;
+                    break;
+                }
+            }
+        }
+        if (arg_idx < 0) {
+            /* should not happen: the name was recorded from add_arg()
+               itself in the same parameter list */
+            JS_FreeAtom(s->ctx, name);
+            continue;
+        }
+
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, JS_ATOM_this);
+        emit_u16(s, 0);
+        emit_op(s, OP_get_arg);
+        emit_u16(s, arg_idx);
+        emit_op(s, OP_define_field);
+        emit_atom(s, name);
+        emit_op(s, OP_drop);
+
+        JS_FreeAtom(s->ctx, name);
+    }
+    js_free(s->ctx, fd->ts_param_prop_names);
+    fd->ts_param_prop_names = NULL;
+    fd->ts_param_prop_count = 0;
+    return 0;
+}
+
 /* build a private setter function name from the private getter name */
 static JSAtom get_private_setter_name(JSContext *ctx, JSAtom name)
 {
@@ -26083,11 +26189,59 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
 
     /* the class statements have a block level scope */
     if (class_var_name != JS_ATOM_NULL) {
-        if (define_var(s, fd, class_var_name, JS_VAR_DEF_LET) < 0)
+        /* TS: namespace/class declaration merging, direction 2 --
+           'namespace Name {...}' declared *before* this class. The
+           namespace already built a plain object holding its
+           exported members; that object's own properties must be
+           copied onto the new class object (the class object itself
+           cannot be discarded or reused: it carries the prototype
+           chain / constructor identity, which only js_parse_class
+           itself can create). Uses the existing OP_copy_data_properties
+           opcode (already used by object/destructuring spread), not a
+           new one. Direction 1 (class declared first, namespace
+           declared after) needs no action here: it is handled on the
+           namespace side (js_parse_ts_namespace), which looks up and
+           reuses this binding once it is registered below. */
+        {
+            JSTSMergeableDecl *ns_entry = js_ts_merge_lookup(s, class_var_name);
+            BOOL is_ns_merge = (ns_entry && ns_entry->kind == JS_TS_MERGE_NAMESPACE);
+            if (is_ns_merge) {
+                /* stack: class_obj -- class_obj ns_obj null */
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, class_var_name);
+                emit_u16(s, fd->scope_level);
+                emit_op(s, OP_null); /* dummy excludeList */
+                emit_op(s, OP_copy_data_properties);
+                /* target=class_obj (idx2), source=ns_obj (idx1),
+                   excludeList=null (idx0) -- same position encoding
+                   already used by object-literal spread ('...'). */
+                emit_u8(s, 2 | (1 << 2) | (0 << 5));
+                emit_op(s, OP_drop); /* pop excludeList */
+                emit_op(s, OP_drop); /* pop ns_obj */
+
+                /* 'Name' is already bound (by the namespace, as
+                   'var') -- do NOT call define_var() again here (that
+                   would be an invalid mixed var/let redeclaration).
+                   Plain reassignment (OP_scope_put_var, not
+                   OP_scope_put_var_init) is correct: the binding
+                   already exists, we are just giving it a new
+                   (merged) value. */
+                emit_op(s, OP_scope_put_var);
+                emit_atom(s, class_var_name);
+                emit_u16(s, fd->scope_level);
+            } else {
+                if (define_var(s, fd, class_var_name, JS_VAR_DEF_LET) < 0)
+                    goto fail;
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, class_var_name);
+                emit_u16(s, fd->scope_level);
+            }
+        }
+        /* TS: register this binding for future namespace merging
+           (direction 1: a later 'namespace Name {...}' reuses this
+           class object instead of creating a new one). */
+        if (js_ts_merge_record(s, class_var_name, JS_TS_MERGE_CLASS, -1) == NULL)
             goto fail;
-        emit_op(s, OP_scope_put_var_init);
-        emit_atom(s, class_var_name);
-        emit_u16(s, fd->scope_level);
     } else {
         if (class_name == JS_ATOM_NULL) {
             /* cannot use OP_set_name because the name of the class
@@ -27763,6 +27917,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                         emit_u16(s, 0);
 
                         emit_class_field_init(s);
+                        if (js_ts_emit_param_properties(s, s->cur_func))
+                            return -1;
                     } else if (call_type == FUNC_CALL_NEW) {
                         /* obj func array -> func obj array */
                         emit_op(s, OP_perm3);
@@ -27808,6 +27964,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                         emit_u16(s, 0);
 
                         emit_class_field_init(s);
+                        if (js_ts_emit_param_properties(s, s->cur_func))
+                            return -1;
                     } else if (call_type == FUNC_CALL_NEW) {
                         emit_op(s, OP_call_constructor);
                         emit_u16(s, arg_count);
@@ -29437,6 +29595,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     goto fail;
                 goto done;
             }
+        }
+        if (js_ts_is_pseudo_keyword_str(s, "namespace") &&
+            peek_token(s, TRUE) == TOK_IDENT) {
+            if (js_parse_ts_namespace(s))
+                goto fail;
+            goto done;
         }
     }
 
@@ -32905,6 +33069,13 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     dbuf_free(&fd->pc2line);
 
     js_free(ctx, fd->source);
+
+    if (fd->ts_param_prop_names) { /* TS: */
+        for(i = 0; i < fd->ts_param_prop_count; i++) {
+            JS_FreeAtom(ctx, fd->ts_param_prop_names[i]);
+        }
+        js_free(ctx, fd->ts_param_prop_names);
+    }
 
     if (fd->parent) {
         /* remove in parent list */
@@ -37362,9 +37533,15 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         emit_op(s, OP_check_ctor);
     }
 
-    if (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
-        emit_class_field_init(s);
-    }
+    /* TS: for a non-derived constructor, class-field initialization
+       (and, if any, parameter-property assignment) is moved from here
+       to right after the parameter list has been fully parsed (see
+       js_ts_emit_param_properties below) -- 'this.NAME = NAME' needs
+       the parameter's argument slot, which does not exist yet at this
+       point. Plain (non-TS) class-field initialization behaves
+       identically either way since it only ever reads 'this', which
+       is already bound for a non-derived constructor; the emission is
+       simply deferred by a few tokens' worth of parsing. */
 
     /* TS: consume generic type parameter declarations '<T, U extends V>'.
        For arrow functions this only applies when the caller (see
@@ -37451,6 +37628,45 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             BOOL rest = FALSE;
             int idx, has_initializer;
 
+            BOOL is_param_prop = FALSE;
+
+            /* TS: parameter properties 'constructor(private x: T, ...)'.
+               Only meaningful directly inside a class constructor's
+               parameter list; accept any combination of the four
+               access-modifier / readonly pseudo-keywords, then remember
+               that this specific parameter is a property so
+               'this.NAME = NAME' can be emitted later (see
+               js_ts_emit_param_properties). A rest ('...x') or
+               destructuring ('{x}'/'[x]') parameter can never be a
+               parameter property in TS. */
+            if (s->ts_mode &&
+                (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
+                 func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR)) {
+                for (;;) {
+                    /* 'public'/'private'/'protected' are strict-mode
+                       reserved words (unlike 'readonly', which has no
+                       predefined atom and is always a plain
+                       identifier): inside a class body -- which is
+                       always parsed in strict mode -- they surface as
+                       TOK_PUBLIC/TOK_PRIVATE/TOK_PROTECTED rather than
+                       TOK_IDENT, so js_ts_is_pseudo_keyword_str() alone
+                       (which only matches TOK_IDENT) cannot detect
+                       them here. This is the same class of pitfall as
+                       the strict-only keyword trap already fixed for
+                       'interface' in M3 (RFC S9(a)), just hitting a
+                       different set of words. */
+                    if (s->token.val == TOK_PUBLIC ||
+                        s->token.val == TOK_PRIVATE ||
+                        s->token.val == TOK_PROTECTED ||
+                        js_ts_is_pseudo_keyword_str(s, "readonly")) {
+                        is_param_prop = TRUE;
+                        if (next_token(s))
+                            goto fail;
+                        continue;
+                    }
+                    break;
+                }
+            }
             if (s->token.val == TOK_ELLIPSIS) {
                 if (func_type == JS_PARSE_FUNC_SETTER)
                     goto fail_accessor;
@@ -37568,6 +37784,23 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 js_parse_error(s, "missing formal parameter");
                 goto fail;
             }
+            /* TS: record this parameter as a property once its name
+               and argument slot are known; the actual 'this.NAME =
+               NAME' emission happens later (see
+               js_ts_emit_param_properties), at the point where 'this'
+               is guaranteed usable (immediately for a non-derived
+               constructor, only after 'super(...)' for a derived
+               one). Never valid for a rest parameter. */
+            if (is_param_prop && !rest) {
+                JSAtom *na = js_realloc(ctx, fd->ts_param_prop_names,
+                                        sizeof(*na) * (fd->ts_param_prop_count + 1));
+                if (!na) {
+                    js_parse_error(s, "out of memory");
+                    goto fail;
+                }
+                fd->ts_param_prop_names = na;
+                fd->ts_param_prop_names[fd->ts_param_prop_count++] = JS_DupAtom(ctx, name);
+            }
             if (rest && s->token.val != ')') {
                 js_parse_expect(s, ')');
                 goto fail;
@@ -37618,6 +37851,18 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         /* set the variable scope as the current scope */
         fd->scope_level = 0;
         fd->scope_first = fd->scopes[fd->scope_level].first;
+    }
+
+    /* TS/class-fields: for a non-derived constructor, 'this' is bound
+       from the start, so class-field initialization (and any
+       parameter-property assignments) can be emitted now that the
+       parameter list -- and therefore every parameter's argument slot
+       -- is fully known. This is the deferred call removed from
+       before parameter parsing above. */
+    if (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
+        emit_class_field_init(s);
+        if (js_ts_emit_param_properties(s, fd))
+            goto fail;
     }
 
     if (next_token(s))
@@ -38423,6 +38668,335 @@ static __exception int js_parse_ts_declare(JSParseState *s)
     return -1;
 }
 
+/* TS: consume a single member statement inside a 'namespace N { ... }'
+   body. Handles the two overwhelmingly common exported forms
+   directly:
+     export const/let/var NAME = expr;   -> also assigns N.NAME
+     export function NAME(...) {...}     -> also assigns N.NAME
+   by parsing the declaration exactly as usual (so the local binding
+   inside the namespace's IIFE body works normally) and then emitting
+   an extra 'paramObj.NAME = NAME' for each exported name, reusing the
+   same [get value, OP_define_field] pattern already used for TS
+   parameter properties (js_ts_emit_param_properties). Any other
+   statement (exported or not, e.g. 'export class'/'export
+   interface'/plain statements) is parsed with the ordinary statement
+   parser and never assigned onto paramObj -- TS does allow exporting
+   classes/interfaces/nested namespaces from a namespace, but wiring
+   that onto paramObj as well is a deliberate range limit recorded in
+   the RFC: only const/let/var/function exports are copied onto the
+   namespace object; other exported declaration kinds remain ordinary
+   local bindings inside the namespace body only (a consumer reaching
+   for e.g. 'N.SomeExportedClass' gets 'undefined' -- an observable,
+   non-silent gap -- rather than a wrong value). 'ns_var_idx' is the
+   local variable slot holding the namespace parameter object (see
+   js_parse_ts_namespace). */
+static __exception int js_ts_parse_namespace_member(JSParseState *s,
+                                                     int ns_var_idx)
+{
+    JSFunctionDef *fd = s->cur_func;
+    BOOL is_export = FALSE;
+
+    if (s->token.val == TOK_EXPORT) {
+        /* peek to make sure this is really an exported declaration,
+           not e.g. a local variable/function literally named
+           'export' used as a value -- mirrors the same guard already
+           used for 'declare'/'type'/'interface' (RFC S9). */
+        int tok2 = peek_token(s, TRUE);
+        if (tok2 == TOK_CONST || tok2 == TOK_VAR || tok2 == TOK_FUNCTION ||
+            tok2 == TOK_IDENT /* pseudo-keyword 'let' */) {
+            is_export = TRUE;
+            if (next_token(s)) /* consume 'export' */
+                return -1;
+        }
+    }
+
+    if (is_export &&
+        (s->token.val == TOK_CONST || s->token.val == TOK_VAR ||
+         token_is_pseudo_keyword(s, JS_ATOM_let))) {
+        int tok = s->token.val;
+        JSAtom exported_name;
+        if (tok != TOK_CONST && tok != TOK_VAR)
+            tok = TOK_LET;
+        if (s->token.val != TOK_IDENT) {
+            if (next_token(s)) /* consume 'const'/'var' keyword token */
+                return -1;
+        }
+        if (s->token.val != TOK_IDENT) {
+            js_parse_error(s, "expected binding name in namespace export");
+            return -1;
+        }
+        exported_name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
+        if (js_parse_var(s, TRUE, tok, FALSE)) {
+            JS_FreeAtom(s->ctx, exported_name);
+            return -1;
+        }
+        if (js_parse_expect_semi(s)) {
+            JS_FreeAtom(s->ctx, exported_name);
+            return -1;
+        }
+        emit_op(s, OP_get_arg);
+        emit_u16(s, ns_var_idx);
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, exported_name);
+        emit_u16(s, fd->scope_level);
+        emit_op(s, OP_define_field);
+        emit_atom(s, exported_name);
+        emit_op(s, OP_drop);
+        JS_FreeAtom(s->ctx, exported_name);
+        return 0;
+    }
+
+    if (is_export && s->token.val == TOK_FUNCTION) {
+        const uint8_t *ptr = s->token.ptr;
+        JSAtom name;
+        JSParsePos pos;
+
+        /* js_parse_function_decl2() requires func_name==JS_ATOM_NULL
+           for JS_PARSE_FUNC_STATEMENT and parses the name itself from
+           the token stream (see the comment at its definition) -- it
+           cannot be handed a name out-of-band. Peek the name with a
+           trial parse (restored immediately) purely so it is known
+           here for the trailing 'paramObj.NAME = NAME' assignment;
+           the real parse below still starts from the unconsumed
+           TOK_FUNCTION token, exactly like the 'declare function'
+           call site. */
+        js_parse_get_pos(s, &pos);
+        if (next_token(s)) /* consume 'function' (trial only) */
+            return -1;
+        if (s->token.val != TOK_IDENT) {
+            js_parse_error(s, "expected function name in namespace export");
+            return -1;
+        }
+        name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
+        if (js_parse_seek_token(s, &pos)) {
+            JS_FreeAtom(s->ctx, name);
+            return -1;
+        }
+
+        if (js_parse_function_decl(s, JS_PARSE_FUNC_STATEMENT,
+                                   JS_FUNC_NORMAL, JS_ATOM_NULL, ptr)) {
+            JS_FreeAtom(s->ctx, name);
+            return -1;
+        }
+        emit_op(s, OP_get_arg);
+        emit_u16(s, ns_var_idx);
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, name);
+        emit_u16(s, fd->scope_level);
+        emit_op(s, OP_define_field);
+        emit_atom(s, name);
+        emit_op(s, OP_drop);
+        JS_FreeAtom(s->ctx, name);
+        return 0;
+    }
+
+    /* 'export' was seen but not followed by one of the four handled
+       keywords (e.g. 'export class'), or there was no 'export' at
+       all (is_export is FALSE and the token stream is unconsumed):
+       parse as an ordinary statement/declaration. */
+    return js_parse_statement_or_decl(s, DECL_MASK_ALL);
+}
+
+/* TS: consume a 'namespace Name { ... }' declaration statement.
+   Desugars to the equivalent of:
+     var Name;
+     (function (Name) { ...body... })(Name || (Name = {}));
+   i.e. an IIFE that receives the (possibly already existing, for
+   declaration merging) namespace object as its sole parameter;
+   exported const/let/var/function members are copied onto that
+   parameter object (js_ts_parse_namespace_member), everything else is
+   a plain local binding inside the IIFE body only.
+
+   Declaration merging (RFC D3.3, decision: both directions
+   supported):
+     - a later 'namespace Name {...}' with the same Name reuses the
+       existing namespace object (js_ts_merge_lookup finds
+       JS_TS_MERGE_NAMESPACE and its stored variable slot);
+     - if Name was already bound as a class/function
+       (JS_TS_MERGE_CLASS/JS_TS_MERGE_FUNCTION), the *existing* bound
+       value (the class/function object itself) is passed in as the
+       IIFE argument directly, so namespace members are attached onto
+       it (RFC direction 1: class/function declared first);
+     - if a class/function is declared *after* this namespace (RFC
+       direction 2), js_parse_class / the constructor path in
+       js_parse_function_decl2 look this entry up themselves and copy
+       this object's own properties onto the new class/function object
+       before rebinding Name (OP_copy_data_properties, see the class
+       name binding site).
+   No new opcodes are used. */
+static __exception int js_parse_ts_namespace(JSParseState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    JSAtom ns_name;
+    const uint8_t *ns_name_ptr;
+    JSTSMergeableDecl *existing;
+    int ns_var_idx;
+    JSFunctionDef *body_fd;
+    int cpool_idx;
+
+    if (next_token(s)) /* consume 'namespace' */
+        return -1;
+    if (s->token.val != TOK_IDENT) {
+        js_parse_error(s, "expected namespace name");
+        return -1;
+    }
+    ns_name = JS_DupAtom(ctx, s->token.u.ident.atom);
+    ns_name_ptr = s->token.ptr;
+    if (next_token(s))
+        goto fail_name;
+    /* RFC range limit: nested 'namespace A.B.C' is not supported;
+       only a single identifier is accepted here. A qualified name
+       produces a clear parse error rather than being silently
+       misinterpreted. */
+    if (s->token.val != '{') {
+        js_parse_error(s, "expected '{' in namespace declaration "
+                       "(nested 'namespace A.B' is not supported)");
+        goto fail_name;
+    }
+
+    existing = js_ts_merge_lookup(s, ns_name);
+
+    /* Build the local variable slot that will hold the namespace
+       object argument, exactly like a single 'var Name;' declarator
+       -- reused across merged declarations of the same name via the
+       recorded slot index. Skipped entirely for a direction-1 merge
+       (existing class/function): 'Name' is already bound by that
+       class/function declaration (as 'let', not 'var'), so calling
+       define_var() again here would be an invalid mixed let/var
+       redeclaration -- the namespace body only ever needs to *read*
+       that existing binding (via OP_scope_get_var below), never to
+       declare or rebind it. */
+    if (existing && existing->kind == JS_TS_MERGE_NAMESPACE &&
+        existing->namespace_var_idx >= 0) {
+        ns_var_idx = existing->namespace_var_idx;
+    } else if (existing && (existing->kind == JS_TS_MERGE_CLASS ||
+                            existing->kind == JS_TS_MERGE_FUNCTION)) {
+        ns_var_idx = -1; /* unused in this branch */
+    } else {
+        ns_var_idx = define_var(s, fd, ns_name, JS_VAR_DEF_VAR);
+        if (ns_var_idx < 0)
+            goto fail_name;
+    }
+
+    /* Compute the IIFE argument expression:
+       - direction-1 merge with an existing class/function: pass the
+         existing bound value directly (namespace members attach onto
+         it, no 'Name || (Name = {})' fallback -- the class/function
+         is always already defined by the time this namespace runs).
+       - otherwise: 'Name || (Name = {})', matching plain
+         declaration-merging semantics (first declaration creates the
+         object, later ones reuse it). */
+    if (existing && (existing->kind == JS_TS_MERGE_CLASS ||
+                     existing->kind == JS_TS_MERGE_FUNCTION)) {
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, ns_name);
+        emit_u16(s, fd->scope_level);
+    } else {
+        int label_has_val;
+        /* Note: define_var() may have returned GLOBAL_VAR_OFFSET (a
+           placeholder, not a usable local-variable slot) if this is a
+           top-level 'var' in global/eval scope (fd->is_global_var).
+           Always access the namespace binding by name via
+           OP_scope_get_var/OP_scope_put_var, which work uniformly for
+           both a real local slot and a global-var binding -- never
+           OP_get_loc/OP_put_loc with ns_var_idx, which would silently
+           read/write the wrong slot (or a placeholder) in the global
+           case. ns_var_idx is still recorded (and reused across merged
+           namespace declarations) purely as an identity/kind marker
+           in the merge table, not as an operand for these opcodes. */
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, ns_name);
+        emit_u16(s, fd->scope_level);
+        emit_op(s, OP_dup);
+        label_has_val = emit_goto(s, OP_if_true, -1);
+        emit_op(s, OP_drop);
+        emit_op(s, OP_object);
+        emit_op(s, OP_dup);
+        emit_op(s, OP_scope_put_var);
+        emit_atom(s, ns_name);
+        emit_u16(s, fd->scope_level);
+        emit_label(s, label_has_val);
+    }
+
+    /* Build the IIFE body as a nested function definition taking one
+       parameter (the namespace object), mirroring the manual
+       fd-construction pattern used for class-field initializers
+       (js_parse_function_class_fields_init) -- but with a real
+       parameter and a real parsed statement list, since namespace
+       bodies are arbitrary user code. */
+    body_fd = js_new_function_def(ctx, fd, FALSE, TRUE, s->filename,
+                                  ns_name_ptr, &s->get_line_col_cache);
+    if (!body_fd) {
+        js_parse_error(s, "out of memory");
+        goto fail_name;
+    }
+    body_fd->func_name = JS_ATOM_NULL;
+    body_fd->has_prototype = FALSE;
+    body_fd->has_home_object = FALSE;
+    body_fd->has_arguments_binding = TRUE;
+    body_fd->has_this_binding = TRUE;
+    body_fd->new_target_allowed = FALSE;
+    body_fd->super_call_allowed = FALSE;
+    body_fd->super_allowed = FALSE;
+    body_fd->arguments_allowed = TRUE;
+    body_fd->func_kind = JS_FUNC_NORMAL;
+    body_fd->func_type = JS_PARSE_FUNC_EXPR;
+
+    s->cur_func = body_fd;
+    {
+        int param_idx = add_arg(ctx, body_fd, ns_name);
+        if (param_idx < 0) {
+            s->cur_func = fd;
+            js_free_function_def(ctx, body_fd);
+            goto fail_name;
+        }
+        body_fd->defined_arg_count = 1;
+    }
+
+    if (next_token(s)) /* consume '{' */
+        goto fail_body;
+    push_scope(s);
+    body_fd->body_scope = body_fd->scope_level;
+    while (s->token.val != '}') {
+        if (js_ts_parse_namespace_member(s, 0 /* ARGUMENT_VAR_OFFSET-less arg 0 is the ns param */))
+            goto fail_body;
+    }
+    pop_scope(s);
+    if (js_is_live_code(s))
+        emit_return(s, FALSE);
+    if (next_token(s)) /* consume '}' */
+        goto fail_body;
+
+    s->cur_func = fd;
+
+    cpool_idx = cpool_add(s, JS_NULL);
+    body_fd->parent_cpool_idx = cpool_idx;
+    emit_op(s, OP_fclosure);
+    emit_u32(s, cpool_idx);
+
+    /* stack: ns_arg fclosure -- call it with ns_arg as the sole
+       argument, matching a plain '(function(N){...})(arg)' call. */
+    emit_op(s, OP_swap);       /* fclosure ns_arg */
+    emit_op(s, OP_call);
+    emit_u16(s, 1);
+    emit_op(s, OP_drop); /* discard the IIFE's return value */
+
+    if (js_ts_merge_record(s, ns_name, JS_TS_MERGE_NAMESPACE, ns_var_idx) == NULL) {
+        js_parse_error(s, "out of memory");
+        goto fail_name;
+    }
+    JS_FreeAtom(ctx, ns_name);
+    return 0;
+
+fail_body:
+    s->cur_func = fd;
+    js_free_function_def(ctx, body_fd);
+fail_name:
+    JS_FreeAtom(ctx, ns_name);
+    return -1;
+}
+
 /* TS: look up 'EnumName.Member' in the const-enum constant-folding
    table. Returns TRUE and fills *pval on a hit (does not consume any
    tokens; the caller is responsible for that), FALSE on a miss (the
@@ -38465,6 +39039,61 @@ static void js_ts_free_const_enum_table(JSParseState *s)
         js_free(s->ctx, e);
     }
     s->ts_const_enum_head = NULL;
+}
+
+/* TS: free the namespace/class/function declaration-merging table
+   (mirrors js_ts_free_const_enum_table; called from the same
+   __JS_EvalInternal exit points). */
+static void js_ts_free_merge_table(JSParseState *s)
+{
+    JSTSMergeableDecl *e, *next;
+    for (e = s->ts_merge_head; e; e = next) {
+        next = e->next;
+        JS_FreeAtom(s->ctx, e->name);
+        js_free(s->ctx, e);
+    }
+    s->ts_merge_head = NULL;
+}
+
+/* TS: look up a previously recorded namespace/class/function
+   declaration by name. Returns NULL if none is recorded (the common
+   case: no declaration-merging involved). Does not consume/dup the
+   atom (borrowed reference into the table). */
+static JSTSMergeableDecl *js_ts_merge_lookup(JSParseState *s, JSAtom name)
+{
+    JSTSMergeableDecl *e;
+    for (e = s->ts_merge_head; e; e = e->next) {
+        if (e->name == name)
+            return e;
+    }
+    return NULL;
+}
+
+/* TS: record (or update) a namespace/class/function declaration under
+   'name' for later declaration-merging lookups. If an entry for
+   'name' already exists, its kind/namespace_var_idx are simply
+   overwritten in place (the common merging case: the same name is
+   declared more than once, and later declarations need to see the
+   latest kind to decide how to merge). Returns NULL on OOM. */
+static JSTSMergeableDecl *js_ts_merge_record(JSParseState *s, JSAtom name,
+                                             JSTSMergeKind kind,
+                                             int namespace_var_idx)
+{
+    JSTSMergeableDecl *e = js_ts_merge_lookup(s, name);
+    if (e) {
+        e->kind = kind;
+        e->namespace_var_idx = namespace_var_idx;
+        return e;
+    }
+    e = js_malloc(s->ctx, sizeof(*e));
+    if (!e)
+        return NULL;
+    e->name = JS_DupAtom(s->ctx, name);
+    e->kind = kind;
+    e->namespace_var_idx = namespace_var_idx;
+    e->next = s->ts_merge_head;
+    s->ts_merge_head = e;
+    return e;
 }
 
 /* TS: consume an 'enum Name { A, B = 1, C = "s" }' declaration
@@ -38949,13 +39578,13 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     } else {
         ret_val = JS_EvalFunctionInternal(ctx, fun_obj, this_obj, var_refs, sf);
     }
-    js_ts_free_const_enum_table(s); /* TS: */
+    js_ts_free_const_enum_table(s); js_ts_free_merge_table(s); /* TS: */
     return ret_val;
  fail1:
     /* XXX: should free all the unresolved dependencies */
     if (m)
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
-    js_ts_free_const_enum_table(s); /* TS: */
+    js_ts_free_const_enum_table(s); js_ts_free_merge_table(s); /* TS: */
     return JS_EXCEPTION;
 }
 
