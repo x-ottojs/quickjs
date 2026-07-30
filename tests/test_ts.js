@@ -115,4 +115,50 @@ print(tight1[0]);
 let tight2: Array<Array<number>>=[[8]];
 print(tight2[0][0]);
 
+// M2b: generic call disambiguation
+function id(x) { return x; }
+print(id<number,string>(42));      // multi-arg => generic
+print(id<number[]>(42));           // complex arg syntax => generic
+var a1 = 5, b1 = 3, c1 = 1;
+print(a1<b1>(c1));                 // single simple ident => comparison chain, NOT generic
+
+// M2b: generic function/class declarations
+function identity<T>(x) { return x; }
+print(identity(99));
+function bounded<T extends number>(x) { return x * 2; }
+print(bounded(21));
+class Box<T> {
+    constructor(v) { this.v = v; }
+}
+var box = new Box(7);
+print(box.v);
+
+// M2b: generic arrow functions
+var idArrow = <T>(x) => x;
+print(idArrow(11));
+var idArrowRet = <T>(x): number => x * 3;
+print(idArrowRet(4));
+var idArrowMulti = <T, U>(x, y) => x + y;
+print(idArrowMulti(2, 3));
+
+// M2b: as / satisfies / as const / non-null assertion
+let asVal = 5 as number;
+print(asVal);
+let asConstVal = 5 as const;
+print(asConstVal);
+let satisfiesVal = { a: 1 } satisfies object;
+print(satisfiesVal.a);
+let nnVal = 5;
+print(nnVal!);
+print((5 as number)!);
+
+// M2b: trailing comma in generic lists
+var idArrowTC = <T,>(x) => x;
+print(idArrowTC(13));
+print(id<number,>(42));
+function fTrailing<T,>(x) { return x; }
+print(fTrailing(14));
+class BoxTC<T,> { constructor(v) { this.v = v; } }
+print(new BoxTC(15).v);
+
 print("ALL TS TESTS PASSED");

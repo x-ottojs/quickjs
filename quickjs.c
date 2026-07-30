@@ -22601,6 +22601,23 @@ static inline BOOL token_is_pseudo_keyword(JSParseState *s, JSAtom atom) {
         !s->token.u.ident.has_escape;
 }
 
+/* TS: like token_is_pseudo_keyword() but for identifiers that have no
+   predefined JS_ATOM_x constant (e.g. "satisfies"). Creates a
+   temporary atom for comparison; slightly slower than
+   token_is_pseudo_keyword() but only used for uncommon keywords. */
+static BOOL js_ts_is_pseudo_keyword_str(JSParseState *s, const char *str)
+{
+    JSAtom atom;
+    BOOL ret;
+
+    if (s->token.val != TOK_IDENT || s->token.u.ident.has_escape)
+        return FALSE;
+    atom = JS_NewAtom(s->ctx, str);
+    ret = (s->token.u.ident.atom == atom);
+    JS_FreeAtom(s->ctx, atom);
+    return ret;
+}
+
 static __exception int js_parse_regexp(JSParseState *s)
 {
     const uint8_t *p;
@@ -24462,6 +24479,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                                                JSFunctionDef **pfd);
 /* TS: forward declaration of the TypeScript type annotation consumer */
 static __exception int js_parse_ts_type(JSParseState *s);
+static int js_ts_rescan_greater(JSParseState *s);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
 static __exception int js_parse_assign_expr(JSParseState *s);
 static __exception int js_parse_unary(JSParseState *s, int parse_flags);
@@ -24971,6 +24989,186 @@ restore:
     return FALSE;
 }
 
+/* TS: check whether the current '<' starts a generic arrow function
+   '<T>(x: T) => x' / '<T,>(x) => x'.  Trial-parses a type parameter
+   list, requires it to be followed by '(' ... ')' and (optionally, a
+   TS return type ': R') and finally '=>'.  Emits no bytecode; always
+   restores the original position (the caller re-parses the generic
+   parameters via js_parse_function_decl2 once this returns TRUE). */
+static BOOL js_ts_is_generic_arrow(JSParseState *s)
+{
+    JSParsePos pos;
+
+    if (!s->ts_mode || s->token.val != '<')
+        return FALSE;
+    js_parse_get_pos(s, &pos);
+
+    if (next_token(s)) /* consume '<' */
+        goto restore;
+    for (;;) {
+        if (s->token.val != TOK_IDENT) {
+            /* allow a trailing comma before the closing '>': '<T,>' */
+            break;
+        }
+        if (next_token(s))
+            goto restore;
+        if (s->token.val == TOK_EXTENDS) {
+            if (next_token(s))
+                goto restore;
+            if (js_parse_ts_type(s))
+                goto restore;
+        }
+        if (s->token.val == '=') {
+            if (next_token(s))
+                goto restore;
+            if (js_parse_ts_type(s))
+                goto restore;
+        }
+        if (s->token.val == ',') {
+            if (next_token(s))
+                goto restore;
+            continue;
+        }
+        break;
+    }
+    if (s->token.val == '>' || js_ts_rescan_greater(s) == 0) {
+        if (next_token(s))
+            goto restore;
+    } else {
+        goto restore;
+    }
+    if (s->token.val != '(')
+        goto restore;
+    if (js_parse_skip_parens_token(s, NULL, TRUE) == TOK_ARROW) {
+        if (js_parse_seek_token(s, &pos))
+            return FALSE;
+        return TRUE;
+    }
+    /* try again allowing a ': ReturnType' before '=>' */
+    if (js_ts_is_arrow_with_return_type(s)) {
+        if (js_parse_seek_token(s, &pos))
+            return FALSE;
+        return TRUE;
+    }
+restore:
+    if (js_parse_seek_token(s, &pos))
+        return FALSE;
+    return FALSE;
+}
+
+/* TS: heuristically determine whether the current '<' starts a generic
+   call's type argument list (e.g. f<T>(x), f<T,U>(x)) rather than being
+   the '<' relational operator (e.g. a<b, a<b>(c) meaning (a<b)>(c)).
+
+   This is deliberately conservative for the genuinely ambiguous case
+   (a single simple identifier type argument immediately followed by
+   '('): TypeScript itself is ambiguous here without full binder/type
+   information, and misclassifying a comparison as a generic call is a
+   silent-miscompile risk, whereas misclassifying a genuine single-type-
+   argument generic call as a comparison merely produces a parse error
+   that the author can work around (e.g. by adding a second type
+   argument or using a temporary variable). Decision rule:
+     - Parse a trial type-argument list '<' Type (',' Type)* '>'.
+     - If more than one type argument (comma seen) => treat as generic.
+     - If any single argument's syntax is not a bare (possibly dotted)
+       identifier (e.g. array 'T[]', union 'A|B', function type,
+       tuple, literal type) => treat as generic (a comparison chain
+       could never produce such syntax after '<').
+     - Otherwise (single bare identifier argument) => NOT generic;
+       let the caller fall back to relational-operator parsing.
+   In all cases, if the closing '>' is not immediately followed by a
+   valid call suffix ('(', a template literal, or optional-call '?.('),
+   the trial is rejected as well.
+   Emits no bytecode; always restores parser state if returning FALSE.
+   If returning TRUE, the parser state is left just after the closing
+   '>' (i.e. positioned at the call suffix), ready for the postfix
+   loop to continue as a function call. */
+static BOOL js_ts_try_generic_call(JSParseState *s)
+{
+    JSParsePos pos;
+    BOOL saw_comma = FALSE;
+    BOOL complex_arg = FALSE;
+
+    if (!s->ts_mode || s->token.val != '<')
+        return FALSE;
+    js_parse_get_pos(s, &pos);
+
+    if (next_token(s)) /* consume '<' */
+        goto restore;
+
+    for (;;) {
+        const uint8_t *arg_start_ptr = s->token.ptr;
+        int arg_start_tok = s->token.val;
+        const uint8_t *arg_end_ptr;
+
+        if (js_parse_ts_type(s))
+            goto restore;
+        /* A "bare identifier" argument (e.g. 'T', 'Foo.Bar') never
+           contains '[', '|', '&', or '(' in its source text; any of
+           those mark array/union/intersection/function-type syntax
+           that a plain relational-comparison chain could never
+           produce after '<'.  We scan the exact source range of this
+           one type argument — [arg_start_ptr, s->token.ptr) — where
+           s->token.ptr is the start of the *next* token (','/'>'/etc)
+           after js_parse_ts_type() returned, so the scan never spills
+           into the following argument or the closing '>'.  This is
+           O(n) in the annotation size, not exponential. */
+        arg_end_ptr = s->token.ptr;
+        if (arg_start_tok != TOK_IDENT) {
+            complex_arg = TRUE;
+        } else {
+            const uint8_t *p;
+            for (p = arg_start_ptr; p < arg_end_ptr; p++) {
+                if (*p == '[' || *p == '|' || *p == '&' || *p == '(' ||
+                    *p == '<') {
+                    complex_arg = TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (s->token.val == ',') {
+            saw_comma = TRUE;
+            if (next_token(s))
+                goto restore;
+            /* allow a trailing comma before the closing '>': 'f<T,>(x)' */
+            if (s->token.val == '>' ||
+                s->token.val == TOK_SAR || s->token.val == TOK_SHR ||
+                s->token.val == TOK_SAR_ASSIGN || s->token.val == TOK_SHR_ASSIGN ||
+                s->token.val == TOK_GTE) {
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+
+    if (!saw_comma && !complex_arg) {
+        /* single bare identifier argument: ambiguous with a
+           relational comparison — conservatively reject. */
+        goto restore;
+    }
+
+    /* consume the closing '>' (possibly re-scanned from '>>' etc.) */
+    if (s->token.val == '>' || js_ts_rescan_greater(s) == 0) {
+        if (next_token(s))
+            goto restore;
+    } else {
+        goto restore;
+    }
+
+    /* the closing '>' must be immediately followed by a call suffix */
+    if (s->token.val == '(' || s->token.val == TOK_TEMPLATE ||
+        s->token.val == TOK_QUESTION_MARK_DOT) {
+        return TRUE;
+    }
+
+restore:
+    if (js_parse_seek_token(s, &pos))
+        return FALSE;
+    return FALSE;
+}
+
 static void set_object_name(JSParseState *s, JSAtom name)
 {
     JSFunctionDef *fd = s->cur_func;
@@ -25365,6 +25563,45 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         else
             class_var_name = class_name;
         class_var_name = JS_DupAtom(ctx, class_var_name);
+    }
+
+    /* TS: consume generic type parameter declarations '<T, U extends V>' */
+    if (s->ts_mode && s->token.val == '<') {
+        if (next_token(s))
+            goto fail;
+        for (;;) {
+            if (s->token.val != TOK_IDENT) {
+                /* allow a trailing comma before '>': 'class C<T,> {}' */
+                break;
+            }
+            if (next_token(s))
+                goto fail;
+            if (s->token.val == TOK_EXTENDS) {
+                if (next_token(s))
+                    goto fail;
+                if (js_parse_ts_type(s))
+                    goto fail;
+            }
+            if (s->token.val == '=') {
+                if (next_token(s))
+                    goto fail;
+                if (js_parse_ts_type(s))
+                    goto fail;
+            }
+            if (s->token.val == ',') {
+                if (next_token(s))
+                    goto fail;
+                continue;
+            }
+            break;
+        }
+        if (s->token.val == '>' || js_ts_rescan_greater(s) == 0) {
+            if (next_token(s))
+                goto fail;
+        } else {
+            js_parse_error(s, "expected '>' in type parameter list");
+            goto fail;
+        }
     }
 
     push_scope(s);
@@ -27172,6 +27409,28 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         JSFunctionDef *fd = s->cur_func;
         BOOL has_optional_chain = FALSE;
 
+        if (s->token.val == '<' && accept_lparen &&
+            js_ts_try_generic_call(s)) {
+            /* TS: 'f<T>(x)' style generic call — type arguments have
+               been consumed (emitting no bytecode); the parser is now
+               positioned at the call suffix ('(' / template / '?.(').
+               Fall through to ordinary function-call handling below. */
+            if (s->token.val == '(') {
+                goto parse_func_call;
+            } else if (s->token.val == TOK_TEMPLATE) {
+                if (optional_chaining_label >= 0) {
+                    return js_parse_error(s, "template literal cannot appear in an optional chain");
+                }
+                call_type = FUNC_CALL_TEMPLATE;
+                op_token_ptr = s->token.ptr;
+                goto parse_func_call2;
+            } else {
+                /* TOK_QUESTION_MARK_DOT: re-enter the loop so the
+                   existing optional-chain handling takes over. */
+                continue;
+            }
+        }
+
         if (s->token.val == TOK_QUESTION_MARK_DOT) {
             if ((parse_flags & PF_POSTFIX_CALL) == 0)
                 return js_parse_error(s, "new keyword cannot be used with an optional chain");
@@ -28015,6 +28274,36 @@ static __exception int js_parse_coalesce_expr(JSParseState *s, int parse_flags)
 
     if (js_parse_logical_and_or(s, TOK_LOR, parse_flags))
         return -1;
+    /* TS: postfix 'as Type' / 'satisfies Type' / 'as const' / non-null
+       assertion '!'.  These consume no extra value: the operand's
+       bytecode (already emitted above) is left untouched on the
+       stack; the type annotation is parsed and discarded. */
+    if (s->ts_mode) {
+        for (;;) {
+            if (s->token.val == '!' && !s->got_lf) {
+                /* non-null assertion: 'x!' */
+                if (next_token(s))
+                    return -1;
+                continue;
+            }
+            if ((token_is_pseudo_keyword(s, JS_ATOM_as) ||
+                 js_ts_is_pseudo_keyword_str(s, "satisfies")) &&
+                !s->got_lf) {
+                if (next_token(s))
+                    return -1;
+                /* 'as const' has no further type syntax to consume */
+                if (s->token.val == TOK_CONST) {
+                    if (next_token(s))
+                        return -1;
+                } else {
+                    if (js_parse_ts_type(s))
+                        return -1;
+                }
+                continue;
+            }
+            break;
+        }
+    }
     if (s->token.val == TOK_DOUBLE_QUESTION_MARK) {
         label1 = new_label(s);
         for(;;) {
@@ -28212,6 +28501,14 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
     } else if (s->token.val == '(' &&
                (js_parse_skip_parens_token(s, NULL, TRUE) == TOK_ARROW ||
                 js_ts_is_arrow_with_return_type(s))) {
+        return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
+                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                      s->token.ptr);
+    } else if (s->token.val == '<' && js_ts_is_generic_arrow(s)) {
+        /* TS: '<T>(x: T) => x' generic arrow function. The type
+           parameter list has been consumed by the trial parse (no
+           bytecode emitted); js_parse_function_decl will parse the
+           generic parameters again starting from the rewound '<'. */
         return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
                                       s->token.ptr);
@@ -36750,6 +37047,51 @@ static __exception int js_parse_function_decl2(JSParseState *s,
 
     if (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
         emit_class_field_init(s);
+    }
+
+    /* TS: consume generic type parameter declarations '<T, U extends V>'.
+       For arrow functions this only applies when the caller (see
+       js_ts_is_generic_arrow) has already determined this is a
+       generic arrow '<T>(x) => x'; ordinary '(x) => x' never reaches
+       here with token.val == '<'. */
+    if (s->ts_mode && s->token.val == '<') {
+        if (next_token(s))
+            goto fail;
+        for (;;) {
+            if (s->token.val != TOK_IDENT) {
+                /* allow a trailing comma before '>': 'function f<T,>()' */
+                break;
+            }
+            if (next_token(s))
+                goto fail;
+            /* optional 'extends Constraint' */
+            if (s->token.val == TOK_EXTENDS) {
+                if (next_token(s))
+                    goto fail;
+                if (js_parse_ts_type(s))
+                    goto fail;
+            }
+            /* optional '= Default' */
+            if (s->token.val == '=') {
+                if (next_token(s))
+                    goto fail;
+                if (js_parse_ts_type(s))
+                    goto fail;
+            }
+            if (s->token.val == ',') {
+                if (next_token(s))
+                    goto fail;
+                continue;
+            }
+            break;
+        }
+        if (s->token.val == '>' || js_ts_rescan_greater(s) == 0) {
+            if (next_token(s))
+                goto fail;
+        } else {
+            js_parse_error(s, "expected '>' in type parameter list");
+            goto fail;
+        }
     }
 
     /* parse arguments */

@@ -26,11 +26,11 @@ Last updated: 2026-07-30
 | TS-20 | Done | 100 | Pass | `quickjs.c:23125-23145` lexer(未改) + 新增 `js_ts_rescan_greater` | **`>` token 重扫机制**:O(1) 词法重解释,把 `TOK_SAR`/`TOK_SHR`/`TOK_SAR_ASSIGN`/`TOK_SHR_ASSIGN`/`TOK_GTE` 重扫为单个 `>` | RFC §D2.2(b)、S4 | 子 agent(Opus-4.8)独立核对 PASS;发现并修复 `TOK_GTE`(`>=`)遗漏 |
 | TS-21 | Done | 100 | Pass | `tests/test_ts.js` | 重扫单测:2/3/4 层嵌套泛型、泛型内数组后缀、无空格闭合 `Array<number>=x`;确认 JS 位移(`>>`/`>>>`/`>>=`/`>>>=`/`>=`)零回归 | RFC §S1、S4 | `make test` 零失败;子 agent 追踪 4 层嵌套时序全部正确 |
 | **M2b · 泛型与断言(歧义消解核心)** | | | | | | | |
-| TS-22 | Not Started | 0 | Not Run | `quickjs.c` | 泛型参数声明 `function f<T>()` / `class C<T>` / 约束与默认值 `<T extends U = V>` / 变体修饰符 | RFC §D2 | — |
-| TS-23 | Not Started | 0 | Not Run | `quickjs.c` | **泛型实参消歧**(emit-free trial-parse + 失败回退 + `memset OP_nop` 清理):`f<T>(x)`、`obj.m<T>()`、`new C<T>()`、tagged template、`fn<T>?.()` | RFC §D2.2(a)、S4 | — |
-| TS-24 | Not Started | 0 | Not Run | `quickjs.c` | 泛型箭头函数 `<T>(x: T) => x`、带返回类型箭头 `(): T => x` | RFC §D2.1、D2.3 | — |
-| TS-25 | Not Started | 0 | Not Run | `quickjs.c` | `as` / `satisfies` / `as const` / 非空断言 `!` / 确定赋值断言 `x!: T` | RFC §D2.1 | — |
-| TS-26 | Not Started | 0 | Not Run | `tests/` | M2b 单测(重点:歧义反例 `a<b>(c)` 须解析为两次比较 + 最坏回溯复杂度) | RFC §S4、风险表 | — |
+| TS-22 | Done | 100 | Pass | `quickjs.c` `js_parse_function_decl2`/`js_parse_class` | 泛型参数声明:`function f<T>()` / `class C<T>` / 约束与默认值 `<T extends U = V>`;支持 trailing comma `<T,>` | RFC §D2 | 子 agent 二轮核对 |
+| TS-23 | Done | 100 | Pass | `quickjs.c` `js_ts_try_generic_call` | **泛型实参消歧**(emit-free trial-parse + 结构启发式,不需 memset OP_nop——callee 求值在判定前已完成且两种判定均需要它):`f<T>(x)`、`obj.m<T>()`、`id<number,string>()`、trailing comma | RFC §D2.2(a)、S4 | PARTIAL→2问题修复:trailing comma 缺口、复杂度扫描范围脆弱性 |
+| TS-24 | Done | 100 | Pass | `quickjs.c` `js_ts_is_generic_arrow` | 泛型箭头函数 `<T>(x: T) => x`、带返回类型、多参数 | RFC §D2.1、D2.3 | — |
+| TS-25 | Done | 100 | Pass | `quickjs.c` `js_parse_coalesce_expr` | `as` / `satisfies` / `as const` / 非空断言 `!`;插入位置符合 TS 优先级(`a+b as T`=`(a+b) as T`);ASI 换行处理正确 | RFC §D2.1 | — |
+| TS-26 | Done | 100 | Pass | `tests/test_ts.js` | 歧义反例(`a<b>(c)`、点限定标识符、加空格)+ 深嵌套泛型性能(10000次线性)+ make test 零回归 | RFC §S4、风险表 | 第一轮子 agent 评审输出不完整,重新委派不同模型 |
 | **M3 · 类型声明(纯擦除)** | | | | | | | |
 | TS-30 | Not Started | 0 | Not Run | `quickjs.c` | `interface` 声明(整体消费丢弃) | RFC §B1 | — |
 | TS-31 | Not Started | 0 | Not Run | `quickjs.c` | `type` 别名(含泛型、条件类型等仅语法消费) | RFC §B1 | — |

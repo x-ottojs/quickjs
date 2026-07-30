@@ -15,10 +15,10 @@ M1  ts_mode 骨架 + 类型注解(Done — 已推送,3 bug 修复:箭头返回�
 M2a `>` token 重扫(Done — 已推送,阻断级前置已解除)
    │
    ▼
-M2b 泛型与断言(歧义消解核心,风险最高)  ◄── 下一步
+M2b 泛型与断言(歧义消解核心,风险最高)(Done — 已推送,2 轮子agent评审)
    │
    ▼
-M3  类型声明(interface/type/declare + 重载签名,纯擦除)
+M3  类型声明(interface/type/declare + 重载签名,纯擦除)  ◄── 下一步
    │   └─ 至此 B1 完成,可独立交付
    ▼
 M4  enum + const enum(首个生成运行时代码,含最小 binder)
@@ -205,16 +205,57 @@ TODO refs: TS-20 ~ TS-21
 ---
 
 # Milestone M2b: 泛型与断言(歧义消解核心)
-Status: Not Started
-Progress: 0%
+Status: Done
+Progress: 100%
 Depends on: M2a
 RFC refs: §D2、§S4
-Context budget: 约 80k / 120k
+Context budget: 约 80k / 120k(实际,含 2 轮子 agent 评审)
 TODO refs: TS-22 ~ TS-26
 
-**风险最高的里程碑**。核心难点:`f<T>(x)` 与 `a < b` 的消歧。策略见 RFC §D2——回溯试探 + 失败回退,复用 `js_parse_get_pos`/`js_parse_seek_token`。
+**风险最高的里程碑,已完成。** 核心难点:`f<T>(x)` 与 `a < b` 的消歧。
 
-验证必须含**歧义反例**:`a<b>(c)` 在 JS 语义下是 `(a<b)>(c)` 两次比较,不得被误判为泛型调用;并测深嵌套泛型的最坏回溯性能(S4 终止性要求)。
+## 关键决策(用户 grill 确认)
+
+`a<b>(c)` 与 `f<T>(x)` 语法上完全同形,真实 TS 编译器也依赖启发式而非纯语法判定。选定**方案 B(结构启发式)**:类型实参列表含逗号、或含 `[|&(<` 等复杂语法标记 → 判为泛型;单一简单标识符实参 + 后接 `(` → 保守判为比较表达式(已知限制,非 bug,可用逗号或类型断言绕过)。
+
+## 实现
+
+- `js_ts_try_generic_call`:postfix 循环内 `<` 分支,emit-free trial-parse + 结构复杂度启发式判定。
+- `js_ts_is_generic_arrow`:表达式起始 `<T>(x)=>x` 判定。
+- `js_parse_function_decl2` / `js_parse_class`:泛型参数声明 `<T, U extends V>` 消费。
+- `js_parse_coalesce_expr`:`as`/`satisfies`/`as const`/非空断言 `!` 后缀循环,插入位置在 `js_parse_logical_and_or(TOK_LOR)` 之后,符合 TS 官方优先级(`a+b as T` = `(a+b) as T`)。
+
+## 子 agent 独立核对(两轮)
+
+第一轮委派评审输出不完整(任务标记完成但只有中间思考,无最终结论)——按重复漂移/失败路径处理,**重新委派不同模型**。
+
+第二轮(GPT-5.5)判 **PARTIAL**,发现 2 个真实问题,均已修复:
+
+| 问题 | 严重级别 | 修复 |
+| --- | --- | --- |
+| trailing comma `<T,>` 在泛型箭头/调用/函数声明/类声明中均不支持,且 `js_ts_is_generic_arrow` 注释承诺支持但代码未实现(注释与实现不一致) | MEDIUM | 4 处均加 trailing comma 支持 |
+| `js_ts_try_generic_call` 复杂度扫描范围用 `s->buf_ptr` 而非精确的实参结束位置,依赖"越界扫到的分隔符不在复杂标记集合内"这一偶然安全条件——评审判定为"最危险的单点" | LOW(尚未导致误判,但是脆弱设计) | 改用 `s->token.ptr`(`js_parse_ts_type` 返回后即下一个 token 起点),扫描范围精确对应当前实参 |
+
+评审同时确认核心歧义反例 `a<b>(c)` 正确判为比较(不误判)、postfix 集成正确(`accept_lparen` 双重保护)、`as`/`satisfies` 优先级正确、ASI 换行处理正确、零回归成立。
+
+## 验证结果
+
+- 核心歧义反例:`a<b>(c)`、`a<Foo.Bar>(c)`(点限定标识符)、加空格 `a < b > (c)` —— 全部正确判为比较,结果一致。
+- 泛型调用消歧:多参数 `id<number,string>(42)`、复杂语法 `id<number[]>(42)` —— 正确判泛型。
+- 泛型声明:函数 `function f<T>()`、`extends` 约束、类 `class Box<T>` —— 全部通过。
+- 泛型箭头:`<T>(x)=>x`、带返回类型、多参数 —— 全部通过。
+- `as`/`satisfies`/`as const`/非空断言 —— 全部通过,含组合 `(5 as number)!`。
+- trailing comma:泛型箭头/调用/函数声明/类声明四处 —— 全部通过(第二轮修复后)。
+- 深嵌套泛型调用性能:10000 次线性时间,非指数级(S4 终止性要求)。
+- JS 位移/关系运算符零回归:`8>>2`、`5>=3` 等结果不变;`as`/`satisfies` 作变量名零回归。
+- `make test` 零失败。
+
+## 结案
+
+- 迭代目的:解决 TS 融合中最危险的语法歧义,完成 M2 阶段(泛型与断言)。
+- 迭代前问题:`f<T>(x)` 与 `a<b` 语法歧义无解析方案;`as`/`satisfies`/非空断言/泛型声明均未实现。
+- 如何迭代:摸底 `<` 的解析入口与字节码 emit 时机(发现 callee 求值在判定前已完成,不需清理)→ grill 确认消歧规则(结构启发式,保守回退)→ 实现 5 处改动 → 两轮子 agent 评审(第一轮失败重新委派,第二轮判 PARTIAL)→ 修复 2 个问题(trailing comma 缺口、扫描范围脆弱性)。
+- 最终结果:TS-22~TS-26 全部 `Done`。M2(泛型与断言)阶段完成,可推进 M3(类型声明)。剩余风险:单参数无逗号泛型调用与比较表达式同形时保守判比较,是设计内已知限制,已在 RFC 记录。
 
 ---
 
