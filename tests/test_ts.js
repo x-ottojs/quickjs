@@ -311,4 +311,115 @@ namespace fnSecond {
 function fnSecond() { return "fn2 " + fnSecond.tag; }
 print(fnSecond());
 
+// M6a: legacy decorators -- method decorator
+function logMethod(target, key, descriptor) {
+    print("method decorated:", key);
+}
+class DecFoo1 {
+    @logMethod
+    greet() { return "hi"; }
+}
+print(new DecFoo1().greet());
+
+// M6a: decorator factory + descriptor mutation
+function enumerable(value) {
+    return function(target, key, descriptor) {
+        descriptor.enumerable = value;
+        return descriptor;
+    };
+}
+class DecFoo2 {
+    @enumerable(false)
+    greet() { return "hello"; }
+}
+var df2 = new DecFoo2();
+print(Object.getOwnPropertyDescriptor(DecFoo2.prototype, "greet").enumerable, df2.greet());
+
+// M6a: multiple decorators, composition order (top-to-bottom eval,
+// bottom-to-top call)
+var decOrder = [];
+function first() {
+    decOrder.push("first-eval");
+    return function() { decOrder.push("first-call"); };
+}
+function second() {
+    decOrder.push("second-eval");
+    return function() { decOrder.push("second-call"); };
+}
+class DecFoo3 {
+    @first()
+    @second()
+    method() {}
+}
+print(decOrder.join(","));
+
+// M6a: property decorator (no descriptor, return value ignored)
+var propDecorated = null;
+function recordProp(target, key) { propDecorated = key; }
+class DecFoo4 {
+    @recordProp
+    start;
+}
+print(propDecorated);
+
+// M6a: static method decorator
+function staticDec(target, key, descriptor) {
+    print("static decorated on", typeof target === "function" ? "ctor" : "proto", key);
+}
+class DecFoo5 {
+    @staticDec
+    static method() { return 1; }
+}
+print(DecFoo5.method());
+
+// M6a: class decorator (observe + replace)
+var classDecCalled = false;
+function sealedLike(ctor) { classDecCalled = true; }
+@sealedLike
+class DecFoo6 { x = 1; }
+print(new DecFoo6().x, classDecCalled);
+
+function reportable(ctor) {
+    return class extends ctor {
+        reportingURL = "http://example.com";
+    };
+}
+@reportable
+class DecFoo7 {
+    type = "report";
+    constructor(t) { this.title = t; }
+}
+var df7 = new DecFoo7("test");
+print(df7.title, df7.type, df7.reportingURL);
+
+// M6a: parameter decorator -- evaluated once at class declaration
+// time (not per-construction), verified via a counter
+var paramFactoryEvalCount = 0;
+function traceParam(msg) {
+    paramFactoryEvalCount++;
+    return function(target, key, idx) {};
+}
+class DecFoo8 {
+    constructor(@traceParam("p0") a, @traceParam("p1") b) {}
+}
+new DecFoo8(1, 2);
+new DecFoo8(3, 4);
+new DecFoo8(5, 6);
+print(paramFactoryEvalCount);
+
+// M6a: class + parameter decorators together (order matches tsc:
+// __param entries applied before class decorator)
+var comboOrder = [];
+function comboClassDec(msg) {
+    return function(ctor) { comboOrder.push("class:" + msg); };
+}
+function comboParamDec(msg) {
+    return function(target, key, idx) { comboOrder.push("param:" + msg); };
+}
+@comboClassDec("A")
+class DecFoo9 {
+    constructor(@comboParamDec("p0") x) {}
+}
+print(comboOrder.join(","));
+
 print("ALL TS TESTS PASSED");

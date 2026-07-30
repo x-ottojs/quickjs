@@ -22122,6 +22122,21 @@ typedef struct JSFunctionDef {
        at that point. */
     JSAtom *ts_param_prop_names;
     int ts_param_prop_count;
+    /* TS: legacy parameter decorators ('@dec' before a parameter),
+       collected while parsing *this* function's parameter list.
+       Reused across js_parse_class -- once js_parse_function_decl2
+       returns for a class member, js_parse_class moves these entries
+       (with the enclosing member's name/is_static filled in, exactly
+       like js_ts_attach_pending_decorators does for method/property
+       decorators) into its own decorator_head so
+       js_ts_apply_class_decorators can fold them into the
+       constructor/class's own decorator list per the observed tsc
+       '__param' wrapper pattern. Each entry's hidden
+       var is declared in the *enclosing* class's outer scope (not
+       this function's own scope, which is gone once
+       js_parse_function_decl2 returns) -- see the comment where these
+       are populated. */
+    struct JSTSDecoratorEntry *ts_param_decorators;
 } JSFunctionDef;
 
 /* TS: one constant-folded 'const enum' member, e.g. 'Color.Red' -> 0.
@@ -22164,6 +22179,78 @@ typedef struct JSTSMergeableDecl {
        entry actually describes a class/function, not a namespace). */
     int namespace_var_idx;
 } JSTSMergeableDecl;
+/* TS: one legacy decorator ('@expr') applied to a class member,
+   parameter, or the class itself. The decorator *expression* is
+   evaluated in source order the moment it is parsed (matching TS
+   semantics: "expressions for each decorator are evaluated
+   top-to-bottom") and its value is immediately stashed into a hidden
+   local variable of the *enclosing* function (js_parse_class runs in
+   the surrounding scope, not a separate class-body function -- see
+   fd = s->cur_func at the top of js_parse_class); js_ts_decorator_slot
+   records which slot holds it so the actual '__decorate'-equivalent
+   application code, emitted once the whole class body has been
+   parsed, can retrieve it with OP_scope_get_var. This defers *when
+   the decorator is called* (which the TS spec also defers, to after
+   the whole class is constructed) without needing to defer *when the
+   decorator expression is evaluated* (which the TS spec does not
+   defer). */
+typedef enum {
+    JS_TS_DEC_CLASS,
+    JS_TS_DEC_METHOD,     /* also covers getters/setters (TS treats
+                              accessors like methods: shared descriptor,
+                              only the first accessor in source order
+                              may be decorated) */
+    JS_TS_DEC_PROPERTY,   /* no descriptor; decorator return value
+                              ignored */
+    JS_TS_DEC_PARAMETER,  /* target member's parameter; return value
+                              ignored; folded into the *same*
+                              __decorate-style list as the enclosing
+                              method/constructor via a '__param'-style
+                              wrapper, per the observed tsc output */
+} JSTSDecoratorKind;
+
+typedef struct JSTSDecoratorEntry {
+    struct JSTSDecoratorEntry *next;
+    JSTSDecoratorKind kind;
+    JSAtom member_name;   /* JS_ATOM_NULL for the class itself and for
+                              constructor parameters */
+    BOOL is_static;
+    int param_index;      /* valid only for JS_TS_DEC_PARAMETER */
+    JSAtom hidden_var_name; /* owned (JS_DupAtom'd); name of the
+                              local variable holding this decorator's
+                              already-evaluated value. Accessed by
+                              atom via OP_scope_get_var, NOT by
+                              fd->vars[] index -- define_var() can
+                              return the placeholder GLOBAL_VAR_OFFSET
+                              (not a real vars[] index) for lexical
+                              declarations at top-level eval/global
+                              scope (same pitfall already hit and
+                              fixed in M5 for JS_VAR_DEF_VAR; it
+                              recurs here for JS_VAR_DEF_LET), so
+                              indexing fd->vars[] with the raw
+                              define_var() return value is unsafe.
+                              Unused (JS_ATOM_NULL) for
+                              JS_TS_DEC_PARAMETER, which uses
+                              decorator_src_start/end instead (see
+                              below). */
+    /* TS: valid only for JS_TS_DEC_PARAMETER. Source range of the
+       decorator expression, skipped-but-not-evaluated while parsing
+       the parameter list (js_ts_skip_decorator_expr) since parameter
+       decorators must be evaluated once at class-declaration time,
+       not every time the constructor/method runs -- see the call site
+       in js_parse_function_decl2's parameter loop. Re-parsed for real
+       (this time emitting bytecode into the *class's* enclosing
+       function, not the constructor's own) once the whole class body
+       has been consumed. */
+    const uint8_t *decorator_src_start;
+    const uint8_t *decorator_src_end;
+    /* ordering within the same (kind, member_name, is_static,
+       param_index) group: entries are appended in source order and
+       later applied in *reverse* (bottom-to-top call order per TS
+       "Decorator Composition"); traversing the singly linked list
+       from head naturally gives reverse-of-append order since new
+       entries are prepended. */
+} JSTSDecoratorEntry;
 
 typedef struct JSToken {
     int val;
@@ -22217,6 +22304,18 @@ typedef struct JSParseState {
        (see JSTSMergeableDecl above). Same whole-parse scoping
        approximation as ts_const_enum_head. */
     struct JSTSMergeableDecl *ts_merge_head;
+    /* TS: monotonically increasing counter, shared across the WHOLE
+       parse (not per-class!), used to build unique hidden variable
+       names for legacy-decorator values (js_parse_class,
+       js_ts_apply_decorators, js_ts_apply_class_decorators). A
+       per-class counter would produce colliding names like
+       "<ts_dec_0>" for two independently decorated classes in the
+       same enclosing scope -- these hidden variables are declared at
+       decorator_scope_level, which for two sibling classes at the
+       same nesting depth is literally the same scope, so their names
+       really do need to be globally unique within that parse, not
+       just unique within one class body. */
+    int ts_decorator_counter;
     GetLineColCache get_line_col_cache;
 } JSParseState;
 
@@ -24565,6 +24664,13 @@ static JSTSMergeableDecl *js_ts_merge_record(JSParseState *s, JSAtom name,
                                              int namespace_var_idx);
 static __exception int js_ts_emit_param_properties(JSParseState *s,
                                                     JSFunctionDef *fd);
+static __exception int js_ts_apply_decorators(JSParseState *s,
+                                              JSTSDecoratorEntry *head,
+                                              JSAtom class_var_name);
+static __exception int js_ts_apply_class_decorators(JSParseState *s,
+                                                     JSTSDecoratorEntry *head,
+                                                     JSAtom class_var_name);
+static void js_ts_free_decorator_list(JSContext *ctx, JSTSDecoratorEntry *head);
 static BOOL js_ts_const_enum_lookup(JSParseState *s, JSAtom enum_name,
                                     JSAtom member_name, JSValue *pval);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
@@ -25558,6 +25664,85 @@ static void emit_class_field_init(JSParseState *s)
    -- in principle -- more than one super() call site could reach
    this function (not valid JS, but defensive regardless). No-op if
    the list is empty (the common case: no parameter properties). */
+/* TS: skip over one legacy-decorator expression ('@' already
+   consumed) without emitting any bytecode, advancing the token stream
+   past it for real (unlike js_parse_skip_parens_token, which always
+   rewinds). Used for parameter decorators, whose expressions must be
+   evaluated *once at class-declaration time* (verified against real
+   tsc output: '__param(0, trace("p0"))' appears in the class's own
+   __decorate call, not inside the constructor body) rather than each
+   time the constructor runs -- so they cannot use the same
+   'parse-and-emit immediately' approach as method/property/class
+   decorators (whose evaluation point IS meant to be inline, per TS
+   "Decorator Composition"). The skipped range [start_ptr, s->token.ptr)
+   is recorded by the caller and re-parsed for real once the whole
+   class has been constructed (js_ts_reparse_and_emit_decorator).
+
+   Grammar handled (deliberate range limit, matches the overwhelmingly
+   common real-world parameter-decorator shapes: bare references and
+   factory calls, optionally chained):
+     LeftHandSideExpr := Ident ('.' Ident | '(' ... ')' | '[' ... ']')*
+   Arbitrary expressions (arrow functions, conditional expressions,
+   'new', etc. as a parameter decorator) are rejected with a clear
+   parse error rather than mis-skipped -- TC39/TS parameter decorators
+   are essentially always a plain reference or one factory call in
+   real code, so this is not a meaningful practical limitation. */
+static __exception int js_ts_skip_decorator_expr(JSParseState *s)
+{
+    if (s->token.val != TOK_IDENT) {
+        return js_parse_error(s, "unsupported parameter decorator expression "
+                              "(expected a plain identifier or factory call)");
+    }
+    if (next_token(s))
+        return -1;
+    for (;;) {
+        if (s->token.val == '.') {
+            if (next_token(s))
+                return -1;
+            if (s->token.val != TOK_IDENT) {
+                return js_parse_error(s, "expected identifier after '.' "
+                                      "in parameter decorator expression");
+            }
+            if (next_token(s))
+                return -1;
+        } else if (s->token.val == '(' || s->token.val == '[') {
+            /* Skip one balanced bracketed range (call arguments or a
+               computed-member index). A single depth counter over ALL
+               bracket kinds is sufficient here (does not need to
+               check that '(' pairs with ')' specifically, etc.):
+               well-formed JS source is always correctly nested, and
+               this function's only job is to find where the *outer*
+               bracket closes, not to validate the inner grammar (that
+               is exactly the same simplification
+               js_parse_skip_parens_token makes). */
+            int depth = 1;
+            if (next_token(s))
+                return -1;
+            while (depth > 0) {
+                switch (s->token.val) {
+                case TOK_EOF:
+                    return js_parse_error(s, "unterminated parameter "
+                                          "decorator expression");
+                case '(': case '[': case '{':
+                    depth++;
+                    break;
+                case ')': case ']': case '}':
+                    depth--;
+                    break;
+                default:
+                    break;
+                }
+                if (next_token(s))
+                    return -1;
+            }
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
+
 static __exception int js_ts_emit_param_properties(JSParseState *s,
                                                     JSFunctionDef *fd)
 {
@@ -25614,6 +25799,7 @@ typedef struct {
     BOOL is_static;
 } ClassFieldsDef;
 
+
 static __exception int emit_class_init_start(JSParseState *s,
                                              ClassFieldsDef *cf)
 {
@@ -25664,9 +25850,452 @@ static void emit_class_init_end(JSParseState *s, ClassFieldsDef *cf)
     emit_op(s, OP_set_home_object);
 }
 
+/* TS: move every decorator collected so far for the member currently
+   being parsed (js_parse_class's 'pending_member_decorators', all
+   still tagged with the placeholder kind/JS_ATOM_NULL set when '@expr'
+   was seen) into the class-wide list, filling in this member's real
+   name/kind/is_static now that they are known. Called once per member
+   from every branch that determines a member's final kind (method,
+   getter/setter, field/property); a no-op if the member had no
+   decorators (the common case). '*ppending' and '*phead' are
+   js_parse_class's locals, passed by pointer since this is a small
+   local helper, not a globally reusable one. */
+static void js_ts_free_decorator_list(JSContext *ctx, JSTSDecoratorEntry *head)
+{
+    JSTSDecoratorEntry *e, *next;
+    for (e = head; e; e = next) {
+        next = e->next;
+        JS_FreeAtom(ctx, e->member_name);
+        JS_FreeAtom(ctx, e->hidden_var_name);
+        js_free(ctx, e);
+    }
+}
+
+static void js_ts_attach_pending_decorators(JSTSDecoratorEntry **ppending,
+                                            JSTSDecoratorEntry **phead,
+                                            JSTSDecoratorKind kind,
+                                            JSContext *ctx, JSAtom name,
+                                            BOOL is_static)
+{
+    JSTSDecoratorEntry *e = *ppending;
+    if (!e)
+        return;
+    while (e) {
+        e->kind = kind;
+        e->member_name = JS_DupAtom(ctx, name);
+        e->is_static = is_static;
+        if (!e->next)
+            break;
+        e = e->next;
+    }
+    /* splice pending onto the front of head (pending is already in
+       the right relative order for this one member; head accumulates
+       across members in class-body source order, which is what
+       js_ts_apply_decorators needs to reconstruct the TS "instance
+       members then static members" grouping). */
+    e->next = *phead;
+    *phead = *ppending;
+    *ppending = NULL;
+}
+
+/* TS: emit the legacy-decorator application code for one class, once
+   its body has been fully parsed and the class object itself is
+   already bound to 'class_var_name' (js_parse_class calls this right
+   after that binding). Mirrors the well-known '__decorate' helper
+   that tsc itself emits (verified against real tsc 5.x output): for
+   each decorated method/accessor, 'Object.getOwnPropertyDescriptor' +
+   the decorators applied bottom-to-top (each one possibly replacing
+   the descriptor) + 'Object.defineProperty'; for each decorated
+   property, the decorators are simply called (return value ignored,
+   no descriptor). No new opcodes are used -- Object.getOwnPropertyDescriptor
+   / Object.defineProperty are ordinary global-function calls emitted
+   with the same primitives used everywhere else in the parser.
+   Class decorators and constructor-parameter decorators are applied
+   separately (js_ts_apply_class_decorators), after all member
+   decorators, per TS "Decorator Evaluation" ordering. A no-op (emits
+   nothing) if 'head' is NULL -- the common case of an undecorated
+   class. Does not free 'head' entries' member_name atoms or the list
+   itself; the caller (js_parse_class) does that once both this and
+   js_ts_apply_class_decorators have run, since the class-decorator
+   pass also needs to walk 'head' looking for JS_TS_DEC_CLASS/
+   JS_TS_DEC_PARAMETER entries. */
+static __exception int js_ts_apply_decorators(JSParseState *s,
+                                              JSTSDecoratorEntry *head,
+                                              JSAtom class_var_name)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    JSTSDecoratorEntry *e;
+    JSTSDecoratorEntry **done = NULL;
+    int done_count = 0, done_alloc = 0;
+    int ret = 0;
+    for (e = head; e; e = e->next) {
+        JSTSDecoratorEntry *cur;
+        BOOL already_done = FALSE;
+        int i;
+        JSAtom target_hidden, desc_hidden = JS_ATOM_NULL;
+        char name_buf[32];
+
+        if (e->kind != JS_TS_DEC_METHOD && e->kind != JS_TS_DEC_PROPERTY)
+            continue; /* class/parameter decorators: applied elsewhere,
+                         by js_ts_apply_class_decorators */
+
+        for (i = 0; i < done_count; i++) {
+            if (done[i] == e) {
+                already_done = TRUE;
+                break;
+            }
+        }
+        if (already_done)
+            continue;
+
+        /* target = is_static ? ClassCtor : ClassCtor.prototype --
+           stashed into a hidden local (accessed by atom, NOT by
+           define_var()'s return value used as a fd->vars[] index --
+           see JSTSDecoratorEntry.hidden_var_name's comment for why
+           that is unsafe) so every later step (desc read, N decorator
+           calls, desc write-back) can fetch it by name instead of
+           juggling stack depth across a variable number of calls. */
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, class_var_name);
+        emit_u16(s, fd->scope_level);
+        if (!e->is_static) {
+            emit_op(s, OP_get_field);
+            emit_atom(s, JS_ATOM_prototype);
+        }
+        snprintf(name_buf, sizeof(name_buf), "<ts_dec_tgt_%d>", s->ts_decorator_counter++);
+        target_hidden = JS_NewAtom(ctx, name_buf);
+        if (target_hidden == JS_ATOM_NULL) { ret = -1; goto out; }
+        if (define_var(s, fd, target_hidden, JS_VAR_DEF_LET) < 0) {
+            JS_FreeAtom(ctx, target_hidden);
+            ret = -1; goto out;
+        }
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, target_hidden);
+        emit_u16(s, fd->scope_level);
+
+        if (e->kind == JS_TS_DEC_METHOD) {
+            /* desc = Object.getOwnPropertyDescriptor(target, "key") */
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, JS_ATOM_Object);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_get_field2); /* Object -- Object getOwnPropertyDescriptor */
+            emit_atom(s, JS_ATOM_getOwnPropertyDescriptor);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, target_hidden);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_push_atom_value);
+            emit_atom(s, e->member_name);
+            emit_op(s, OP_call_method);
+            emit_u16(s, 2); /* -- desc */
+
+            snprintf(name_buf, sizeof(name_buf), "<ts_dec_desc_%d>", s->ts_decorator_counter++);
+            desc_hidden = JS_NewAtom(ctx, name_buf);
+            if (desc_hidden == JS_ATOM_NULL) {
+                JS_FreeAtom(ctx, target_hidden);
+                ret = -1; goto out;
+            }
+            if (define_var(s, fd, desc_hidden, JS_VAR_DEF_LET) < 0) {
+                JS_FreeAtom(ctx, target_hidden);
+                JS_FreeAtom(ctx, desc_hidden);
+                ret = -1; goto out;
+            }
+            emit_op(s, OP_scope_put_var_init);
+            emit_atom(s, desc_hidden);
+            emit_u16(s, fd->scope_level);
+        }
+
+        /* Apply every decorator for this exact (member_name, is_static,
+           kind) group, bottom-to-top per TS "Decorator Composition"
+           (the singly linked list is already in that order:
+           js_ts_attach_pending_decorators prepends entries as they
+           are parsed, so head-to-tail traversal visits the
+           *last*-declared decorator on this member first, matching
+           tsc's '__decorate' which iterates its array from
+           decorators.length-1 down to 0). Track every entry consumed
+           here in 'done' so later outer-loop iterations skip it. */
+        for (cur = e; cur; cur = cur->next) {
+            if (cur->kind != e->kind || cur->member_name != e->member_name ||
+                cur->is_static != e->is_static)
+                continue;
+
+            if (done_count >= done_alloc) {
+                int na = done_alloc ? done_alloc * 2 : 8;
+                JSTSDecoratorEntry **nd = js_realloc(ctx, done, sizeof(*nd) * na);
+                if (!nd) {
+                    JS_FreeAtom(ctx, target_hidden);
+                    if (desc_hidden != JS_ATOM_NULL) JS_FreeAtom(ctx, desc_hidden);
+                    ret = -1; goto out;
+                }
+                done = nd;
+                done_alloc = na;
+            }
+            done[done_count++] = cur;
+
+            if (e->kind == JS_TS_DEC_METHOD) {
+                int label_no_result;
+                /* result = decorator(target, "key", desc);
+                   if (result !== undefined) desc = result;
+                   OP_call's callee is call_argv[-1] and it always
+                   invokes with JS_UNDEFINED as 'this' (see
+                   CASE(OP_call)) -- stack is simply
+                   [func, arg1, arg2, arg3], no separate 'this' slot. */
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, cur->hidden_var_name);
+                emit_u16(s, fd->scope_level);
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, target_hidden);
+                emit_u16(s, fd->scope_level);
+                emit_op(s, OP_push_atom_value);
+                emit_atom(s, e->member_name);
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, desc_hidden);
+                emit_u16(s, fd->scope_level);
+                emit_op(s, OP_call);
+                emit_u16(s, 3); /* -- result */
+                emit_op(s, OP_dup);
+                emit_op(s, OP_undefined);
+                emit_op(s, OP_strict_eq);
+                label_no_result = emit_goto(s, OP_if_true, -1);
+                /* result !== undefined: desc = result */
+                emit_op(s, OP_scope_put_var);
+                emit_atom(s, desc_hidden);
+                emit_u16(s, fd->scope_level);
+                {
+                    int label_end = emit_goto(s, OP_goto, -1);
+                    emit_label(s, label_no_result);
+                    emit_op(s, OP_drop); /* result === undefined: discard it */
+                    emit_label(s, label_end);
+                }
+            } else {
+                /* JS_TS_DEC_PROPERTY: decorator(target, "key"); return
+                   value ignored entirely (per TS docs). No separate
+                   'this' operand (see OP_call note above). */
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, cur->hidden_var_name);
+                emit_u16(s, fd->scope_level);
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, target_hidden);
+                emit_u16(s, fd->scope_level);
+                emit_op(s, OP_push_atom_value);
+                emit_atom(s, e->member_name);
+                emit_op(s, OP_call);
+                emit_u16(s, 2); /* -- result */
+                emit_op(s, OP_drop);
+            }
+        }
+
+        if (e->kind == JS_TS_DEC_METHOD) {
+            /* Object.defineProperty(target, "key", desc) */
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, JS_ATOM_Object);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_get_field2);
+            emit_atom(s, JS_ATOM_defineProperty);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, target_hidden);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_push_atom_value);
+            emit_atom(s, e->member_name);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, desc_hidden);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_call_method);
+            emit_u16(s, 3); /* -- result (defineProperty returns target) */
+            emit_op(s, OP_drop);
+        }
+
+        JS_FreeAtom(ctx, target_hidden);
+        if (desc_hidden != JS_ATOM_NULL)
+            JS_FreeAtom(ctx, desc_hidden);
+    }
+out:
+    js_free(ctx, done);
+    return ret;
+}
+
+/* TS: apply parameter decorators (folded into the "__param" pattern
+   observed in real tsc output) and class decorators, in that order,
+   after all method/property decorators (js_ts_apply_decorators) have
+   already run -- matching TS "Decorator Evaluation": "Parameter
+   Decorators are applied for the constructor. Class Decorators are
+   applied for the class." Both kinds may replace/observe the class
+   binding: a class decorator's return value (if not undefined)
+   replaces the bound constructor; the final (possibly replaced) value
+   is what 'class_var_name' ends up holding. No new opcodes. */
+static __exception int js_ts_apply_class_decorators(JSParseState *s,
+                                                     JSTSDecoratorEntry *head,
+                                                     JSAtom class_var_name)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    JSTSDecoratorEntry *e;
+    BOOL have_param = FALSE, have_class = FALSE;
+    JSTSDecoratorEntry **params = NULL;
+    int param_count = 0, param_alloc = 0;
+    int ret = 0;
+    int i;
+
+    for (e = head; e; e = e->next) {
+        if (e->kind == JS_TS_DEC_PARAMETER) have_param = TRUE;
+        if (e->kind == JS_TS_DEC_CLASS) have_class = TRUE;
+    }
+    if (!have_param && !have_class)
+        return 0;
+
+    if (have_param) {
+        /* Collect every JS_TS_DEC_PARAMETER entry into an array so it
+           can be walked in *both* directions independently: source
+           order for evaluation (verified against tsc: 'factory eval:
+           p0' happens before 'factory eval: p1' for
+           'constructor(@trace("p0") a, @trace("p1") b)') and
+           reverse-of-source order for application (verified: 'p1' is
+           *applied* before 'p0' -- same bottom-to-top rule as every
+           other decorator kind). 'head' is built by prepending as
+           parameters are parsed, so it is already in
+           reverse-of-source order; the array is filled by walking
+           'head' forward (index 0 = last-declared = 'p1') and then
+           read *backwards* for the evaluation pass (index
+           param_count-1 = first-declared = 'p0'). */
+        for (e = head; e; e = e->next) {
+            if (e->kind != JS_TS_DEC_PARAMETER)
+                continue;
+            if (param_count >= param_alloc) {
+                int na = param_alloc ? param_alloc * 2 : 8;
+                JSTSDecoratorEntry **np = js_realloc(ctx, params, sizeof(*np) * na);
+                if (!np) { ret = -1; goto out; }
+                params = np;
+                param_alloc = na;
+            }
+            params[param_count++] = e;
+        }
+
+        /* --- pass 1: evaluate every parameter-decorator expression,
+           in source order (array index param_count-1 down to 0),
+           stashing each into its own hidden local -- mirrors
+           js_ts_apply_decorators' 'evaluate once, apply later'
+           pattern, except the "later" here is a second pass over this
+           same array rather than an inline call. Re-parsing happens
+           now that we are back in the class's enclosing function (not
+           the constructor/method's own, long gone) -- this is the
+           point tsc itself evaluates these at (verified: '__param(0,
+           trace("p0"))' sits inside the class's own '__decorate([...],
+           Ctor)' call, not inside the constructor body). */
+        for (i = param_count - 1; i >= 0; i--) {
+            JSParsePos resume_pos, jump_pos;
+            JSAtom hidden_name;
+            char name_buf[32];
+
+            js_parse_get_pos(s, &resume_pos);
+            jump_pos.ptr = params[i]->decorator_src_start;
+            jump_pos.got_lf = FALSE; /* the expression was already
+                fully parsed once (successfully) by
+                js_ts_skip_decorator_expr, so no ASI-sensitive token
+                boundary is being crossed here */
+            if (js_parse_seek_token(s, &jump_pos)) { ret = -1; goto out; }
+            if (js_parse_left_hand_side_expr(s)) { ret = -1; goto out; }
+            if (js_parse_seek_token(s, &resume_pos)) { ret = -1; goto out; }
+
+            snprintf(name_buf, sizeof(name_buf), "<ts_pdec_%d>", s->ts_decorator_counter++);
+            hidden_name = JS_NewAtom(ctx, name_buf);
+            if (hidden_name == JS_ATOM_NULL) { ret = -1; goto out; }
+            if (define_var(s, fd, hidden_name, JS_VAR_DEF_LET) < 0) {
+                JS_FreeAtom(ctx, hidden_name);
+                ret = -1; goto out;
+            }
+            emit_op(s, OP_scope_put_var_init);
+            emit_atom(s, hidden_name);
+            emit_u16(s, fd->scope_level);
+            /* stash the hidden name on the entry itself (safe: these
+               entries are otherwise done with their hidden_var_name
+               field, only ever used for JS_TS_DEC_CLASS/METHOD/
+               PROPERTY kinds) so pass 2 can read it back. */
+            params[i]->hidden_var_name = hidden_name;
+        }
+
+        /* --- pass 2: apply every parameter decorator, in
+           reverse-of-source order (array index 0 up to
+           param_count-1, i.e. last-declared first) -- per TS
+           "Decorator Composition" bottom-to-top, verified: 'decorator
+           called: p1' before 'decorator called: p0'.
+           decorator(target=Ctor, key, paramIndex); return value
+           ignored. No separate 'this' operand (OP_call always invokes
+           with this=JS_UNDEFINED). */
+        for (i = 0; i < param_count; i++) {
+            JSTSDecoratorEntry *pe = params[i];
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, pe->hidden_var_name);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, class_var_name);
+            emit_u16(s, fd->scope_level);
+            if (pe->member_name == JS_ATOM_NULL) {
+                emit_op(s, OP_undefined);
+            } else {
+                emit_op(s, OP_push_atom_value);
+                emit_atom(s, pe->member_name);
+            }
+            emit_op(s, OP_push_i32);
+            emit_u32(s, (uint32_t)pe->param_index);
+            emit_op(s, OP_call);
+            emit_u16(s, 3);
+            emit_op(s, OP_drop);
+            JS_FreeAtom(ctx, pe->hidden_var_name);
+            pe->hidden_var_name = JS_ATOM_NULL;
+        }
+    }
+
+    /* --- class decorators: result = dec(Ctor); if (result !==
+       undefined) Ctor = result; applied bottom-to-top (head-to-tail
+       traversal of 'head', which is already reverse-of-source-order
+       since js_parse_statement_or_decl's '@' loop prepends, matching
+       the convention used everywhere else in this file), AFTER all
+       parameter decorators (verified: 'classDec applied' in the tsc
+       output above always comes after every '__param' entry has run,
+       since '__decorate's single reversed pass visits array index
+       [classDec, __param(...)] from the __param end first). */
+    if (have_class) {
+        for (e = head; e; e = e->next) {
+            int label_no_result;
+            if (e->kind != JS_TS_DEC_CLASS)
+                continue;
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, e->hidden_var_name);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, class_var_name);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_call);
+            emit_u16(s, 1); /* -- result */
+            emit_op(s, OP_dup);
+            emit_op(s, OP_undefined);
+            emit_op(s, OP_strict_eq);
+            label_no_result = emit_goto(s, OP_if_true, -1);
+            emit_op(s, OP_scope_put_var);
+            emit_atom(s, class_var_name);
+            emit_u16(s, fd->scope_level);
+            {
+                int label_end = emit_goto(s, OP_goto, -1);
+                emit_label(s, label_no_result);
+                emit_op(s, OP_drop);
+                emit_label(s, label_end);
+            }
+        }
+    }
+out:
+    js_free(ctx, params);
+    return ret;
+}
+
+
+
+
+
+
 
 static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
-                                      JSParseExportEnum export_flag)
+                                      JSParseExportEnum export_flag,
+                                      JSTSDecoratorEntry *class_decorators)
 {
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
@@ -25679,6 +26308,30 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
     const uint8_t *class_start_ptr = s->token.ptr;
     const uint8_t *start_ptr;
     ClassFieldsDef class_fields[2];
+    /* TS: legacy decorators collected while parsing this class body
+       (see JSTSDecoratorEntry above); applied once the whole class
+       has been constructed (js_ts_apply_decorators). NULL if the
+       class has no decorators at all -- the overwhelmingly common
+       case -- so no extra code is ever emitted for a plain class. */
+    JSTSDecoratorEntry *decorator_head = class_decorators; /* class
+        decorators, already evaluated by the caller before 'class' was
+        even seen (see the '@' handling block in
+        js_parse_statement_or_decl) -- prepended here so member/
+        property/parameter decorators collected below simply continue
+        appending onto the same list. */
+    /* current member's pending (not-yet-attributed) decorators,
+       evaluated as they are parsed but not yet known to belong to
+       e.g. 'method' until its name token is reached; moved into
+       decorator_head (with member_name/kind/is_static filled in) once
+       that is known. */
+    JSTSDecoratorEntry *pending_member_decorators = NULL;
+    /* TS: scope level at which legacy-decorator hidden variables must
+       be declared so they survive past the class body's two
+       push_scope()/pop_scope() pairs (heritage-clause scope, then
+       private-field scope) -- js_ts_apply_decorators() reads them
+       back after both have been popped. Captured just below, right
+       before the first push_scope(). */
+    int decorator_scope_level = 0;
 
     /* classes are parsed and executed in strict mode */
     saved_js_mode = fd->js_mode;
@@ -25744,6 +26397,9 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         }
     }
 
+    decorator_scope_level = fd->scope_level; /* TS: see the field's
+        comment -- captured right before entering the class's nested
+        scopes */
     push_scope(s);
 
     if (s->token.val == TOK_EXTENDS) {
@@ -25801,6 +26457,83 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             if (next_token(s))
                 goto fail;
             continue;
+        }
+        /* TS: '@decoratorExpr' before a member. Each decorator
+           expression is evaluated right here (source-order side
+           effects, matching TS "expressions ... evaluated
+           top-to-bottom"), then its value is stashed into a hidden
+           local of the *enclosing* function (fd, not the class
+           itself) so it can be retrieved later once this member's
+           name/kind is known and, ultimately, once the whole class
+           has finished constructing (js_ts_apply_decorators). */
+        while (s->ts_mode && s->token.val == '@') {
+            JSAtom hidden_name;
+            char name_buf[32];
+            if (next_token(s)) /* consume '@' */
+                goto fail;
+            /* decorator expression: a LeftHandSideExpression covers
+               plain refs like '@sealed' and factory calls like
+               '@log("x")' uniformly via the ordinary expression
+               parser. */
+            if (js_parse_left_hand_side_expr(s))
+                goto fail;
+            /* unique per-decorator name, drawn from the whole-parse
+               counter s->ts_decorator_counter (see JSParseState's
+               comment -- must NOT be a per-class counter, or two
+               independently decorated classes at the same nesting
+               depth would generate colliding "<ts_dec_0>" names):
+               define_var(..., JS_VAR_DEF_LET) rejects a same-scope
+               redeclaration of an identical name, and a
+               class can have any number of decorators. */
+            snprintf(name_buf, sizeof(name_buf), "<ts_dec_%d>", s->ts_decorator_counter++);
+            hidden_name = JS_NewAtom(ctx, name_buf);
+            if (hidden_name == JS_ATOM_NULL)
+                goto fail;
+            {
+                /* TS: declare at decorator_scope_level (pre-class-body
+                   scope), not whatever nested scope is active while
+                   parsing '@expr' -- see that field's comment.
+                   define_var() attaches the new variable to whatever
+                   fd->scope_level is *at the time of the call*, so
+                   scope_level is swapped for the duration of this one
+                   call only. */
+                int saved_scope_level = fd->scope_level;
+                int def_ret;
+                fd->scope_level = decorator_scope_level;
+                def_ret = define_var(s, fd, hidden_name, JS_VAR_DEF_LET);
+                fd->scope_level = saved_scope_level;
+                if (def_ret < 0) {
+                    JS_FreeAtom(ctx, hidden_name);
+                    goto fail;
+                }
+            }
+            emit_op(s, OP_scope_put_var_init);
+            emit_atom(s, hidden_name);
+            emit_u16(s, fd->scope_level);
+            /* hidden_name itself (not fd->vars[]'s return index, see
+               JSTSDecoratorEntry.hidden_var_name's comment) is what
+               js_ts_apply_decorators needs later to read this value
+               back with OP_scope_get_var. */
+            {
+                JSTSDecoratorEntry *e = js_mallocz(ctx, sizeof(*e));
+                if (!e) {
+                    js_parse_error(s, "out of memory");
+                    JS_FreeAtom(ctx, hidden_name);
+                    goto fail;
+                }
+                e->hidden_var_name = hidden_name; /* ownership moves */
+                e->kind = JS_TS_DEC_METHOD; /* refined below once this
+                                                member's real kind is
+                                                known */
+                e->member_name = JS_ATOM_NULL;
+                e->param_index = -1;
+                /* prepend: js_ts_apply_decorators walks head-first,
+                   which is reverse-of-source-order == the TS
+                   "bottom-to-top call order" for decorators on the
+                   same declaration. */
+                e->next = pending_member_decorators;
+                pending_member_decorators = e;
+            }
         }
         is_static = FALSE;
         if (s->token.val == TOK_STATIC) {
@@ -25876,6 +26609,17 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             BOOL is_set = prop_type - PROP_TYPE_GET;
             JSFunctionDef *method_fd;
 
+            /* TS: accessors are decorated like methods (shared
+               PropertyDescriptor); TS only allows the decorator on
+               the first accessor for a given name in source order,
+               but that constraint is a type-checker concern, not
+               something the parser needs to enforce for correct
+               runtime behavior here. */
+            js_ts_attach_pending_decorators(&pending_member_decorators,
+                                            &decorator_head,
+                                            JS_TS_DEC_METHOD, ctx, name,
+                                            is_static);
+
             if (is_private) {
                 int idx, var_kind, is_static1;
                 idx = find_private_class_field(ctx, fd, name, fd->scope_level);
@@ -25940,6 +26684,15 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             JSAtom field_var_name = JS_ATOM_NULL;
 
             /* class field */
+
+            /* TS: property decorator -- no descriptor, decorator
+               return value ignored (per TS docs: "there is currently
+               no mechanism to describe an instance property ... The
+               return value is ignored too"). */
+            js_ts_attach_pending_decorators(&pending_member_decorators,
+                                            &decorator_head,
+                                            JS_TS_DEC_PROPERTY, ctx, name,
+                                            is_static);
 
             /* XXX: spec: not consistent with method name checks */
             if (name == JS_ATOM_constructor || name == JS_ATOM_prototype) {
@@ -26050,11 +26803,65 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 else
                     func_type = JS_PARSE_FUNC_CLASS_CONSTRUCTOR;
             }
+            /* TS: a decorator cannot be applied to the constructor
+               itself (only to the class as a whole, or to individual
+               constructor parameters) -- reject rather than silently
+               dropping or misapplying it. */
+            if ((func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
+                 func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) &&
+                pending_member_decorators) {
+                js_parse_error(s, "a decorator cannot be applied to a "
+                               "class constructor (use a class "
+                               "decorator instead)");
+                goto fail;
+            }
+            if (func_type != JS_PARSE_FUNC_CLASS_CONSTRUCTOR &&
+                func_type != JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) {
+                js_ts_attach_pending_decorators(&pending_member_decorators,
+                                                &decorator_head,
+                                                JS_TS_DEC_METHOD, ctx, name,
+                                                is_static);
+            }
             if (is_private) {
                 class_fields[is_static].need_brand = TRUE;
             }
             if (js_parse_function_decl2(s, func_type, func_kind, JS_ATOM_NULL, start_ptr, JS_PARSE_EXPORT_NONE, &method_fd))
                 goto fail;
+            /* TS: move any parameter decorators collected while
+               parsing this member's parameter list
+               (method_fd->ts_param_decorators) into the class-wide
+               decorator_head, now that this member's real name is
+               known. For a constructor, member_name stays JS_ATOM_NULL
+               (matching JS_TS_DEC_CLASS's convention) since parameter
+               decorators there are folded into the *class*'s own
+               decorator list (js_ts_apply_class_decorators), per the
+               observed tsc output ('__param(...)' appears inside the
+               class's own '__decorate([...], Ctor)' call, not a
+               separate one for the constructor). For an ordinary
+               method, member_name is that method's name; TS also
+               requires method-parameter decorators to fold into that
+               method's own '__decorate' list alongside its method
+               decorator (if any) -- js_ts_apply_decorators's grouping
+               by (kind, member_name, is_static) does not apply here
+               since JS_TS_DEC_PARAMETER entries are skipped by that
+               function entirely and handled solely by
+               js_ts_apply_class_decorators, which groups by
+               param_index instead. */
+            if (method_fd->ts_param_decorators) {
+                JSTSDecoratorEntry *pe = method_fd->ts_param_decorators;
+                BOOL is_ctor = (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
+                                func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR);
+                while (pe) {
+                    pe->member_name = is_ctor ? JS_ATOM_NULL : JS_DupAtom(ctx, name);
+                    pe->is_static = is_static;
+                    if (!pe->next)
+                        break;
+                    pe = pe->next;
+                }
+                pe->next = decorator_head;
+                decorator_head = method_fd->ts_param_decorators;
+                method_fd->ts_param_decorators = NULL;
+            }
             if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
                 func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
                 ctor_fd = method_fd;
@@ -26242,6 +27049,18 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
            class object instead of creating a new one). */
         if (js_ts_merge_record(s, class_var_name, JS_TS_MERGE_CLASS, -1) == NULL)
             goto fail;
+        /* TS: legacy decorators -- method/accessor/property decorators
+           are applied now that the class object is fully constructed
+           and bound; class and constructor-parameter decorators are
+           applied separately below (they need the *final* class
+           binding, which may itself change if a class decorator
+           returns a replacement constructor). */
+        if (decorator_head) {
+            if (js_ts_apply_decorators(s, decorator_head, class_var_name))
+                goto fail;
+            if (js_ts_apply_class_decorators(s, decorator_head, class_var_name))
+                goto fail;
+        }
     } else {
         if (class_name == JS_ATOM_NULL) {
             /* cannot use OP_set_name because the name of the class
@@ -26260,11 +27079,19 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             goto fail;
     }
 
+    js_ts_free_decorator_list(ctx, decorator_head);
+    js_ts_free_decorator_list(ctx, pending_member_decorators); /* TS:
+        should always be empty by this point (every '@'-collected
+        entry is moved out once its member's kind is known), but freed
+        defensively in case some future member-kind branch is added
+        without also calling js_ts_attach_pending_decorators. */
     JS_FreeAtom(ctx, class_name);
     JS_FreeAtom(ctx, class_var_name);
     fd->js_mode = saved_js_mode;
     return 0;
  fail:
+    js_ts_free_decorator_list(ctx, decorator_head);
+    js_ts_free_decorator_list(ctx, pending_member_decorators);
     JS_FreeAtom(ctx, name);
     JS_FreeAtom(ctx, class_name);
     JS_FreeAtom(ctx, class_var_name);
@@ -27418,7 +28245,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             return -1;
         break;
     case TOK_CLASS:
-        if (js_parse_class(s, TRUE, JS_PARSE_EXPORT_NONE))
+        if (js_parse_class(s, TRUE, JS_PARSE_EXPORT_NONE, NULL))
             return -1;
         break;
     case TOK_NULL:
@@ -29602,6 +30429,61 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 goto fail;
             goto done;
         }
+        /* TS: '@decoratorExpr' before a class declaration statement.
+           Evaluated immediately (same "expressions evaluated
+           top-to-bottom" rule as method/property decorators -- unlike
+           parameter decorators, class-decorator expressions genuinely
+           are meant to run right here, verified against tsc output:
+           class decorators appear as plain entries alongside
+           '__param(...)' ones in the class's own '__decorate([...],
+           Ctor)' call, evaluated in the same left-to-right pass). */
+        if (s->token.val == '@') {
+            JSTSDecoratorEntry *class_decorators = NULL;
+            while (s->token.val == '@') {
+                JSAtom hidden_name;
+                char name_buf[32];
+                JSTSDecoratorEntry *ce;
+                if (next_token(s)) /* consume '@' */
+                    goto fail;
+                if (js_parse_left_hand_side_expr(s))
+                    goto fail;
+                snprintf(name_buf, sizeof(name_buf), "<ts_cls_dec_%d>",
+                        s->ts_decorator_counter++);
+                hidden_name = JS_NewAtom(ctx, name_buf);
+                if (hidden_name == JS_ATOM_NULL)
+                    goto fail;
+                if (define_var(s, s->cur_func, hidden_name, JS_VAR_DEF_LET) < 0) {
+                    JS_FreeAtom(ctx, hidden_name);
+                    goto fail;
+                }
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, hidden_name);
+                emit_u16(s, s->cur_func->scope_level);
+                ce = js_mallocz(ctx, sizeof(*ce));
+                if (!ce) {
+                    js_parse_error(s, "out of memory");
+                    JS_FreeAtom(ctx, hidden_name);
+                    goto fail;
+                }
+                ce->kind = JS_TS_DEC_CLASS;
+                ce->member_name = JS_ATOM_NULL;
+                ce->hidden_var_name = hidden_name;
+                ce->param_index = -1;
+                ce->next = class_decorators;
+                class_decorators = ce;
+            }
+            if (s->token.val != TOK_CLASS) {
+                js_parse_error(s, "expected 'class' after decorator(s)");
+                goto fail;
+            }
+            if (!(decl_mask & DECL_MASK_OTHER)) {
+                js_parse_error(s, "class declarations can't appear in single-statement context");
+                goto fail;
+            }
+            if (js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE, class_decorators))
+                goto fail;
+            goto done;
+        }
     }
 
     switch(tok = s->token.val) {
@@ -30301,7 +31183,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             js_parse_error(s, "class declarations can't appear in single-statement context");
             goto fail;
         }
-        if (js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE))
+        if (js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE, NULL))
             return -1;
         break;
 
@@ -32469,7 +33351,7 @@ static __exception int js_parse_export(JSParseState *s)
 
     tok = s->token.val;
     if (tok == TOK_CLASS) {
-        return js_parse_class(s, FALSE, JS_PARSE_EXPORT_NAMED);
+        return js_parse_class(s, FALSE, JS_PARSE_EXPORT_NAMED, NULL);
     } else if (tok == TOK_FUNCTION ||
                (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                 peek_token(s, TRUE) == TOK_FUNCTION)) {
@@ -32601,7 +33483,7 @@ static __exception int js_parse_export(JSParseState *s)
         break;
     case TOK_DEFAULT:
         if (s->token.val == TOK_CLASS) {
-            return js_parse_class(s, FALSE, JS_PARSE_EXPORT_DEFAULT);
+            return js_parse_class(s, FALSE, JS_PARSE_EXPORT_DEFAULT, NULL);
         } else if (s->token.val == TOK_FUNCTION ||
                    (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                     peek_token(s, TRUE) == TOK_FUNCTION)) {
@@ -33075,6 +33957,13 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
             JS_FreeAtom(ctx, fd->ts_param_prop_names[i]);
         }
         js_free(ctx, fd->ts_param_prop_names);
+    }
+    if (fd->ts_param_decorators) { /* TS: normally already moved out by
+        js_parse_class right after js_parse_function_decl2 returns
+        (see the 'method_fd->ts_param_decorators' handling there);
+        freed defensively here for any early-failure path that
+        destroys this JSFunctionDef before that hand-off happens. */
+        js_ts_free_decorator_list(ctx, fd->ts_param_decorators);
     }
 
     if (fd->parent) {
@@ -37629,6 +38518,64 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             int idx, has_initializer;
 
             BOOL is_param_prop = FALSE;
+            int this_param_index = fd->arg_count; /* TS: this parameter's
+                ordinal index -- fd->arg_count is exactly "how many
+                parameters add_arg() has recorded so far", i.e. the
+                index this about-to-be-parsed parameter will get. */
+
+            /* TS: parameter decorators '@dec'/'@dec(...)' before a
+               parameter. Only meaningful for a class constructor or
+               method's parameter list (the caller's func_type
+               determines that; a plain function's parameters cannot
+               have them). Unlike method/property/class decorators,
+               these must NOT be evaluated here: verified against real
+               tsc output, parameter-decorator expressions are
+               evaluated exactly once, at class-declaration time
+               (inside the class's own '__decorate([... __param(0,
+               expr) ...], Ctor)' call), not every time the
+               constructor runs. So the expression is only *skipped*
+               here (js_ts_skip_decorator_expr, no bytecode emitted)
+               and its source range is recorded; js_parse_class
+               re-parses and evaluates it for real once the whole
+               class body has been consumed (see fd->ts_param_decorators
+               and js_ts_reparse_and_emit_decorator). */
+            if (s->ts_mode &&
+                (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
+                 func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
+                 func_type == JS_PARSE_FUNC_METHOD)) {
+                while (s->token.val == '@') {
+                    const uint8_t *expr_start_ptr;
+                    JSTSDecoratorEntry *e;
+                    if (next_token(s)) /* consume '@' */
+                        goto fail;
+                    expr_start_ptr = s->token.ptr;
+                    if (js_ts_skip_decorator_expr(s))
+                        goto fail;
+                    e = js_mallocz(ctx, sizeof(*e));
+                    if (!e) {
+                        js_parse_error(s, "out of memory");
+                        goto fail;
+                    }
+                    e->kind = JS_TS_DEC_PARAMETER;
+                    e->member_name = JS_ATOM_NULL; /* filled in by
+                        js_parse_class once this function's own
+                        JSAtom (constructor/method name) is known */
+                    e->param_index = this_param_index;
+                    e->hidden_var_name = JS_ATOM_NULL; /* not used for
+                        JS_TS_DEC_PARAMETER: the raw source range,
+                        stashed separately below, is re-parsed later
+                        instead of being evaluated inline. */
+                    e->decorator_src_start = expr_start_ptr;
+                    e->decorator_src_end = s->token.ptr; /* token.ptr
+                        is the START of the *next* token right after
+                        the decorator expression -- js_ts_skip_decorator_expr
+                        leaves the stream positioned exactly there. */
+                    /* prepend, matching js_ts_attach_pending_decorators'
+                       reverse-of-source-order convention. */
+                    e->next = fd->ts_param_decorators;
+                    fd->ts_param_decorators = e;
+                }
+            }
 
             /* TS: parameter properties 'constructor(private x: T, ...)'.
                Only meaningful directly inside a class constructor's
@@ -38627,7 +39574,7 @@ static __exception int js_parse_ts_declare(JSParseState *s)
            itself is harmless to actually construct: it is simply
            never instantiated by code that respects the ambient
            contract. */
-        return js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE);
+        return js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE, NULL);
     }
     if (s->token.val == TOK_VAR || s->token.val == TOK_CONST ||
         token_is_pseudo_keyword(s, JS_ATOM_let)) {

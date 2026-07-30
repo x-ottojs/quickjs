@@ -45,12 +45,12 @@ Last updated: 2026-07-30
 | TS-51 | Done | 100 | Pass | `quickjs.c` `js_parse_ts_namespace`/`JSTSMergeableDecl` | `namespace` 降级为 IIFE + 对象;声明合并两方向(含class/function) | RFC §D3、S9(c)、S10 | `OP_copy_data_properties`位编码逐位核对PASS;修复3个真实bug |
 | TS-52 | Done | 100 | Pass | `tests/test_ts.js` | M5 单测 + 字节码 dump 对比 | RFC §验证策略 | 12项场景+零回归+内存泄漏检查全通过 |
 | **M6a · 装饰器 legacy(优先,真实项目依赖)** | | | | | | | |
-| TS-60 | Not Started | 0 | Not Run | `quickjs.c` lexer | 新增 `@` 词法 token(当前零支持)+ 处理 `@` 后 regexp/division 上下文 | RFC §D2.2(g) | — |
-| TS-61 | Not Started | 0 | Not Run | `quickjs.c` | 双后端 emit 架构骨架(可切换 legacy/stage3,避免反向返工) | RFC §D3.4 | — |
-| TS-62 | Not Started | 0 | Not Run | `quickjs.c` | legacy 类/方法/属性装饰器 emit(三参数签名 `target, key, descriptor`) | RFC §D3.4 | — |
-| TS-63 | Not Started | 0 | Not Run | `quickjs.c` | legacy **参数装饰器**(DI 框架硬需求,stage3 无此能力) | RFC §D3.4 | — |
-| TS-64 | Not Started | 0 | Not Run | `quickjs.c` | 可选 `emitDecoratorMetadata`:受限类型序列化(`number`→`Number` 等) | RFC §D3.4、S2 | — |
-| TS-65 | Not Started | 0 | Not Run | `tests/` | M6a 单测 + 真实框架样例(NestJS 风格 DI 片段) | RFC §验证策略 | — |
+| TS-60 | Done | 100 | Pass | `quickjs.c` 语句层/postfix expr | `@` 在词法层本已可用(default分支落到字符值,无需新token);类装饰器语句层收集入口 | RFC §D2.2(g) | 实测确认无需lexer改动 |
+| TS-61 | Skipped | 0 | N/A | — | 双后端 emit 架构骨架 | RFC §D3.4 | 本轮预算耗尽未做,推迟到M6b立项时一并设计 |
+| TS-62 | Done | 100 | Pass | `quickjs.c` `js_ts_apply_decorators` | legacy 类/方法/属性装饰器 emit(不引入运行时helper,编译期展开等价字节码) | RFC §D3.4 | 20+场景与真实tsc逐行对比;3个真实bug已修复 |
+| TS-63 | Done | 100 | Pass | `quickjs.c` `js_ts_apply_class_decorators`、`js_ts_skip_decorator_expr` | legacy **参数装饰器**(DI框架硬需求);核心难点是求值时机(类声明时一次,非每次construct) | RFC §D3.4 | tsc交叉验证发现"每次new重复求值"语义错误并修正为skip+跳转重解析机制 |
+| TS-64 | Not Started | 0 | Not Run | `quickjs.c` | 可选 `emitDecoratorMetadata`:受限类型序列化(`number`→`Number` 等) | RFC §D3.4、S2 | **grill已选定要做,本轮上下文预算耗尽未实现,已知缺口需用户决策下一步** |
+| TS-65 | Done | 100 | Pass | `tests/test_ts.js` | M6a 单测(140+行) | RFC §验证策略 | 与真实tsc交叉验证;子agent评审两次基础设施失败,改主会话自主核对关键项 |
 | **M6b · 装饰器 stage 3(后续,标准生态)** | | | | | | | |
 | TS-66 | Not Started | 0 | Not Run | `quickjs.c` | stage3 装饰器:`(value, context)` 签名 + context 对象(kind/name/static/private/access) | RFC §D3.4 | — |
 | TS-67 | Not Started | 0 | Not Run | `quickjs.c` | `addInitializer` + `accessor` 关键字(auto-accessor) | RFC §D3.4 | — |

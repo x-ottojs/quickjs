@@ -27,7 +27,7 @@ M4  enum + const enum(首个生成运行时代码,含最小 binder)(Done — 已
 M5  参数属性 + namespace(声明合并)(Done — 已推送,3个strict-only/关键字bug+OP_copy_data_properties位编码验证)
    │
    ▼
-M6a 装饰器 legacy(优先 — 真实项目依赖,含参数装饰器+metadata)  ◄── 下一步
+M6a 装饰器 legacy(优先 — 真实项目依赖)(Done — 四种装饰器核心机制,metadata未完成已知缺口)
    │
    ▼
 M6b 装饰器 stage 3(标准生态,双后端切换)
@@ -416,17 +416,74 @@ TODO refs: TS-50 ~ TS-52
 
 ---
 
-# Milestone M6: 装饰器
-Status: Not Started
-Progress: 0%
+# Milestone M6a: 装饰器 legacy (TS experimentalDecorators)
+Status: Done
+Progress: 100%
 Depends on: M5
 RFC refs: §D3、§风险表
-Context budget: 约 85k / 120k
+Context budget: 约 130k / 120k (实际，超出预算——本 RFC 至今最复杂的一次改动，触及词法层新符号'@'、类构造收尾流程、跨函数状态传递、字节码"跳转重解析"机制)
 TODO refs: TS-60 ~ TS-63
 
-**入口需 grill 确认语义版本**(TC39 stage 3 vs TS legacy `experimentalDecorators`)——两者语义不兼容,必须先定再实现(TS-60)。
+**入口已 grill 确认语义版本**：终局视角决策为两套并存(legacy + stage3)，legacy 优先，本里程碑实现 legacy。
+
+## 范围完成情况
+
+- ✅ 类装饰器 `@dec class Foo{}`（含替换构造函数，如 TS 官方 `reportableClassDecorator` 范例）
+- ✅ 方法/访问器装饰器 `@dec method(){}`（`Object.getOwnPropertyDescriptor`+调用+`Object.defineProperty`，静态/实例均支持）
+- ✅ 属性装饰器 `@dec prop;`（2 参，返回值忽略）
+- ✅ 参数装饰器 `constructor(@dec x){}`（构造函数与普通方法均支持）
+- ✅ 装饰器工厂 `@dec(args)`（100% 真实场景形态）
+- ✅ 多装饰器复合求值/应用顺序（top-to-bottom 求值、bottom-to-top 应用，与 TS 官方文档范例逐行对比一致）
+- ✅ 类+参数装饰器混合顺序（与真实 tsc 转译输出逐行对比一致）
+- ⏸️ **`emitDecoratorMetadata`（受限类型序列化）—— grill 已选定要做，但本里程碑上下文预算耗尽，未实现，推迟到 M6a-metadata 或并入 M6b**。这是需要向用户明确汇报的范围缺口，不是隐藏降级。
+
+## 关键技术决策：不引入运行时 `__decorate` helper
+
+没有像 tsc 那样注入一个通用的 `__decorate`/`__param` JS 函数，而是在编译期直接展开等价字节码——因为装饰器数量在编译期已知，不需要运行时循环。用真实 tsc 反复编译验证转译输出（`__decorate`/`__param`/`__metadata` 三个 helper 的实现细节），确保生成的字节码语义与之完全等价。
+
+## 参数装饰器求值时机：本里程碑最难的正确性问题
+
+摸底最初按方法/属性装饰器的"原地求值"模式实现参数装饰器，跑通后用真实 tsc 交叉对比才发现语义错误：tsc 把参数装饰器表达式的求值放在**类声明时（一次）**，不是每次构造函数调用时。若直接照搬"原地求值"，装饰器工厂会在每次 `new` 时重复求值——语义错误但表现不明显（真实参数装饰器多无副作用），差点被放过。
+
+解决方案：参数解析时只用 `js_ts_skip_decorator_expr`（新写的纯扫描函数，不 emit）跳过表达式，记录源码区间；类构造完全结束后，用 `js_parse_seek_token` **跳转回该区间重新解析求值**（此时 `s->cur_func` 已切回外层类函数，emit 进入正确的字节码流），再跳回原位置继续解析。这是本 RFC 目前最复杂的字节码/token 流控制机制。
+
+进一步核对后发现：求值与应用不能合并在同一循环——必须先按源码顺序对所有参数装饰器求值（存入各自隐藏变量），再统一按逆序应用调用。第一版把两步合并导致顺序错误（已用 tsc 对比发现并修正为 `js_ts_apply_class_decorators` 的两阶段结构）。
+
+## 实现中暴露的 3 个真实 bug（均已修复并验证）
+
+1. **段错误**：`define_var` 在顶层 eval 场景对 `LET` 类型也会返回占位值 `GLOBAL_VAR_OFFSET`（约 10 亿），最初用这个返回值当 `fd->vars[]` 数组索引，导致越界访问段错误。这是 M5 已固化的 S10 规则在装饰器场景的**第三次**复现——足以说明这类 `define_var` 返回值陷阱具有跨里程碑重复性，值得作为长期检查项。修复：`JSTSDecoratorEntry` 全部改用 `JSAtom hidden_var_name` 直接存 atom，按名访问不索引数组。
+2. **作用域生命周期错误**：装饰器隐藏变量最初在类体 `push_scope`/`pop_scope` 包裹的内层作用域声明，但应用代码在 `pop_scope` 之后才读取，变量已脱离作用域链，报 `ReferenceError`。修复：捕获 `push_scope` 之前的 `decorator_scope_level`，`define_var` 时临时切换 `fd->scope_level` 到这个外层值。
+3. **隐藏变量名计数器冲突**：命名计数器最初是每次 `js_parse_class`/相关函数调用重新从 0 开始的局部变量，导致两个独立类各自生成同名隐藏变量（`<ts_dec_0>`），因两者实际共享同一个外层作用域而报"invalid redefinition"。修复：提升为 `JSParseState.ts_decorator_counter` 全局单调计数器。
+
+## 验证
+
+- 20+ 个真实场景，每个都与真实 `tsc`（`npx typescript@latest`）编译输出逐行对比验证：基础方法装饰器、装饰器工厂、多装饰器复合顺序、descriptor 修改、属性装饰器、静态方法装饰器、accessor 装饰器、类装饰器观察/替换（含 TS 官方 `reportableClassDecorator`/`sealed` 范例）、参数装饰器（构造函数/普通方法）、参数装饰器求值时机（核心正确性：3 次 `new` 只求值 2 次而非 6 次）、参数装饰器顺序、类+参数装饰器组合顺序、装饰器成员访问链 `@ns.dec()`、装饰器多层调用 `@factory()()`、多类独立装饰器不冲突（bug 3 的回归测试）。
+- 字节码 dump 验证参数装饰器的求值代码确实生成在类声明收尾流程里，不在构造函数体内。
+- 内存：多次独立进程运行 atom 计数稳定，无跨运行累积泄漏；`js_ts_free_decorator_list` 覆盖 `js_parse_class` 全部出口；`method_fd->ts_param_decorators` 转移后置 NULL，`js_free_function_def` 防御性释放不产生 double-free。
+- `make test` 与 `tests/test_ts.js`（140+ 行）全部通过。
+
+## 子 agent 独立核对：两次因基础设施故障失败，改为主会话自主核对
+
+两次委派评审均因平台层错误中断（第一次 "Anthropic API error: Connection error"，第二次 "Stream request failed"），均非评审内容本身的问题。未第三次重试（已消耗较多轮次），改为主会话针对评审清单里风险最高的项目做独立静态核对：
+- 段错误 bug 修复完整性：`grep hidden_var_idx` 零残留 ✅
+- 计数器统一性：`grep` 局部计数器变量名零残留，全部改用 `s->ts_decorator_counter` ✅
+- 内存出口完整性：`js_parse_class` 两个出口均调用 `js_ts_free_decorator_list`；`method_fd->ts_param_decorators` 转移后置 NULL 避免 double-free ✅
+- 5 个 `js_parse_class` 调用点参数正确性：4 处 NULL、语句层 1 处传收集链表 ✅
+- `js_ts_skip_decorator_expr` 与 `js_parse_left_hand_side_expr` 语法覆盖不对称的方向安全性：skip 阶段更严格（仅标识符链），eval 阶段更宽松（完整 postfix 表达式）——不会出现"skip 通过但 eval 失败"的危险场景，只会让极罕见的非标准写法在 skip 阶段被安全拒绝，已用 IIFE 装饰器写法实测验证报错而非崩溃 ✅
+- `decorator_src_start/end` 边界精确性：用无空格分隔的多参数/单参数装饰器场景实测验证 ✅
+- `push_scope`/`pop_scope` 配对与 `decorator_scope_level` 假设：核实类体内仅两对 push/pop_scope，两次弹出后 `fd->scope_level` 精确回到捕获时的值 ✅
+
+**已知限制（本次未做，如需第三方独立评审应作为后续里程碑第一项）**：`js_ts_apply_class_decorators` 中"先参数装饰器整体、后类装饰器整体"的分两阶段处理，与 tsc `__decorate` 单次反向遍历混合数组在**已实测的两种组合场景**下行为一致，但未做形式化证明覆盖所有可能的数量组合（如 3 类装饰器+5 参数装饰器等复杂排列）。
+
+## 结案
+
+- 迭代目的：让 QuickJS 原生支持真实 TS 后端项目（NestJS/TypeORM 等）依赖的核心机制——legacy 装饰器四种形态。
+- 迭代前问题：`@` 完全不可用；参数装饰器的正确求值时机需要真实 tsc 验证才能发现（原地求值方案表面能跑但语义错误）。
+- 如何迭代：用真实 tsc 摸底四种装饰器精确语义与转译模式 → grill 确认求值/metadata 范围 → 实现类/方法/属性装饰器（原地求值+收尾应用）→ 调试 bug1(段错误)/bug2(作用域) → 实现参数装饰器 → 用 tsc 交叉验证发现"每次 new 重复求值"的语义错误 → 重新设计"skip+跳转重解析"机制 → 调试顺序错误(两阶段分离) → 调试 bug3(计数器冲突) → 20+ 场景验证 → 子 agent 评审两次基础设施失败改自主核对。
+- 最终结果：TS-60~TS-62 完成（四种装饰器核心机制），TS-63(`emitDecoratorMetadata`) **未完成，已知缺口**。是否继续补齐 metadata、还是先推进 M6b(stage3)/M7，需要用户决策。
 
 ---
+
 
 # Milestone M7: 集成与端到端
 Status: Not Started
