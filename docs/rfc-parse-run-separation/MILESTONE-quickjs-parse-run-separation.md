@@ -198,4 +198,52 @@ TODO refs: T-10
 
 ## 完成阶段
 
-待 M2 通过后执行:变更清单 → 用户跑 Example → 里程碑审核(子 agent)+ 系统 review → 修复 → 结案 → 提交。
+变更清单 → 用户跑 Example → 里程碑审核(子 agent)+ 系统 review → 修复 → 结案 → 提交:均已完成。已提交并推送(GitHub `2a9dc0a` / JD `6ed27c9`)。
+
+---
+
+# Milestone M4: TS 融合路线评估(追加)
+Status: Done
+Progress: 100%
+Depends on: M3
+RFC refs: §后续路线 T1-T4
+Important rule refs: R5(断言挂 file:line)、R6(零改动)、R9(断言强度需经现状穷举校准)
+Context budget: 约 30k / 120k
+Dependency check: pass — 路线由用户确定:先分离(M1-M3 已完成)→ 再融合 TS 解析
+TODO refs: T-11
+
+## 目标与非目标
+
+- 目标:评估"在现有 JS parser 上融合 TS 解析"的技术可行性,并**量化**性能与体积收益。
+- 非目标:不实现 TS parser、不改任何源码(R6);落地须另立 RFC。
+
+## 验证设计(M4 独立用例)
+
+- 实测基准:自建 `compute`/`pointDistance`/`pureArith` 三个热路径基准,`Date.now()` 计时,含 warmup。
+- 字节码静态分析:用 `-DDUMP_BYTECODE=2` 重编译 `qjs`,dump microbench.js 字节码并统计指令占比。
+- 体积实测:`ls -lh` / `strip` / `size` 测 `qjs` 与 `quickjs.o` text 段;按函数行数估算 parser+compiler 占比。
+- **现状穷举(R9 强制)**:核对 QuickJS 是否已有类型特化 opcode 与 peephole 合并,再估算增量收益。
+
+## 关键发现与证据
+
+| 发现 | 证据 |
+| --- | --- |
+| TS 融合技术成立(P2 路径) | parser 为手写递归下降,`JSParseState` `quickjs.c:22134` 可加 `ts_mode`;101 个 `js_parse_*` 函数约 8248 行 |
+| `typeof`+`strict_eq` 仅占 0.3% | microbench.js 字节码 dump 统计 |
+| **已有类型特化 opcode** | `OP_add_loc` 三路特化(int/float/string)+ 合并取值写回,`quickjs.c:19743` |
+| **peephole 已做模式合并** | `quickjs.c:35411`(→`OP_inc_loc`)、`35444`/`35458`(→`OP_add_loc`) |
+| `OP_add` 热路径仅 3 条指令 | `quickjs.c:19696` |
+| 属性访问优化被类型擦除堵死 | `find_own_property` `quickjs.c:6135` 需哈希查找;`JSShape` 运行时动态,TS interface 运行时不存在 |
+| parser+compiler 占 text 段 13% | 8248/61424 行;`quickjs.o` text = 704KB |
+
+## 压缩迭代摘要
+
+- **本里程碑最大价值**:阻止了一个基于直觉的错误立项理由。初稿曾估"新增特化 opcode 可拿 15-25%",实测核对后修正为 8-15%(且纯静态类型仅 3-8%)——因为 QuickJS **已经**做了最有价值的特化。
+- **R9 第三次触发**:根因是"估算新增收益时未穷举现状已覆盖部分"。已将该模式补入 R9 触发场景。
+
+## 结案
+
+- 迭代目的:回答"先分离后融合 TS"路线的技术可行性与收益量级。
+- 迭代前问题:TS 融合的性能收益凭直觉估算,存在高估风险,可能导致错误立项。
+- 如何迭代:实测三个基准 + 字节码指令分布统计 + 体积实测 + **现状特化机制穷举**,据此校准收益区间。
+- 最终结果:T-11 `Done`。结论——TS 解析融合技术成立且推荐(价值在"能直接跑 .ts"),但**不应以性能优化为立项理由**(3-8%);体积收益真正来源是 F3 零 parser AOT(-10%),与 TS 无关;最优组合是 TS parser 放编译期 AOT + 运行期零 parser。剩余风险:落地须另立 RFC 并重新 grill 确认(R6 禁区)。

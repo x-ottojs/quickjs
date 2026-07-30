@@ -18,6 +18,7 @@ Last updated: 2026-07-30
 | T-08 | Done | 100 | Pass | 全部 RFC 引用位置 | 逐条复核 30+ 个 `file:line` 真实存在且语义相符;多同义词交叉搜索防漏 | RFC §R5、风险表 | 仅 1 处小幅行号偏移(注释实为 `37303`),已修正 |
 | T-09 | Done | 100 | Pass | RFC 草案 | 委派 2 个不同模型(GPT-5.5 / Claude-Opus-4.8)对抗式独立评审 | 核心·应用点 A | 二者独立同判 D3 过强 → FAIL;共 7 项修订 |
 | T-10 | Done | 100 | Pass | RFC 定稿 | 按评审结论完成 7 项修订、补 R7/R8/R9、写执行摘要、转定稿 | RFC 头部执行摘要 | 三份文档状态一致 |
+| T-11 | Done | 100 | Pass | `quickjs.c` parser 层 + `quickjs-opcode.h` + `resolve_labels` | TS 融合路线评估:P2 融合方式成立;实测字节码指令分布与基准;发现 `OP_add_loc` 三路特化与 peephole 合并已覆盖主要优化空间 | RFC §后续路线 T1-T4 | 修正"15-25%"过强估算为 3-8%;R9 第三次触发已固化 |
 
 ## 状态说明
 
