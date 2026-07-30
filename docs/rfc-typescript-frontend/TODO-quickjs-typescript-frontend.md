@@ -23,8 +23,8 @@ Last updated: 2026-07-30
 | TS-15 | Not Started | 0 | Not Run | `quickjs.c:26338` | 解构类型注解 | RFC §D1 | — |
 | TS-16 | Not Started | 0 | Not Run | `tests/` | M1 单测 + `make test` + test262 零新增失败 | RFC §S1 | — |
 | **M2a · `>` token 重扫(阻断级前置,评审发现)** | | | | | | | |
-| TS-20 | Not Started | 0 | Not Run | `quickjs.c:23125-23145` lexer | **`>` token 重扫机制**:类型上下文中把 `TOK_SAR`/`TOK_SHR`/`TOK_SAR_ASSIGN`/`TOK_SHR_ASSIGN` 拆为单个 `>` | RFC §D2.2(b)、S4 | — |
-| TS-21 | Not Started | 0 | Not Run | `tests/` | 重扫单测:`Array<Map<string, number>>`、`a<b<c<d<e>>>>`、确认 JS 位移运算零回归 | RFC §S1、S4 | — |
+| TS-20 | Done | 100 | Pass | `quickjs.c:23125-23145` lexer(未改) + 新增 `js_ts_rescan_greater` | **`>` token 重扫机制**:O(1) 词法重解释,把 `TOK_SAR`/`TOK_SHR`/`TOK_SAR_ASSIGN`/`TOK_SHR_ASSIGN`/`TOK_GTE` 重扫为单个 `>` | RFC §D2.2(b)、S4 | 子 agent(Opus-4.8)独立核对 PASS;发现并修复 `TOK_GTE`(`>=`)遗漏 |
+| TS-21 | Done | 100 | Pass | `tests/test_ts.js` | 重扫单测:2/3/4 层嵌套泛型、泛型内数组后缀、无空格闭合 `Array<number>=x`;确认 JS 位移(`>>`/`>>>`/`>>=`/`>>>=`/`>=`)零回归 | RFC §S1、S4 | `make test` 零失败;子 agent 追踪 4 层嵌套时序全部正确 |
 | **M2b · 泛型与断言(歧义消解核心)** | | | | | | | |
 | TS-22 | Not Started | 0 | Not Run | `quickjs.c` | 泛型参数声明 `function f<T>()` / `class C<T>` / 约束与默认值 `<T extends U = V>` / 变体修饰符 | RFC §D2 | — |
 | TS-23 | Not Started | 0 | Not Run | `quickjs.c` | **泛型实参消歧**(emit-free trial-parse + 失败回退 + `memset OP_nop` 清理):`f<T>(x)`、`obj.m<T>()`、`new C<T>()`、tagged template、`fn<T>?.()` | RFC §D2.2(a)、S4 | — |

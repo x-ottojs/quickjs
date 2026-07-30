@@ -97,4 +97,22 @@ voidFn();
 var cb: (x: number) => void = (x) => print(x);
 cb(7);
 
+// nested generic type arguments (M2a: > token re-scanning)
+let nested2: Array<Map<string, number>> = new Map();
+print(typeof nested2);
+let nested3: Array<Map<string, Set<number>>> = [];
+print(typeof nested3);
+let nested4: Array<Map<string, Set<Record<string, number>>>> = [];
+print(typeof nested4);
+
+// generic with union inside
+let mixed: Array<string | number> = [1, "two", 3];
+print(mixed.length);
+
+// nested generic closing without space before '=' (>= / >>= merge test)
+let tight1: Array<number>=[9];
+print(tight1[0]);
+let tight2: Array<Array<number>>=[[8]];
+print(tight2[0][0]);
+
 print("ALL TS TESTS PASSED");

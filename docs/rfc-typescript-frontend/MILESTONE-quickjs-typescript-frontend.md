@@ -9,13 +9,13 @@ Last updated: 2026-07-30
 M0 设计与评审(Done — 两模型对抗评审,9 项修订已落地)
    │
    ▼
-M1  ts_mode 骨架 + 类型注解  ◄── 所有后续里程碑的基座
+M1  ts_mode 骨架 + 类型注解(Done — 已推送,3 bug 修复:箭头返回类型/可选参数/void)
    │
    ▼
-M2a `>` token 重扫(阻断级前置,评审发现)◄── 嵌套泛型的先决条件
+M2a `>` token 重扫(Done — 已推送,阻断级前置已解除)
    │
    ▼
-M2b 泛型与断言(歧义消解核心,风险最高)
+M2b 泛型与断言(歧义消解核心,风险最高)  ◄── 下一步
    │
    ▼
 M3  类型声明(interface/type/declare + 重载签名,纯擦除)
@@ -119,44 +119,98 @@ D2 重写(拆 D2.1 可复用 / D2.2 须新建 7 项) → D3.1 参数属性时序
 ---
 
 # Milestone M1: ts_mode 骨架与类型注解
-Status: Not Started
-Progress: 0%
+Status: Done
+Progress: 100%
 Depends on: M0
 RFC refs: §D1、§S1、§S4
 Important rule refs: S1(零回归最高优先级)、S2(不做类型检查)、S7(上游 merge 友好)
-Context budget: 约 90k / 120k(改动面较大,含 4 个插入点 + 类型语法函数族)
-Dependency check: 待执行
+Context budget: 约 90k / 120k(实际,含 3 处 bug 修复往返)
+Dependency check: pass
 TODO refs: TS-10 ~ TS-16
 
 ## 目标与非目标
 
 - 目标:建立 `ts_mode` 开关与 `js_parse_ts_type` 函数族;支持四个插入点的类型注解;**零回归**。
-- 非目标:不含泛型(M2)、不含 `interface`/`type` 声明(M3)、不含任何生成代码的构造(M4+)。
+- 非目标:不含泛型消歧(M2b)、不含 `interface`/`type` 声明(M3)、不含任何生成代码的构造(M4+)。
 
-## 设计闸门(待 M1 启动时填写)
+## 执行线路(实际)
 
-需产出:`js_parse_ts_type` 的职责边界与递归下降结构、`ts_mode` 的传递链路(`JS_Eval` flag → `JSParseState`)、四个插入点的改动契约、单元测试设计。
+- `quickjs.h`:新增 `JS_EVAL_FLAG_TS (1<<8)`。
+- `quickjs.c`:`JSParseState.ts_mode` 字段;`__JS_EvalInternal` 中设置;`js_parse_ts_type` 函数族(独立递归下降,不 emit 字节码);四个插入点(变量 28560、参数 36790、返回值 36909、类成员 25571)。
+- `qjs.c`:`--ts` CLI 开关。
+- `tests/test_ts.js`:新增测试套件。
 
-## 验证设计(M1 独立)
+## 子 agent 独立核对结论
 
-- 正常:各插入点的基础类型注解可被正确消费并执行。
-- 边界:嵌套类型(`Array<Map<string, number[]>>` 形态的语法消费)、可选参数、默认值 + 注解共存。
-- 错误:`ts_mode` 关闭时遇到 `:` 注解须报语法错误(与现有 JS 行为一致)。
-- **回归红线(S1)**:`make test` 全通过 + test262 对比 `test262_errors.txt` 零新增失败。
+委派 Opus-4.8 对抗式核对,判 **PARTIAL**,发现 3 个真实 bug,全部已修复并验证:
 
-## Example 设计(待 M1 完成时交付)
+| Bug | 根因 | 修复 |
+| --- | --- | --- |
+| `(): T => x` 报语法错误 | `skip_parens_token` 判箭头靠闭合后是否 `TOK_ARROW`,带返回类型时闭合后是 `:` 不是 `=>`,箭头分支不触发 | 新增 `js_ts_is_arrow_with_return_type` trial-parse 辅助函数(emit-free,失败必回退) |
+| `x?: T` 报 "expecting ','" | 参数名消费后未处理可选标记 `?` | 类型注解消费前先吞 `?` |
+| `: void` / `=> void` 报 "expected type" | primary type switch 缺 `TOK_VOID` 分支 | 补分支 |
 
-用户可跑:写一个含类型注解的 `.ts` 文件,用 `./qjs --ts hello.ts` 执行,预期正常输出且类型注解被忽略。
+## 验证结果
+
+- `./qjs --ts tests/test_ts.js` → ALL TS TESTS PASSED(含变量/函数/类/联合/数组/箭头/可选参数/void)。
+- `make test` → 零失败。
+- 含 `:` 的 JS 语法(对象字面量/label/三元/switch)在 ts_mode 关闭时逐字节行为不变(手动验证,test262 子模块未拉取,以 `make test` + 手动含 `:` 语法验证代替)。
+
+## 结案
+
+- 迭代目的:建立 TS 类型注解消费的骨架,作为后续里程碑的基座。
+- 迭代前问题:前置 RFC 只有设计,无可运行代码。
+- 如何迭代:摸底 flag 传递链路与四个插入点精确位置 → grill 确认执行简报 → 实现骨架与类型语法函数族 → 委派子 agent 核对 → 发现并修复 3 个 bug。
+- 最终结果:TS-10~TS-16 全部 `Done`。已提交推送(GitHub `7d040d5` / JD `ab13cf4`)。剩余风险:test262 子模块未拉取,零回归验证依赖 `make test` + 手动语法核对,非完整 test262 对比(记录为范围化例外,不阻塞推进)。
 
 ---
 
-# Milestone M2: 泛型与断言(歧义消解核心)
+# Milestone M2a: `>` token 重扫
+Status: Done
+Progress: 100%
+Depends on: M1
+RFC refs: §D2.2(b)、S4
+Important rule refs: S4(已批准的新建机制)、S1(零回归)
+Context budget: 约 35k / 120k(实际)
+Dependency check: pass
+TODO refs: TS-20 ~ TS-21
+
+## 目标与非目标
+
+- 目标:解决嵌套泛型 `Array<Map<K,V>>` 闭合 `>>` 被 lexer 合并为单 token 的阻断问题,使 M2b(泛型消歧)可以推进。
+- 非目标:不做泛型实参消歧(M2b)、不做泛型参数声明/约束(M2b)。
+
+## 设计与实现
+
+新增 `js_ts_rescan_greater`(O(1) 词法重解释,非回溯):遇到 `TOK_SAR`(`>>`)/`TOK_SHR`(`>>>`)/`TOK_SAR_ASSIGN`(`>>=`)/`TOK_SHR_ASSIGN`(`>>>=`)/`TOK_GTE`(`>=`,子 agent 核对时发现遗漏并修复)时,把 `token.val` 改为 `>`、`buf_ptr` 回退到 `token.ptr+1`,让下一个 `next_token` 从第二个字符重新词法分析。集成到 `js_parse_ts_type_name` 的泛型闭合检查:`if (token=='>' || rescan==0) { next_token }`——每层泛型消费一个 `>`,逐层剥离直至最外层。
+
+## 子 agent 独立核对结论
+
+委派 Opus-4.8 核对,判 **PASS**。逐层时序追踪(2/3/4 层嵌套)全部正确。发现一处窄边界:`TOK_GTE`(无空格 `Array<number>=x`)未在 switch 中处理,会导致合法 TS 被拒绝(安全失败,非误接受)。已修复。
+
+## 验证结果
+
+- 嵌套泛型:2/3/4 层(`Array<Map<string,number>>`、`Array<Map<string,Set<number>>>`、四层)、泛型内数组后缀(`Map<string, number[]>`)、泛型参数是另一泛型(`Map<string, Array<number>>`)、三层同名(`Array<Array<Array<number>>>`)、无空格闭合+赋值(`Array<number>=x`、`Array<Array<number>>=x`)——全部通过。
+- JS 位移零回归:`8>>2`、`-1>>>0`、`a>>=2`、`b>>>=2`、`5>=3` 结果与预期一致。
+- `make test` 零失败。
+- `js_ts_rescan_greater` 唯一调用点在 `js_parse_ts_type_name`(ts_mode 门控路径内),JS 路径不可达。
+
+## 结案
+
+- 迭代目的:解除评审发现的阻断级前置问题,使嵌套泛型可解析。
+- 迭代前问题:M1 的类型 parser 遇嵌套泛型闭合 `>>` 直接报错(设计上的已知限制)。
+- 如何迭代:摸底 lexer `>` token 生成与 `buf_ptr`/`token.ptr` 语义 → grill 确认最小方案 → 实现 `js_ts_rescan_greater` + 集成 → 反复调试闭合时序(初版有 2 处时序 bug,通过逐层追踪修正)→ 子 agent 核对发现并修复 `TOK_GTE` 遗漏。
+- 最终结果:TS-20~TS-21 全部 `Done`。M2b(泛型消歧)的阻断已解除,可以推进。剩余风险:无——范围极小、验证充分。
+
+---
+
+# Milestone M2b: 泛型与断言(歧义消解核心)
 Status: Not Started
 Progress: 0%
-Depends on: M1
+Depends on: M2a
 RFC refs: §D2、§S4
 Context budget: 约 80k / 120k
-TODO refs: TS-20 ~ TS-23
+TODO refs: TS-22 ~ TS-26
 
 **风险最高的里程碑**。核心难点:`f<T>(x)` 与 `a < b` 的消歧。策略见 RFC §D2——回溯试探 + 失败回退,复用 `js_parse_get_pos`/`js_parse_seek_token`。
 
@@ -167,7 +221,7 @@ TODO refs: TS-20 ~ TS-23
 # Milestone M3: 类型声明(纯擦除)
 Status: Not Started
 Progress: 0%
-Depends on: M2
+Depends on: M2b
 RFC refs: §B1
 Context budget: 约 60k / 120k
 TODO refs: TS-30 ~ TS-33

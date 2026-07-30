@@ -37196,6 +37196,32 @@ static __exception int js_parse_function_decl(JSParseState *s,
  *   LiteralType     := string | number | 'true' | 'false' | 'null' | '-' number
  */
 
+/* TS: re-scan a merged '>>'/'>>>'/'>>='/'>>>=' token as a single '>'.
+   In type position, '>>' closes two nested generic argument lists.
+   The lexer (quickjs.c:23125) merges these into TOK_SAR / TOK_SHR /
+   TOK_SAR_ASSIGN / TOK_SHR_ASSIGN, so we must split them back.
+   This is O(1) lexical reinterpretation: set token.val to '>' and
+   rewind buf_ptr to just after the first '>'.  The remaining '>' or
+   '>>' will be re-tokenised by the next next_token() call (and
+   re-scanned again if still in type position).
+   Returns 0 on success (token was re-scanned), -1 if the current
+   token is not a '>>'-family token. */
+static int js_ts_rescan_greater(JSParseState *s)
+{
+    switch (s->token.val) {
+    case TOK_SAR:        /* >> */
+    case TOK_SHR:        /* >>> */
+    case TOK_SAR_ASSIGN: /* >>= */
+    case TOK_SHR_ASSIGN: /* >>>= */
+    case TOK_GTE:        /* >= (e.g. Array<number>=x with no space) */
+        s->token.val = '>';
+        s->buf_ptr = s->token.ptr + 1;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
 /* TS: consume a qualified type name (ident ('.' ident)*) and optional
    generic type arguments '<' Type (',' Type)* '>'. Returns 0 / -1. */
 static __exception int js_parse_ts_type_name(JSParseState *s)
@@ -37232,14 +37258,17 @@ static __exception int js_parse_ts_type_name(JSParseState *s)
             if (js_parse_ts_type(s))
                 return -1;
         }
-        if (s->token.val == '>') {
+        /* TS: consume the closing '>'.  For nested generics, the token
+           may be TOK_SAR (>>) or TOK_SHR (>>>): js_ts_rescan_greater
+           splits it into a single '>' and rewinds buf_ptr to the
+           remaining '>'(s).  We then call next_token to consume this
+           '>', which re-tokenises the remaining '>' as a new '>' (or
+           '>>' if two remain).  The enclosing generic list will in
+           turn see that '>' and consume it.  */
+        if (s->token.val == '>' ||
+            js_ts_rescan_greater(s) == 0) {
             if (next_token(s))
                 return -1;
-        } else if (s->token.val == TOK_SAR || s->token.val == TOK_SHR) {
-            /* '>>' / '>>>' in type position: M1 does not re-scan tokens
-               (that is M2a). Report an error. */
-            js_parse_error(s, "nested generic type arguments not supported");
-            return -1;
         } else {
             js_parse_error(s, "expected '>' in type arguments");
             return -1;
