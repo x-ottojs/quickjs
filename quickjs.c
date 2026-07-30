@@ -22146,6 +22146,7 @@ typedef struct JSParseState {
     BOOL is_module; /* parsing a module */
     BOOL allow_html_comments;
     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
+    BOOL ts_mode;  /* TS: true if parsing TypeScript input */
     GetLineColCache get_line_col_cache;
 } JSParseState;
 
@@ -24459,6 +24460,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                                                const uint8_t *ptr,
                                                JSParseExportEnum export_flag,
                                                JSFunctionDef **pfd);
+/* TS: forward declaration of the TypeScript type annotation consumer */
+static __exception int js_parse_ts_type(JSParseState *s);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
 static __exception int js_parse_assign_expr(JSParseState *s);
 static __exception int js_parse_unary(JSParseState *s, int parse_flags);
@@ -24913,6 +24916,59 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, BOOL no_line_
     if (js_parse_seek_token(s, &pos))
         return -1;
     return tok;
+}
+
+/* TS: check whether the current '(' starts an arrow function whose return
+   type is annotated, e.g. (a: T): R => ....  js_parse_skip_parens_token()
+   seeks back to the start after returning, so we cannot chain it.  This
+   helper saves the position, manually advances past the parens and the
+   ': Type', and checks for '=>'.  Always restores the original position.
+   Returns TRUE if an arrow function with TS return type is detected. */
+static BOOL js_ts_is_arrow_with_return_type(JSParseState *s)
+{
+    JSParsePos pos;
+    int depth, tok;
+
+    if (!s->ts_mode || s->token.val != '(')
+        return FALSE;
+    js_parse_get_pos(s, &pos);
+
+    /* advance past the balanced '(' ... ')' */
+    if (next_token(s))  /* consume '(' */
+        goto restore;
+    depth = 1;
+    while (depth > 0) {
+        tok = s->token.val;
+        if (tok == TOK_EOF)
+            goto restore;
+        if (tok == '(' || tok == '[' || tok == '{')
+            depth++;
+        else if (tok == ')' || tok == ']' || tok == '}')
+            depth--;
+        if (depth > 0) {
+            if (next_token(s))
+                goto restore;
+        }
+    }
+    /* now at ')'; consume it */
+    if (next_token(s))
+        goto restore;
+    /* expect ': Type' */
+    if (s->token.val != ':')
+        goto restore;
+    if (next_token(s))
+        goto restore;
+    if (js_parse_ts_type(s))
+        goto restore;
+    if (s->token.val == TOK_ARROW) {
+        if (js_parse_seek_token(s, &pos))
+            return FALSE;
+        return TRUE;
+    }
+restore:
+    if (js_parse_seek_token(s, &pos))
+        return FALSE;
+    return FALSE;
 }
 
 static void set_object_name(JSParseState *s, JSAtom name)
@@ -25562,6 +25618,14 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 emit_op(s, OP_scope_get_var);
                 emit_atom(s, name);
                 emit_u16(s, s->cur_func->scope_level);
+            }
+
+            /* TS: consume class field type annotation */
+            if (s->ts_mode && s->token.val == ':') {
+                if (next_token(s))
+                    goto fail;
+                if (js_parse_ts_type(s))
+                    goto fail;
             }
 
             if (s->token.val == '=') {
@@ -26339,6 +26403,12 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                                         int hasval, int has_ellipsis,
                                         BOOL allow_initializer, BOOL export_flag)
 {
+    /* TS-15 TODO: destructuring type annotations (e.g.
+       `const {a}: T = x`) are not supported in M1. The annotation
+       appears after the closing '}' or ']' of the binding pattern,
+       which conflicts with the destructuring rename ':' syntax
+       (`a: b`). This needs careful disambiguation and is deferred to
+       a later milestone. */
     int label_parse, label_assign, label_done, label_lvalue, depth_lvalue;
     int start_addr, assign_addr;
     JSAtom prop_name, var_name;
@@ -28140,7 +28210,8 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         }
         return 0;
     } else if (s->token.val == '(' &&
-               js_parse_skip_parens_token(s, NULL, TRUE) == TOK_ARROW) {
+               (js_parse_skip_parens_token(s, NULL, TRUE) == TOK_ARROW ||
+                js_ts_is_arrow_with_return_type(s))) {
         return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
                                       s->token.ptr);
@@ -28536,6 +28607,14 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             if (export_flag) {
                 if (!add_export_entry(s, s->cur_func->module, name, name,
                                       JS_EXPORT_TYPE_LOCAL))
+                    goto var_error;
+            }
+
+            /* TS: consume type annotation */
+            if (s->ts_mode && s->token.val == ':') {
+                if (next_token(s))
+                    goto var_error;
+                if (js_parse_ts_type(s))
                     goto var_error;
             }
 
@@ -36761,6 +36840,18 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     goto fail;
                 if (next_token(s))
                     goto fail;
+                /* TS: consume optional parameter marker '?' */
+                if (s->ts_mode && s->token.val == '?') {
+                    if (next_token(s))
+                        goto fail;
+                }
+                /* TS: consume parameter type annotation */
+                if (s->ts_mode && s->token.val == ':') {
+                    if (next_token(s))
+                        goto fail;
+                    if (js_parse_ts_type(s))
+                        goto fail;
+                }
                 if (rest) {
                     emit_op(s, OP_rest);
                     emit_u16(s, idx);
@@ -36872,6 +36963,14 @@ static __exception int js_parse_function_decl2(JSParseState *s,
 
     if (next_token(s))
         goto fail;
+
+    /* TS: consume return type annotation */
+    if (s->ts_mode && s->token.val == ':') {
+        if (next_token(s))
+            goto fail;
+        if (js_parse_ts_type(s))
+            goto fail;
+    }
 
     /* generator function: yield after the parameters are evaluated */
     if (func_kind == JS_FUNC_GENERATOR ||
@@ -37075,6 +37174,295 @@ static __exception int js_parse_function_decl(JSParseState *s,
                                    JS_PARSE_EXPORT_NONE, NULL);
 }
 
+/* TS: ---- TypeScript type annotation consumer (TS-11) ----
+ *
+ * The following functions consume (skip) TypeScript type annotations
+ * without performing any type checking. They generate NO bytecode.
+ * The caller has already consumed the ':' introducing the annotation;
+ * these functions start consuming from the current token.
+ *
+ * Grammar (subset for M1):
+ *   Type            := UnionType
+ *   UnionType       := IntersectionType ('|' IntersectionType)*
+ *   IntersectionType:= TypeOperator ('&' TypeOperator)*
+ *   TypeOperator    := 'readonly'? PrimaryType ('[' ']')*
+ *   PrimaryType     := TypeName ('<' Type (',' Type)* '>')?
+ *                    | '(' Type ')'
+ *                    | '(' Type (',' Type)* ')' '=>' Type
+ *                    | '[' Type (',' Type)* ']'
+ *                    | LiteralType
+ *                    | '{' ... '}'   (skipped with brace matching)
+ *   TypeName        := ident ('.' ident)*
+ *   LiteralType     := string | number | 'true' | 'false' | 'null' | '-' number
+ */
+
+/* TS: consume a qualified type name (ident ('.' ident)*) and optional
+   generic type arguments '<' Type (',' Type)* '>'. Returns 0 / -1. */
+static __exception int js_parse_ts_type_name(JSParseState *s)
+{
+    /* first identifier */
+    if (s->token.val != TOK_IDENT) {
+        js_parse_error(s, "expected type name");
+        return -1;
+    }
+    if (next_token(s))
+        return -1;
+    /* dotted qualifier: a.b.c */
+    while (s->token.val == '.') {
+        if (next_token(s))
+            return -1;
+        if (s->token.val != TOK_IDENT) {
+            js_parse_error(s, "expected name after '.' in type");
+            return -1;
+        }
+        if (next_token(s))
+            return -1;
+    }
+    /* generic type arguments: <T, U, ...> */
+    if (s->token.val == '<') {
+        if (next_token(s))
+            return -1;
+        /* M1 does not support nested generics via '>>' re-scanning; a
+           single '<...>' level is consumed. */
+        if (js_parse_ts_type(s))
+            return -1;
+        while (s->token.val == ',') {
+            if (next_token(s))
+                return -1;
+            if (js_parse_ts_type(s))
+                return -1;
+        }
+        if (s->token.val == '>') {
+            if (next_token(s))
+                return -1;
+        } else if (s->token.val == TOK_SAR || s->token.val == TOK_SHR) {
+            /* '>>' / '>>>' in type position: M1 does not re-scan tokens
+               (that is M2a). Report an error. */
+            js_parse_error(s, "nested generic type arguments not supported");
+            return -1;
+        } else {
+            js_parse_error(s, "expected '>' in type arguments");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* TS: consume a primary type. Returns 0 / -1. No bytecode emitted. */
+static __exception int js_parse_ts_primary_type(JSParseState *s)
+{
+    switch (s->token.val) {
+    case TOK_IDENT:
+        /* type name (with optional generic args) */
+        return js_parse_ts_type_name(s);
+    case TOK_STRING:
+    case TOK_NUMBER:
+    case TOK_TEMPLATE:
+        /* literal types: string, number, template literal */
+        if (next_token(s))
+            return -1;
+        return 0;
+    case TOK_NULL:
+    case TOK_TRUE:
+    case TOK_FALSE:
+        /* literal keywords */
+        if (next_token(s))
+            return -1;
+        return 0;
+    case TOK_VOID:
+        /* TS: void type */
+        if (next_token(s))
+            return -1;
+        return 0;
+    case '(':
+        {
+            /* could be grouping '(Type)', function type
+               '(Type) => Type', or function type with named params
+               '(name: Type, name2?: Type) => Type' */
+            if (next_token(s))
+                return -1;
+            if (s->token.val != ')') {
+                for (;;) {
+                    /* function-type parameter: optional '...' rest,
+                       optional name 'ident' followed by '?' or ':',
+                       then the type. If none of these match, treat the
+                       whole item as a bare type. */
+                    if (s->token.val == TOK_ELLIPSIS) {
+                        if (next_token(s))
+                            return -1;
+                    }
+                    if (s->token.val == TOK_IDENT &&
+                        (peek_token(s, TRUE) == ':' ||
+                         peek_token(s, TRUE) == '?')) {
+                        /* named parameter */
+                        if (next_token(s))
+                            return -1;
+                        if (s->token.val == '?') {
+                            if (next_token(s))
+                                return -1;
+                        }
+                        /* expect ':' */
+                        if (s->token.val == ':') {
+                            if (next_token(s))
+                                return -1;
+                        }
+                    }
+                    if (js_parse_ts_type(s))
+                        return -1;
+                    if (s->token.val != ',')
+                        break;
+                    if (next_token(s))
+                        return -1;
+                }
+            }
+            if (s->token.val != ')') {
+                js_parse_error(s, "expected ')' in type");
+                return -1;
+            }
+            if (next_token(s))
+                return -1;
+            /* function type: '=>' ReturnType */
+            if (s->token.val == TOK_ARROW) {
+                if (next_token(s))
+                    return -1;
+                if (js_parse_ts_type(s))
+                    return -1;
+            }
+            return 0;
+        }
+    case '[':
+        {
+            /* tuple type '[T, U, ...]' */
+            if (next_token(s))
+                return -1;
+            if (s->token.val == ']') {
+                if (next_token(s))
+                    return -1;
+                return 0;
+            }
+            if (js_parse_ts_type(s))
+                return -1;
+            while (s->token.val == ',') {
+                if (next_token(s))
+                    return -1;
+                if (s->token.val == ']')
+                    break;
+                if (js_parse_ts_type(s))
+                    return -1;
+            }
+            if (s->token.val != ']') {
+                js_parse_error(s, "expected ']' in tuple type");
+                return -1;
+            }
+            if (next_token(s))
+                return -1;
+            return 0;
+        }
+    case '{':
+        {
+            /* object type literal: skip to the matching '}' using
+               brace-depth counting. M1 does not parse members. */
+            int depth = 1;
+            if (next_token(s))
+                return -1;
+            while (depth > 0) {
+                if (s->token.val == TOK_EOF) {
+                    js_parse_error(s, "unterminated object type");
+                    return -1;
+                }
+                if (s->token.val == '{') {
+                    depth++;
+                } else if (s->token.val == '}') {
+                    depth--;
+                    if (depth == 0) {
+                        if (next_token(s))
+                            return -1;
+                        return 0;
+                    }
+                }
+                if (next_token(s))
+                    return -1;
+            }
+            return 0;
+        }
+    default:
+        /* leading '-' for negative number literal types, e.g. -1 */
+        if (s->token.val == '-') {
+            if (next_token(s))
+                return -1;
+            if (s->token.val != TOK_NUMBER) {
+                js_parse_error(s, "expected number after '-' in type");
+                return -1;
+            }
+            if (next_token(s))
+                return -1;
+            return 0;
+        }
+        js_parse_error(s, "expected type");
+        return -1;
+    }
+}
+
+/* TS: consume a full type annotation (the ':' must already be consumed
+   by the caller). Returns 0 on success, -1 on error. No bytecode emitted. */
+static __exception int js_parse_ts_type(JSParseState *s)
+{
+    /* 'readonly' prefix (only valid before array postfix in TS, but for
+       M1 we accept it loosely and just consume it) */
+    {
+        JSAtom ro_atom = JS_NewAtom(s->ctx, "readonly");
+        BOOL is_readonly = token_is_pseudo_keyword(s, ro_atom);
+        JS_FreeAtom(s->ctx, ro_atom);
+        if (is_readonly) {
+            if (next_token(s))
+                return -1;
+        }
+    }
+    /* primary type */
+    if (js_parse_ts_primary_type(s))
+        return -1;
+    /* postfix array type: T[] (possibly chained T[][]...) */
+    while (s->token.val == '[') {
+        if (next_token(s))
+            return -1;
+        if (s->token.val != ']') {
+            js_parse_error(s, "expected ']' in array type");
+            return -1;
+        }
+        if (next_token(s))
+            return -1;
+    }
+    /* intersection types: T & U */
+    while (s->token.val == '&') {
+        if (next_token(s))
+            return -1;
+        if (js_parse_ts_primary_type(s))
+            return -1;
+        while (s->token.val == '[') {
+            if (next_token(s))
+                return -1;
+            if (s->token.val != ']') {
+                js_parse_error(s, "expected ']' in array type");
+                return -1;
+            }
+            if (next_token(s))
+                return -1;
+        }
+    }
+    /* union types: T | U */
+    while (s->token.val == '|') {
+        if (next_token(s))
+            return -1;
+        /* recurse to handle a full type operand (covers chained
+           intersections inside unions) */
+        if (js_parse_ts_type(s))
+            return -1;
+    }
+    return 0;
+}
+
+/* TS: ---- end of TypeScript type consumer ---- */
+
 static __exception int js_parse_program(JSParseState *s)
 {
     JSFunctionDef *fd = s->cur_func;
@@ -37202,6 +37590,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     skip_shebang(&s->buf_ptr, s->buf_end);
 
     eval_type = flags & JS_EVAL_TYPE_MASK;
+    s->ts_mode = (flags & JS_EVAL_FLAG_TS) != 0; /* TS: */
     m = NULL;
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         JSObject *p;
