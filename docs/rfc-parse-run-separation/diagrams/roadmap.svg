@@ -1,0 +1,58 @@
+<svg width="100%" viewBox="0 0 680 700" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>QuickJS parse 与运行分离 · 技术路线图</title>
+<desc>插画风技术路线图:三个编号阶段自上而下(证据接地 → 结论固化与评审 → 定稿交付),阶段间箭头相连;底部为三条硬约束与分离形态摘要。</desc>
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8A8272"/></marker>
+</defs>
+<rect x="24" y="8" width="632" height="672" rx="18" fill="#FAF6EC" stroke="#E3D9C4" stroke-width="1.5"/>
+<rect x="44" y="28" width="592" height="58" rx="12" fill="#AFC0D2"/>
+<text x="340" y="53" text-anchor="middle" font-size="16" font-weight="bold" fill="#2F3B4A">QuickJS parse 与运行分离 · 技术路线图</text>
+<text x="340" y="73" text-anchor="middle" font-size="11" fill="#3E4E62">评估型 RFC(零代码改动) · 基线 VERSION 2026-06-04 / HEAD 04be246</text>
+
+<rect x="44" y="104" width="592" height="112" rx="14" fill="#DCE7F2"/>
+<circle cx="76" cy="130" r="13" fill="#5B7A9D"/>
+<text x="76" y="135" text-anchor="middle" font-size="13" font-weight="bold" fill="#FFFFFF">1</text>
+<text x="98" y="135" font-size="14" font-weight="bold" fill="#39424E">M1 证据接地 — 三段式流水线与分离点</text>
+<rect x="64" y="152" width="176" height="50" rx="10" fill="#FFFDF9" stroke="#E7DECA"/>
+<text x="76" y="174" font-size="14">🔍</text><text x="98" y="174" font-size="11" fill="#4A4A42">COMPILE_ONLY</text>
+<text x="76" y="192" font-size="10" fill="#7A7466">quickjs.c:37290</text>
+<rect x="256" y="152" width="176" height="50" rx="10" fill="#FFFDF9" stroke="#E7DECA"/>
+<text x="268" y="174" font-size="14">🔗</text><text x="290" y="174" font-size="11" fill="#4A4A42">eval_internal 间接层</text>
+<text x="268" y="192" font-size="10" fill="#7A7466">quickjs.c:56176</text>
+<rect x="448" y="152" width="176" height="50" rx="10" fill="#FFFDF9" stroke="#E7DECA"/>
+<text x="460" y="174" font-size="14">📦</text><text x="482" y="174" font-size="11" fill="#4A4A42">BCWriter / BCReader</text>
+<text x="460" y="192" font-size="10" fill="#7A7466">quickjs.c:39434</text>
+<line x1="340" y1="216" x2="340" y2="244" stroke="#8A8272" stroke-width="2" marker-end="url(#ah)"/>
+
+<rect x="44" y="250" width="592" height="112" rx="14" fill="#DFEDE0"/>
+<circle cx="76" cy="276" r="13" fill="#6E9273"/>
+<text x="76" y="281" text-anchor="middle" font-size="13" font-weight="bold" fill="#FFFFFF">2</text>
+<text x="98" y="281" font-size="14" font-weight="bold" fill="#39423A">M2 结论固化与复核 — 三条硬约束 + 独立评审</text>
+<rect x="64" y="298" width="270" height="50" rx="10" fill="#FFFDF9" stroke="#E7DECA"/>
+<text x="78" y="320" font-size="14">📐</text><text x="102" y="320" font-size="11" fill="#4A4A42">逐条 file:line 复核</text>
+<text x="78" y="338" font-size="10" fill="#7A7466">穷举 parser 入口(防漏)</text>
+<rect x="350" y="298" width="270" height="50" rx="10" fill="#FFFDF9" stroke="#E7DECA"/>
+<text x="364" y="320" font-size="14">🧑‍⚖️</text><text x="392" y="320" font-size="11" fill="#4A4A42">子 agent 独立评审</text>
+<text x="364" y="338" font-size="10" fill="#7A7466">终局 / 全面 / 系统 三视角</text>
+<line x1="340" y1="362" x2="340" y2="390" stroke="#8A8272" stroke-width="2" marker-end="url(#ah)"/>
+
+<rect x="44" y="396" width="592" height="112" rx="14" fill="#F4E6DF"/>
+<circle cx="76" cy="422" r="13" fill="#B0705C"/>
+<text x="76" y="427" text-anchor="middle" font-size="13" font-weight="bold" fill="#FFFFFF">3</text>
+<text x="98" y="427" font-size="14" font-weight="bold" fill="#4A3B34">M3 定稿与交付 — 执行摘要 + 用户核对</text>
+<rect x="64" y="444" width="270" height="50" rx="10" fill="#FFFDF9" stroke="#E7DECA"/>
+<text x="78" y="466" font-size="14">📖</text><text x="102" y="466" font-size="11" fill="#4A4A42">执行摘要 · 草案→定稿</text>
+<text x="78" y="484" font-size="10" fill="#7A7466">长期记忆锚定</text>
+<rect x="350" y="444" width="270" height="50" rx="10" fill="#FFFDF9" stroke="#E7DECA"/>
+<text x="364" y="466" font-size="14">✅</text><text x="392" y="466" font-size="11" fill="#4A4A42">Example:核对命令序列</text>
+<text x="364" y="484" font-size="10" fill="#7A7466">用户亲手验证 file:line</text>
+
+<rect x="44" y="524" width="592" height="60" rx="12" fill="#F1E9D2"/>
+<text x="64" y="548" font-size="12" font-weight="bold" fill="#4A4436">分离形态(预期成果)</text>
+<text x="64" y="568" font-size="10.5" fill="#5C5648">F1 同进程 compile-then-run · F2 跨进程 AOT(qjsc 路线) · F3 运行期零 parser(有语义代价)</text>
+
+<rect x="44" y="596" width="592" height="66" rx="12" fill="#EFDFDF"/>
+<text x="64" y="620" font-size="12" font-weight="bold" fill="#5A4040">三条硬约束(重要事项规则)</text>
+<text x="64" y="639" font-size="10.5" fill="#6B4E4E">R1 字节码=信任边界(JS_ReadObject 无 verifier) · R2 BC_VERSION 严格相等,不可作分发格式</text>
+<text x="64" y="655" font-size="10.5" fill="#6B4E4E">R3 剔 parser = 失去 eval + Function/Async/Generator/AsyncGenerator 四构造器</text>
+</svg>
