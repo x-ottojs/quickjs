@@ -4095,6 +4095,413 @@ static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* TS: __runInitializers / __esDecorate -- C implementations of the
+   two runtime helpers that real tsc injects for TC39 stage-3
+   decorators (verified against `npx typescript@latest tsc --target
+   ES2022` output). Registered as native globals (see
+   js_std_add_helpers) so the TS frontend can emit calls to them
+   exactly like tsc emits calls to its injected JS helpers.
+   NOTE on reference counting: JS_SetProperty/JS_SetPropertyStr
+   CONSUME the value argument's reference; JS_Call/JS_GetProperty* do
+   NOT consume anything (JS_Call uses COPY_ARGV). JS_GetOwnPropertyNames
+   dup's each returned atom -- each must be JS_FreeAtom'd. */
+
+static JSValue js_ts_run_initializers(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    /* function(thisArg, initializers[, value]) {
+         var useValue = arguments.length > 2;
+         for (var i = 0; i < initializers.length; i++)
+           value = useValue ? initializers[i].call(thisArg, value)
+                            : initializers[i].call(thisArg);
+         return useValue ? value : void 0;
+       } */
+    JSValue this_arg = argv[0];
+    JSValue init_array = argv[1];
+    JSValue value = JS_UNDEFINED, ret, elem, call_ret;
+    uint32_t len, i;
+    BOOL use_value = (argc > 2);
+
+    if (use_value)
+        value = argv[2];
+    ret = JS_GetPropertyStr(ctx, init_array, "length");
+    if (JS_IsException(ret))
+        return JS_EXCEPTION;
+    if (JS_ToUint32(ctx, &len, ret)) {
+        JS_FreeValue(ctx, ret);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, ret);
+    for (i = 0; i < len; i++) {
+        elem = JS_GetPropertyUint32(ctx, init_array, i);
+        if (JS_IsException(elem))
+            return JS_EXCEPTION;
+        if (use_value) {
+            call_ret = JS_Call(ctx, elem, this_arg, 1, &value);
+            JS_FreeValue(ctx, value);
+        } else {
+            call_ret = JS_Call(ctx, elem, this_arg, 0, NULL);
+        }
+        JS_FreeValue(ctx, elem);
+        if (JS_IsException(call_ret))
+            return JS_EXCEPTION;
+        value = call_ret;
+    }
+    if (use_value)
+        return value;
+    JS_FreeValue(ctx, value);
+    return JS_UNDEFINED;
+}
+
+/* 'context.addInitializer' closure: func_data[0] holds the
+   extraInitializers array (JS_NewCFunctionData dup's it; the
+   C_FUNCTION_DATA finalizer frees it automatically). */
+static JSValue js_ts_add_initializer(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv,
+                                     int magic, JSValue *func_data)
+{
+    /* function(f) { extraInitializers.push(f); } */
+    JSValue arr = func_data[0];
+    JSValue push = JS_GetPropertyStr(ctx, arr, "push");
+    JSValue ret;
+    if (JS_IsException(push))
+        return JS_EXCEPTION;
+    ret = JS_Call(ctx, push, arr, argc, argv);
+    JS_FreeValue(ctx, push);
+    if (JS_IsException(ret))
+        return JS_EXCEPTION;
+    JS_FreeValue(ctx, ret);
+    return JS_UNDEFINED;
+}
+
+/* helper: shallow-copy own enumerable string props of src into dst
+   ('access' handling is done by the caller separately). */
+static int js_ts_copy_own_props(JSContext *ctx, JSValue dst, JSValue src)
+{
+    uint32_t len, i;
+    JSPropertyEnum *tab = NULL;
+    if (JS_GetOwnPropertyNames(ctx, &tab, &len, src,
+                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
+        return -1;
+    for (i = 0; i < len; i++) {
+        JSValue v = JS_GetProperty(ctx, src, tab[i].atom);
+        if (JS_IsException(v)) {
+            uint32_t j;
+            for (j = 0; j < len; j++)
+                JS_FreeAtom(ctx, tab[j].atom);
+            js_free(ctx, tab);
+            return -1;
+        }
+        JS_SetProperty(ctx, dst, tab[i].atom, v); /* consumes v */
+        JS_FreeAtom(ctx, tab[i].atom);
+    }
+    js_free(ctx, tab);
+    return 0;
+}
+
+static JSValue js_ts_es_decorate(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    /* function(ctor, descriptorIn, decorators, contextIn, initializers,
+                extraInitializers) { ... } -- full semantics reproduced
+       from tsc's __esDecorate.
+       REFERENCE-COUNTING CONTRACT (verified against quickjs.c):
+       - JS_GetProperty / JS_GetGlobalObject / JS_NewObject /
+         JS_Call RETURN NEW REFERENCES owned by the caller;
+       - JS_SetProperty / JS_SetPropertyInternal CONSUME the value
+         argument;
+       - JS_Call does NOT consume argv (COPY_ARGV);
+       - JS_GetGlobalObject's result MUST be explicitly JS_FreeValue'd
+         after use (it is a fresh reference, not a borrowed one). */
+    JSValue ctor = argv[0];
+    JSValue descriptor_in = argv[1];
+    JSValue decorators = argv[2];
+    JSValue context_in = argv[3];
+    JSValue initializers = argv[4];
+    JSValue extra_initializers = argv[5];
+    JSValue kind_v, key, target, descriptor;
+    JSValue decor_len_v, elem, context, result;
+    const char *kind_c;
+    uint32_t len, i;
+    BOOL is_accessor, is_static, is_class, is_field;
+
+    kind_v = JS_GetPropertyStr(ctx, context_in, "kind");
+    if (JS_IsException(kind_v))
+        return JS_EXCEPTION;
+    kind_c = JS_ToCString(ctx, kind_v);
+    if (!kind_c) {
+        JS_FreeValue(ctx, kind_v);
+        return JS_EXCEPTION;
+    }
+    is_accessor = !strcmp(kind_c, "accessor");
+    is_class = !strcmp(kind_c, "class");
+    is_field = !strcmp(kind_c, "field");
+    {
+        JSValue static_v = JS_GetPropertyStr(ctx, context_in, "static");
+        is_static = JS_ToBool(ctx, static_v) > 0;
+        JS_FreeValue(ctx, static_v);
+    }
+    JS_FreeCString(ctx, kind_c);
+
+    /* key = kind === "getter" ? "get" : kind === "setter" ? "set" : "value" */
+    {
+        JSValue k2 = JS_GetPropertyStr(ctx, context_in, "kind");
+        const char *k2c = JS_ToCString(ctx, k2);
+        if (!k2c) {
+            JS_FreeValue(ctx, k2);
+            JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+        if (!strcmp(k2c, "getter"))
+            key = JS_NewString(ctx, "get");
+        else if (!strcmp(k2c, "setter"))
+            key = JS_NewString(ctx, "set");
+        else
+            key = JS_NewString(ctx, "value");
+        JS_FreeCString(ctx, k2c);
+        JS_FreeValue(ctx, k2);
+    }
+    if (JS_IsException(key)) {
+        JS_FreeValue(ctx, kind_v);
+        return JS_EXCEPTION;
+    }
+
+    /* target = !descriptorIn && ctor ? (static ? ctor : ctor.prototype)
+       : null */
+    if (JS_IsNull(descriptor_in) && !JS_IsNull(ctor)) {
+        if (is_static) {
+            target = JS_DupValue(ctx, ctor);
+        } else {
+            target = JS_GetPropertyStr(ctx, ctor, "prototype");
+            if (JS_IsException(target)) {
+                JS_FreeValue(ctx, key);
+                JS_FreeValue(ctx, kind_v);
+                return JS_EXCEPTION;
+            }
+        }
+    } else {
+        target = JS_NULL;
+    }
+
+    /* descriptor = descriptorIn || (target ?
+       Object.getOwnPropertyDescriptor(target, name) : {}) */
+    if (!JS_IsNull(descriptor_in)) {
+        descriptor = JS_DupValue(ctx, descriptor_in);
+    } else if (!JS_IsNull(target)) {
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue name_v = JS_GetPropertyStr(ctx, context_in, "name");
+        JSValue obj, gopd, args[2];
+        if (JS_IsException(name_v)) {
+            JS_FreeValue(ctx, global);
+            JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+        obj = JS_GetPropertyStr(ctx, global, "Object");
+        gopd = JS_GetPropertyStr(ctx, obj, "getOwnPropertyDescriptor");
+        args[0] = target;
+        args[1] = name_v;
+        descriptor = JS_Call(ctx, gopd, obj, 2, args);
+        JS_FreeValue(ctx, gopd);
+        JS_FreeValue(ctx, obj);
+        JS_FreeValue(ctx, name_v);
+        JS_FreeValue(ctx, global);
+        if (JS_IsException(descriptor)) {
+            JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+        if (JS_IsUndefined(descriptor)) {
+            JS_FreeValue(ctx, descriptor);
+            descriptor = JS_NewObject(ctx);
+        }
+    } else {
+        descriptor = JS_NewObject(ctx);
+    }
+    if (JS_IsException(descriptor)) {
+        JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+        return JS_EXCEPTION;
+    }
+
+    /* reverse-order decorator loop */
+    decor_len_v = JS_GetPropertyStr(ctx, decorators, "length");
+    if (JS_IsException(decor_len_v)) {
+        JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+        return JS_EXCEPTION;
+    }
+    if (JS_ToUint32(ctx, &len, decor_len_v)) {
+        JS_FreeValue(ctx, decor_len_v);
+        JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, decor_len_v);
+
+    for (i = len; i > 0; i--) {
+        JSValue acc_src, acc_dst;
+        JSValue arg_value, fn_data[1];
+        JSValue add_init_fn, call_args[2];
+
+        context = JS_NewObject(ctx);
+        if (JS_IsException(context)) {
+            JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+        if (js_ts_copy_own_props(ctx, context, context_in)) {
+            JS_FreeValue(ctx, context); JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+        acc_src = JS_GetPropertyStr(ctx, context_in, "access");
+        if (!JS_IsUndefined(acc_src) && !JS_IsException(acc_src)) {
+            acc_dst = JS_NewObject(ctx);
+            if (JS_IsException(acc_dst)) {
+                JS_FreeValue(ctx, acc_src);
+                JS_FreeValue(ctx, context); JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+                return JS_EXCEPTION;
+            }
+            if (js_ts_copy_own_props(ctx, acc_dst, acc_src)) {
+                JS_FreeValue(ctx, acc_dst); JS_FreeValue(ctx, acc_src);
+                JS_FreeValue(ctx, context); JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+                return JS_EXCEPTION;
+            }
+            JS_SetPropertyStr(ctx, context, "access", acc_dst);
+        }
+        JS_FreeValue(ctx, acc_src);
+
+        fn_data[0] = extra_initializers;
+        add_init_fn = JS_NewCFunctionData(ctx, js_ts_add_initializer, 1, 0, 1, fn_data);
+        if (JS_IsException(add_init_fn)) {
+            JS_FreeValue(ctx, context); JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+        JS_SetPropertyStr(ctx, context, "addInitializer", add_init_fn);
+
+        elem = JS_GetPropertyUint32(ctx, decorators, i - 1);
+        if (JS_IsException(elem)) {
+            JS_FreeValue(ctx, context); JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+
+        if (is_accessor) {
+            JSValue g = JS_GetPropertyStr(ctx, descriptor, "get");
+            JSValue st = JS_GetPropertyStr(ctx, descriptor, "set");
+            arg_value = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, arg_value, "get", g);
+            JS_SetPropertyStr(ctx, arg_value, "set", st);
+        } else {
+            const char *key_c = JS_ToCString(ctx, key);
+            arg_value = JS_GetPropertyStr(ctx, descriptor, key_c);
+            JS_FreeCString(ctx, key_c);
+        }
+        if (JS_IsException(arg_value)) {
+            JS_FreeValue(ctx, elem); JS_FreeValue(ctx, context); JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+
+        call_args[0] = arg_value;
+        call_args[1] = context;
+        result = JS_Call(ctx, elem, JS_UNDEFINED, 2, call_args);
+        JS_FreeValue(ctx, elem);
+        JS_FreeValue(ctx, arg_value);
+        JS_FreeValue(ctx, context);
+        if (JS_IsException(result)) {
+            JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+            return JS_EXCEPTION;
+        }
+
+        if (is_accessor) {
+            if (JS_IsUndefined(result)) {
+                JS_FreeValue(ctx, result);
+                continue;
+            }
+            if (JS_IsNull(result) || !JS_IsObject(result)) {
+                JS_FreeValue(ctx, result);
+                JS_ThrowTypeError(ctx, "Object expected");
+                JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+                return JS_EXCEPTION;
+            }
+            {
+                JSValue g = JS_GetPropertyStr(ctx, result, "get");
+                JSValue st = JS_GetPropertyStr(ctx, result, "set");
+                JSValue initf = JS_GetPropertyStr(ctx, result, "init");
+                if (!JS_IsUndefined(g))
+                    JS_SetPropertyStr(ctx, descriptor, "get", g);
+                else
+                    JS_FreeValue(ctx, g);
+                if (!JS_IsUndefined(st))
+                    JS_SetPropertyStr(ctx, descriptor, "set", st);
+                else
+                    JS_FreeValue(ctx, st);
+                if (!JS_IsUndefined(initf)) {
+                    JSValue unshift = JS_GetPropertyStr(ctx, initializers, "unshift");
+                    JSValue ur = JS_Call(ctx, unshift, initializers, 1, &initf);
+                    JS_FreeValue(ctx, unshift);
+                    JS_FreeValue(ctx, ur);
+                    JS_FreeValue(ctx, initf);
+                } else {
+                    JS_FreeValue(ctx, initf);
+                }
+            }
+            JS_FreeValue(ctx, result);
+        } else if (is_class) {
+            if (!JS_IsUndefined(result)) {
+                if (!JS_IsNull(descriptor_in)) {
+                    JS_SetPropertyStr(ctx, descriptor_in, "value", result);
+                } else {
+                    JS_FreeValue(ctx, result);
+                }
+            } else {
+                JS_FreeValue(ctx, result);
+            }
+        } else {
+            if (!JS_IsUndefined(result)) {
+                if (is_field) {
+                    JSValue unshift = JS_GetPropertyStr(ctx, initializers, "unshift");
+                    JSValue ur = JS_Call(ctx, unshift, initializers, 1, &result);
+                    JS_FreeValue(ctx, unshift);
+                    JS_FreeValue(ctx, ur);
+                    JS_FreeValue(ctx, result);
+                } else {
+                    const char *key_c = JS_ToCString(ctx, key);
+                    JS_SetPropertyStr(ctx, descriptor, key_c, result);
+                    JS_FreeCString(ctx, key_c);
+                }
+            } else {
+                JS_FreeValue(ctx, result);
+            }
+        }
+    }
+
+    /* if (target) Object.defineProperty(target, name, descriptor) */
+    if (!JS_IsNull(target)) {
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue name_v = JS_GetPropertyStr(ctx, context_in, "name");
+        JSValue obj = JS_GetPropertyStr(ctx, global, "Object");
+        JSValue odp = JS_GetPropertyStr(ctx, obj, "defineProperty");
+        JSValue args[3] = { target, name_v, descriptor };
+        JSValue r = JS_UNDEFINED;
+        if (!JS_IsException(name_v) && !JS_IsException(obj) && !JS_IsException(odp)) {
+            r = JS_Call(ctx, odp, obj, 3, args);
+            if (JS_IsException(r)) {
+                JS_FreeValue(ctx, odp);
+                JS_FreeValue(ctx, obj);
+                JS_FreeValue(ctx, name_v);
+                JS_FreeValue(ctx, global);
+                JS_FreeValue(ctx, descriptor); JS_FreeValue(ctx, target); JS_FreeValue(ctx, key); JS_FreeValue(ctx, kind_v);
+                return JS_EXCEPTION;
+            }
+            JS_FreeValue(ctx, r);
+        }
+        JS_FreeValue(ctx, odp);
+        JS_FreeValue(ctx, obj);
+        JS_FreeValue(ctx, name_v);
+        JS_FreeValue(ctx, global);
+    }
+
+    JS_FreeValue(ctx, descriptor);
+    JS_FreeValue(ctx, target);
+    JS_FreeValue(ctx, key);
+    JS_FreeValue(ctx, kind_v);
+    return JS_UNDEFINED;
+}
+
 void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
 {
     JSValue global_obj, console, args, performance;
@@ -4126,6 +4533,13 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
                       JS_NewCFunction(ctx, js_print, "print", 1));
     JS_SetPropertyStr(ctx, global_obj, "__loadScript",
                       JS_NewCFunction(ctx, js_loadScript, "__loadScript", 1));
+    /* TS: stage-3 decorator runtime helpers (see implementations
+       above) -- registered as global C functions so the TS frontend's
+       emitted code can call them like tsc's injected JS helpers. */
+    JS_SetPropertyStr(ctx, global_obj, "__esDecorate",
+                      JS_NewCFunction(ctx, js_ts_es_decorate, "__esDecorate", 6));
+    JS_SetPropertyStr(ctx, global_obj, "__runInitializers",
+                      JS_NewCFunction(ctx, js_ts_run_initializers, "__runInitializers", 2));
 
     JS_FreeValue(ctx, global_obj);
 }
