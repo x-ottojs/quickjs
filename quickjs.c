@@ -41223,6 +41223,31 @@ static __exception int js_parse_ts_type_name(JSParseState *s)
 /* TS: consume a primary type. Returns 0 / -1. No bytecode emitted. */
 static __exception int js_parse_ts_primary_type(JSParseState *s)
 {
+    /* TS type operators: 'keyof T', 'infer U' (both plain
+       identifiers) and 'typeof expr' (TOK_TYPEOF). Each is consumed
+       here and then the operand type is parsed recursively. */
+    if (s->token.val == TOK_IDENT) {
+        JSAtom ka = JS_NewAtom(s->ctx, "keyof");
+        JSAtom ia = JS_NewAtom(s->ctx, "infer");
+        BOOL is_keyof = (s->token.u.ident.atom == ka);
+        BOOL is_infer = (s->token.u.ident.atom == ia);
+        JS_FreeAtom(s->ctx, ka);
+        JS_FreeAtom(s->ctx, ia);
+        if (is_keyof || is_infer) {
+            if (next_token(s)) /* consume keyof/infer */
+                return -1;
+            return js_parse_ts_type(s);
+        }
+    }
+    if (s->token.val == TOK_TYPEOF) {
+        /* typeof expr -- the operand is an expression (identifier,
+           member chain); consume as a left-hand-side expression */
+        if (next_token(s)) /* consume typeof */
+            return -1;
+        if (js_parse_ts_type_name(s))
+            return -1;
+        return 0;
+    }
     switch (s->token.val) {
     case TOK_IDENT:
         /* type name (with optional generic args) */
@@ -41537,16 +41562,50 @@ static __exception int js_parse_ts_type(JSParseState *s)
     /* primary type */
     if (js_parse_ts_primary_type(s))
         return -1;
-    /* postfix array type: T[] (possibly chained T[][]...) */
+    /* postfix: T[] array type, or T[K] indexed access type */
     while (s->token.val == '[') {
         if (next_token(s))
             return -1;
-        if (s->token.val != ']') {
-            js_parse_error(s, "expected ']' in array type");
+        if (s->token.val == ']') {
+            /* array type */
+            if (next_token(s))
+                return -1;
+        } else {
+            /* indexed access: parse the key type then expect ']' */
+            if (js_parse_ts_type(s))
+                return -1;
+            if (s->token.val != ']') {
+                js_parse_error(s, "expected ']' in indexed access type");
+                return -1;
+            }
+            if (next_token(s))
+                return -1;
+        }
+    }
+    /* conditional types: T extends U ? X : Y -- the check type is
+       the type parsed so far; 'extends' is TOK_EXTENDS */
+    if (s->token.val == TOK_EXTENDS) {
+        if (next_token(s)) /* consume 'extends' */
+            return -1;
+        if (js_parse_ts_type(s)) /* extends type */
+            return -1;
+        if (s->token.val != '?') {
+            js_parse_error(s, "expected '?' in conditional type");
             return -1;
         }
-        if (next_token(s))
+        if (next_token(s)) /* consume '?' */
             return -1;
+        if (js_parse_ts_type(s)) /* true type */
+            return -1;
+        if (s->token.val != ':') {
+            js_parse_error(s, "expected ':' in conditional type");
+            return -1;
+        }
+        if (next_token(s)) /* consume ':' */
+            return -1;
+        if (js_parse_ts_type(s)) /* false type */
+            return -1;
+        return 0;
     }
     /* intersection types: T & U */
     while (s->token.val == '&') {
@@ -41557,12 +41616,19 @@ static __exception int js_parse_ts_type(JSParseState *s)
         while (s->token.val == '[') {
             if (next_token(s))
                 return -1;
-            if (s->token.val != ']') {
-                js_parse_error(s, "expected ']' in array type");
-                return -1;
+            if (s->token.val == ']') {
+                if (next_token(s))
+                    return -1;
+            } else {
+                if (js_parse_ts_type(s))
+                    return -1;
+                if (s->token.val != ']') {
+                    js_parse_error(s, "expected ']' in indexed access type");
+                    return -1;
+                }
+                if (next_token(s))
+                    return -1;
             }
-            if (next_token(s))
-                return -1;
         }
     }
     /* union types: T | U */

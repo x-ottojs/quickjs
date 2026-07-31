@@ -616,3 +616,25 @@ print("ALL TS TESTS PASSED");
         print("ALL TS TESTS PASSED");
     });
 }
+
+// B4: 类型运算符 (keyof/typeof/infer/条件/索引/映射)
+{
+    type TK = keyof { a: number; b: string };
+    type TV = { a: number }["a"];
+    type TC = string extends number ? true : false;
+    type TM = { [P in "x" | "y"]: number };
+    type TI<T> = T extends infer U ? U : never;
+    type TTO = typeof console;
+    const tk: TK = "a";
+    const tv: TV = 42;
+    const tc: TC = false;
+    const tm: TM = { x: 1, y: 2 };
+    print(tk === "a" && tv === 42 && tc === false && tm.x + tm.y === 3);
+    // 嵌套: 条件类型作为类型参数/默认值/函数返回
+    type TU<T> = Array<T extends string ? 1 : 2>;
+    type TD<T = string extends number ? 1 : 2> = T;
+    type TF = (x: string) => string extends number ? 1 : 2;
+    const tu: TU<number> = [2];
+    print(tu[0] === 2);
+}
+print("ALL TS TESTS PASSED");

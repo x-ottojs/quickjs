@@ -543,6 +543,7 @@ TODO refs: TS-66 ~ TS-68
   - **`await using`（B3，2026-08-01）**：async 资源管理——`await using Name = expr;` 用 `Symbol.asyncDispose` + finally 内 `OP_await`（复用 using 的 try/finally 结构）；识别：`await` 在普通函数是标识符（非 async 不转关键字），TOK_IDENT case 文本检测 `await using` 对（buf_ptr），非 async 报 "only valid in async functions"；与真实 tsc 逐字符一致（`body ad:b ad:a after`）；可与同步 using 混合（LIFO 统一）
   - 已知差异（记录）：非 dispose 值（null/undefined/数字）在 dispose 时抛 TypeError（tsc helper 静默跳过——TS 类型系统禁止，已记录）
   - `Symbol.dispose`/`Symbol.asyncDispose` 注册（前次保留）
+- **类型运算符（B4，2026-08-01，RFC 范围外补充）**：`keyof T`/`infer U`（前缀）、`typeof expr`（TOK_TYPEOF）、索引访问 `T[K]`（数组后缀扩展）、条件类型 `T extends U ? X : Y`、映射类型 `{ [K in ...]: ... }`（原有对象字面量类型覆盖）全部支持——纯擦除。嵌套场景（条件作为类型参数/默认值/函数返回）验证通过，与真实 tsc 逐字符一致（`a 42 false 3`）。
 - 已知限制（记录，非隐藏）：metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
 
 # Milestone M7: 集成与端到端
