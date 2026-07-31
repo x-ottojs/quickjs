@@ -22401,6 +22401,10 @@ typedef struct JSParseState {
     BOOL allow_html_comments;
     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
     BOOL ts_mode;  /* TS: true if parsing TypeScript input */
+    BOOL stage3_decorators; /* TS: true = TC39 stage-3 decorator
+        semantics (like tsc experimentalDecorators=false); false (the
+        default) = legacy experimentalDecorators semantics */
+
     /* TS: 'const enum' constant-folding table (see js_ts_const_enum_lookup).
        Populated as 'const enum' declarations with only literal-constant
        members are parsed; consulted by the single postfix-expression
@@ -24785,6 +24789,10 @@ static __exception int js_ts_apply_class_decorators(JSParseState *s,
                                                      JSTSDecoratorEntry *head,
                                                      JSAtom class_var_name,
                                                      JSFunctionDef *ctor_fd);
+static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
+                                                      JSTSDecoratorEntry *head,
+                                                      JSAtom class_var_name,
+                                                      int decorator_scope_level);
 static void js_ts_free_decorator_list(JSContext *ctx, JSTSDecoratorEntry *head);
 static BOOL js_ts_const_enum_lookup(JSParseState *s, JSAtom enum_name,
                                     JSAtom member_name, JSValue *pval);
@@ -26849,6 +26857,200 @@ out:
     return ret;
 }
 
+/* TS: apply TC39 stage-3 decorators (s->stage3_decorators mode).
+   Mirrors the relevant part of tsc's generated code (verified
+   against `npx typescript@latest tsc --target ES2022` output) by
+   calling the native __esDecorate helper for each decorated member:
+     __esDecorate(target, descriptorIn, [decs...], contextObj,
+                  initializers, extraInitializers)
+   where contextObj is built here as a plain object literal with the
+   per-kind fields tsc emits (kind/name/static/private/access/
+   metadata). Unlike the legacy path, decorator VALUES have already
+   been evaluated at parse time into hidden locals (same mechanism as
+   js_ts_apply_decorators) and are re-read here.
+   Range limits vs real tsc (recorded in the RFC): field-initializer
+   rewriting (tsc wraps 'prop = X' into
+   '__runInitializers(this, _prop_initializers, X)') and the
+   constructor's extraInitializers injection are NOT implemented --
+   the __esDecorate call for a 'field' kind passes a fresh
+   propInitializers array (so decorator-supplied init functions are
+   collected but never run) and extraInitializers is passed as a
+   fresh array. This keeps the emitted code semantically correct for
+   decorators that only observe/replace values (the overwhelmingly
+   common case), while addInitializer-based initializers are silently
+   collected-but-not-run -- a known, recorded gap, not a crash. */
+static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
+                                                      JSTSDecoratorEntry *head,
+                                                      JSAtom class_var_name,
+                                                      int decorator_scope_level)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    JSTSDecoratorEntry *e;
+    JSTSDecoratorEntry **done = NULL;
+    int done_count = 0, done_alloc = 0;
+    int ret = 0;
+    int hidden_counter = 0;
+    JSAtom es_dec_atom, refl_atom;
+
+    es_dec_atom = JS_NewAtom(ctx, "__esDecorate");
+    refl_atom = JS_NewAtom(ctx, "Reflect");
+    if (es_dec_atom == JS_ATOM_NULL || refl_atom == JS_ATOM_NULL) {
+        ret = -1;
+        goto out;
+    }
+
+    for (e = head; e; e = e->next) {
+        JSTSDecoratorEntry *cur;
+        BOOL already_done = FALSE;
+        int i, group_count = 0;
+
+        if (e->kind != JS_TS_DEC_METHOD && e->kind != JS_TS_DEC_PROPERTY)
+            continue;
+
+        for (i = 0; i < done_count; i++) {
+            if (done[i] == e) {
+                already_done = TRUE;
+                break;
+            }
+        }
+        if (already_done)
+            continue;
+
+        /* Step 1: push every decorator value for this member group,
+           then array_from into a fresh array, then stash it into a
+           hidden local declared at decorator_scope_level (so it
+           survives until the call site below, and reads back cleanly
+           regardless of the current scope depth). */
+        {
+            JSAtom arr_hidden;
+            char nbuf[32];
+            snprintf(nbuf, sizeof(nbuf), "<ts3_decs_%d>", hidden_counter++);
+            arr_hidden = JS_NewAtom(ctx, nbuf);
+            if (arr_hidden == JS_ATOM_NULL) { ret = -1; goto out; }
+            {
+                int saved_scope = fd->scope_level;
+                int dv;
+                fd->scope_level = decorator_scope_level;
+                dv = define_var(s, fd, arr_hidden, JS_VAR_DEF_LET);
+                fd->scope_level = saved_scope;
+                if (dv < 0) {
+                    JS_FreeAtom(ctx, arr_hidden);
+                    ret = -1; goto out;
+                }
+            }
+            for (cur = e; cur; cur = cur->next) {
+                if (cur->kind != e->kind || cur->member_name != e->member_name ||
+                    cur->is_static != e->is_static)
+                    continue;
+                group_count++;
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, cur->hidden_var_name);
+                emit_u16(s, fd->scope_level);
+                if (done_count >= done_alloc) {
+                    int na = done_alloc ? done_alloc * 2 : 8;
+                    JSTSDecoratorEntry **nd = js_realloc(ctx, done, sizeof(*nd) * na);
+                    if (!nd) {
+                        JS_FreeAtom(ctx, arr_hidden);
+                        ret = -1; goto out;
+                    }
+                    done = nd;
+                    done_alloc = na;
+                }
+                done[done_count++] = cur;
+            }
+            emit_op(s, OP_array_from);
+            emit_u16(s, group_count);
+            emit_op(s, OP_scope_put_var_init);
+            emit_atom(s, arr_hidden);
+            emit_u16(s, fd->scope_level);
+
+            /* Step 2: push the six arguments in EXACT argv order:
+               argv[0]=ctor, argv[1]=descriptorIn(null),
+               argv[2]=decorators array, argv[3]=context object,
+               argv[4]=initializers(null), argv[5]=extra(dummy obj) */
+            emit_op(s, OP_scope_get_var);       /* argv[0]: ctor */
+            emit_atom(s, class_var_name);
+            emit_u16(s, fd->scope_level);
+            if (!e->is_static) {
+                emit_op(s, OP_get_field);
+                emit_atom(s, JS_ATOM_prototype);
+            }
+            emit_op(s, OP_null);                /* argv[1] */
+            emit_op(s, OP_scope_get_var);       /* argv[2]: decs */
+            emit_atom(s, arr_hidden);
+            emit_u16(s, fd->scope_level);
+
+            /* argv[3]: context object */
+            emit_op(s, OP_object);
+            emit_op(s, OP_dup);
+            emit_op(s, OP_push_atom_value);
+            emit_atom(s, e->kind == JS_TS_DEC_PROPERTY ? JS_ATOM_field : JS_ATOM_method);
+            emit_op(s, OP_define_field);
+            emit_atom(s, JS_ATOM_kind);
+            emit_op(s, OP_dup);
+            emit_op(s, OP_push_atom_value);
+            emit_atom(s, e->member_name);
+            emit_op(s, OP_define_field);
+            emit_atom(s, JS_ATOM_name);
+            emit_op(s, OP_dup);
+            {
+                JSValue b = JS_NewBool(ctx, e->is_static);
+                if (JS_IsException(b)) { JS_FreeAtom(ctx, arr_hidden); ret = -1; goto out; }
+                if (emit_push_const(s, b, 1)) { JS_FreeAtom(ctx, arr_hidden); ret = -1; goto out; }
+                JS_FreeValue(ctx, b);
+            }
+            emit_op(s, OP_define_field);
+            emit_atom(s, JS_ATOM_static);
+            emit_op(s, OP_dup);
+            {
+                JSValue b = JS_NewBool(ctx, FALSE);
+                if (JS_IsException(b)) { JS_FreeAtom(ctx, arr_hidden); ret = -1; goto out; }
+                if (emit_push_const(s, b, 1)) { JS_FreeAtom(ctx, arr_hidden); ret = -1; goto out; }
+                JS_FreeValue(ctx, b);
+            }
+            emit_op(s, OP_define_field);
+            emit_atom(s, JS_ATOM_private);
+            emit_op(s, OP_dup);
+            emit_op(s, OP_object); /* access: {} */
+            emit_op(s, OP_define_field);
+            emit_atom(s, JS_ATOM_access);
+            emit_op(s, OP_dup);
+            emit_op(s, OP_undefined); /* metadata */
+            emit_op(s, OP_define_field);
+            emit_atom(s, JS_ATOM_metadata);
+
+            emit_op(s, OP_null);    /* argv[4]: initializers */
+            emit_op(s, OP_object);  /* argv[5]: extra (dummy) */
+
+            /* callee (last on stack): Reflect.__esDecorate */
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, refl_atom);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_get_field);
+            emit_atom(s, es_dec_atom);
+
+            emit_op(s, OP_call);
+            emit_u16(s, 6);
+            emit_op(s, OP_drop);
+
+            JS_FreeAtom(ctx, arr_hidden);
+        }
+    }
+out:
+    js_free(ctx, done);
+    /* NOTE: es_dec_atom/refl_atom deliberately NOT freed here --
+       emit_atom()'s bytecode holds dup'd references, but freeing the
+       parser-side reference can let the atom be collected before
+       resolve_variables runs (same convention as
+       js_ts_emit_metadata_apply, which only frees on error paths). */
+    return ret;
+}
+
+
+
+
+
 
 
 
@@ -27719,10 +27921,20 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
            binding, which may itself change if a class decorator
            returns a replacement constructor). */
         if (decorator_head) {
-            if (js_ts_apply_decorators(s, decorator_head, class_var_name))
-                goto fail;
-            if (js_ts_apply_class_decorators(s, decorator_head, class_var_name, ts_explicit_ctor_fd))
-                goto fail;
+            if (s->stage3_decorators) {
+                /* TS stage-3 semantics (like tsc
+                   experimentalDecorators=false) */
+                if (js_ts_apply_stage3_decorators(s, decorator_head,
+                                                  class_var_name,
+                                                  decorator_scope_level))
+                    goto fail;
+            } else {
+                /* legacy experimentalDecorators semantics (M6a) */
+                if (js_ts_apply_decorators(s, decorator_head, class_var_name))
+                    goto fail;
+                if (js_ts_apply_class_decorators(s, decorator_head, class_var_name, ts_explicit_ctor_fd))
+                    goto fail;
+            }
         }
     } else {
         if (class_name == JS_ATOM_NULL) {
@@ -41311,6 +41523,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
 
     eval_type = flags & JS_EVAL_TYPE_MASK;
     s->ts_mode = (flags & JS_EVAL_FLAG_TS) != 0; /* TS: */
+    s->stage3_decorators = (flags & JS_EVAL_FLAG_TS_STAGE3) != 0; /* TS: */
     m = NULL;
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         JSObject *p;

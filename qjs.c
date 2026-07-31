@@ -75,6 +75,8 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
     return ret;
 }
 
+int ts_stage3 = 0; /* TS: stage-3 decorator semantics (global: set by CLI, read by eval_file/eval_buf) */
+
 static int eval_file(JSContext *ctx, const char *filename, int module, int strict,
                      int ts)
 {
@@ -102,6 +104,8 @@ static int eval_file(JSContext *ctx, const char *filename, int module, int stric
     /* TS: enable TypeScript annotation consumption */
     if (ts)
         eval_flags |= JS_EVAL_FLAG_TS;
+    if (ts_stage3) /* TS: stage-3 decorator semantics (global) */
+        eval_flags |= JS_EVAL_FLAG_TS_STAGE3;
     ret = eval_buf(ctx, buf, buf_len, filename, eval_flags);
     js_free(ctx, buf);
     return ret;
@@ -408,6 +412,13 @@ int main(int argc, char **argv)
                 ts = 1;
                 continue;
             }
+            /* TS: TC39 stage-3 decorator semantics (like tsc
+               experimentalDecorators=false) */
+            if (!strcmp(longopt, "ts-stage3")) {
+                ts = 1;
+                ts_stage3 = 1;
+                continue;
+            }
             if (opt == 'd' || !strcmp(longopt, "dump")) {
                 dump_memory++;
                 continue;
@@ -521,6 +532,8 @@ int main(int argc, char **argv)
             /* TS: enable TypeScript annotation consumption */
             if (ts)
                 eval_flags |= JS_EVAL_FLAG_TS;
+            if (ts_stage3)
+                eval_flags |= JS_EVAL_FLAG_TS_STAGE3;
             if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", eval_flags))
                 goto fail;
         } else

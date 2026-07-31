@@ -348,6 +348,10 @@ static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int64_t d)
 /* parse input as TypeScript (type annotations are consumed and
    discarded; no type checking is performed) */
 #define JS_EVAL_FLAG_TS    (1 << 8)
+/* TS: use TC39 stage-3 decorator semantics instead of the legacy
+   experimentalDecorators semantics (like tsc's
+   experimentalDecorators=false). Requires JS_EVAL_FLAG_TS as well. */
+#define JS_EVAL_FLAG_TS_STAGE3 (1 << 9)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);

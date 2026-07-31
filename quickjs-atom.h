@@ -280,4 +280,15 @@ DEF(Symbol_species, "Symbol.species")
 DEF(Symbol_unscopables, "Symbol.unscopables")
 DEF(Symbol_asyncIterator, "Symbol.asyncIterator")
 
+/* TS: stage-3 decorator context fields (added at the END so existing
+   atom indices are unchanged -- bytecode compatibility, see the
+   parse/run separation RFC's R2) */
+DEF(method, "method")
+DEF(field, "field")
+DEF(kind, "kind")
+DEF(access, "access")
+DEF(metadata, "metadata")
+DEF(__esDecorate, "__esDecorate")
+DEF(__runInitializers, "__runInitializers")
+
 #endif /* DEF */
