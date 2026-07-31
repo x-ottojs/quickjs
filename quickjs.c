@@ -21993,6 +21993,45 @@ typedef struct JSVarDef {
     int func_pool_idx;
 } JSVarDef;
 
+typedef enum {
+    JS_TS_META_NONE,    /* no type annotation was present at all --
+                            emitDecoratorMetadata still needs a value
+                            here (design:type is always emitted for a
+                            decorated method, even with no return type
+                            annotation... except 'void 0' - see
+                            JS_TS_META_VOID) */
+    JS_TS_META_NUMBER,
+    JS_TS_META_STRING,
+    JS_TS_META_BOOLEAN,
+    JS_TS_META_SYMBOL,
+    JS_TS_META_BIGINT,
+    JS_TS_META_ARRAY,
+    JS_TS_META_FUNCTION,
+    JS_TS_META_OBJECT,  /* the Object fallback: any/unknown/union/
+                            intersection/literal/tuple/etc. */
+    JS_TS_META_VOID,     /* 'void' (only meaningful for a return type:
+                            tsc emits 'void 0', not any constructor) */
+    JS_TS_META_IDENT,    /* a bare identifier type reference: emitted
+                            as a direct reference to that identifier
+                            (may be a class, enum, or -- with no safety
+                            net, per grill -- an interface/type alias
+                            that has no runtime value, in which case
+                            evaluating it throws ReferenceError) */
+} JSTSMetaKind;
+
+/* TS: classification result for one type annotation, produced by
+   js_ts_classify_type_range (a post-hoc scan over the already-
+   consumed source range, NOT a second parse -- js_parse_ts_type
+   itself is untouched, so plain undecorated code pays zero extra
+   cost; classification only happens where a caller explicitly asks
+   for it, i.e. class-member/parameter/return-type positions, since
+   only those can ever be decorated and therefore need
+   emitDecoratorMetadata support). */
+typedef struct JSTSTypeMeta {
+    JSTSMetaKind kind;
+    JSAtom ident_atom; /* valid only for JS_TS_META_IDENT; owned
+                          (JS_DupAtom'd) */
+} JSTSTypeMeta;
 typedef struct JSFunctionDef {
     JSContext *ctx;
     struct JSFunctionDef *parent;
@@ -22137,7 +22176,42 @@ typedef struct JSFunctionDef {
        js_parse_function_decl2 returns) -- see the comment where these
        are populated. */
     struct JSTSDecoratorEntry *ts_param_decorators;
+    /* TS: emitDecoratorMetadata classification for THIS function's own
+       return type annotation and parameter types, collected while
+       parsing (see the call sites in js_parse_function_decl2), read
+       back by js_parse_class once js_parse_function_decl2 returns and
+       this member's real name/decoration status is known. Only
+       meaningful for a class method/constructor -- always
+       JS_TS_META_NONE (the zero value) for anything else, costing
+       nothing. */
+    JSTSTypeMeta ts_return_type_meta;
+    JSTSTypeMeta *ts_param_type_metas; /* one entry per parameter, in
+        declaration order; NULL if this function has no TS-mode
+        parameter type annotations at all */
+    int ts_param_type_meta_count;
 } JSFunctionDef;
+
+/* TS: 'emitDecoratorMetadata' runtime-constructor classification for a
+   type annotation. Verified against real tsc output (design:type /
+   design:paramtypes / design:returntype): a type annotation is
+   classified by its OUTERMOST syntactic shape only (e.g. 'T[]' is
+   always Array no matter what T is; 'A|B' is always Object no matter
+   what A/B are) -- this is a deliberate range limit approved by grill
+   (not a full type checker): 8 primitive keywords + array + function
+   + a bare identifier reference get precise treatment; everything
+   else (union/intersection/conditional/mapped/literal/tuple/generic
+   type parameters used bare, etc.) safely falls back to Object, which
+   is what real tsc itself does for interfaces, unions, and most
+   "complex" shapes anyway (only a handful of special cases like
+   type-alias expansion or object-space identifier resolution differ
+   from real tsc, and those would require an actual type checker to
+   replicate -- explicitly out of scope, see RFC S2). A bare
+   identifier (JS_TS_META_IDENT) is emitted as-is with NO safety net
+   (grill decision): if it names an interface/type-only declaration
+   with no runtime value, the generated code throws ReferenceError at
+   class-construction time rather than silently degrading to Object --
+   matches real TS/JS "the identifier just doesn't exist" semantics
+   for an undecorated bare reference used as a value. */
 
 /* TS: one constant-folded 'const enum' member, e.g. 'Color.Red' -> 0.
    Linked list, appended as 'const enum' declarations with only
@@ -22244,6 +22318,42 @@ typedef struct JSTSDecoratorEntry {
        has been consumed. */
     const uint8_t *decorator_src_start;
     const uint8_t *decorator_src_end;
+    /* TS: emitDecoratorMetadata classification for this entry's OWN
+       declaration's type annotation(s). Meaning depends on 'kind':
+       - JS_TS_DEC_METHOD/PROPERTY: type_meta is this member's own
+         type annotation (property type, or 'Function' hardcoded for
+         a method -- see the call site) -> "design:type".
+       - JS_TS_DEC_PARAMETER: type_meta is unused (metadata for
+         constructor/method PARAMETERS is emitted once per enclosing
+         declaration as a single array, not per decorator entry -- see
+         js_parse_class's param_types/param_type_count, filled in
+         alongside ts_param_decorators).
+       - JS_TS_DEC_CLASS: type_meta is unused; class decorators never
+         get "design:type" (verified: real tsc never emits
+         design:type/design:returntype for a class, only
+         design:paramtypes for its constructor, handled the same way
+         as JS_TS_DEC_PARAMETER above).
+       Populated once, on whichever JSTSDecoratorEntry is first
+       attached for a given member (js_ts_attach_pending_decorators
+       does not distinguish -- see the emitting site instead, which
+       only reads it off the outer 'e' in js_ts_apply_decorators, not
+       every 'cur' in the inner loop, since all decorators on the same
+       member obviously share the same declared type). Also carries a
+       'return_type_meta' for JS_TS_DEC_METHOD (methods need BOTH
+       design:type=Function AND design:returntype=<actual return
+       type>, verified against real tsc output). */
+    JSTSTypeMeta type_meta;
+    JSTSTypeMeta return_type_meta; /* JS_TS_DEC_METHOD only */
+    /* JS_TS_DEC_METHOD only: this method's own parameter types (for
+       design:paramtypes), moved over from the method's own
+       JSFunctionDef.ts_param_type_metas once js_parse_function_decl2
+       returns (see the back-fill site in js_parse_class). Owns the
+       array and every entry's ident_atom. NULL if the method has zero
+       parameters or is not itself decorated closely enough to need
+       this (in which case the array from ts_param_type_metas is
+       simply freed instead, see js_free_function_def). */
+    JSTSTypeMeta *param_type_metas;
+    int param_type_meta_count;
     /* ordering within the same (kind, member_name, is_static,
        param_index) group: entries are appended in source order and
        later applied in *reverse* (bottom-to-top call order per TS
@@ -24648,6 +24758,10 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                                                JSFunctionDef **pfd);
 /* TS: forward declaration of the TypeScript type annotation consumer */
 static __exception int js_parse_ts_type(JSParseState *s);
+static JSTSMetaKind js_ts_classify_type_range(JSContext *ctx,
+                                              const uint8_t *start,
+                                              const uint8_t *end,
+                                              JSAtom *pident_atom);
 static int js_ts_rescan_greater(JSParseState *s);
 static __exception int js_parse_ts_interface(JSParseState *s);
 static __exception int js_parse_ts_type_alias(JSParseState *s);
@@ -24669,7 +24783,8 @@ static __exception int js_ts_apply_decorators(JSParseState *s,
                                               JSAtom class_var_name);
 static __exception int js_ts_apply_class_decorators(JSParseState *s,
                                                      JSTSDecoratorEntry *head,
-                                                     JSAtom class_var_name);
+                                                     JSAtom class_var_name,
+                                                     JSFunctionDef *ctor_fd);
 static void js_ts_free_decorator_list(JSContext *ctx, JSTSDecoratorEntry *head);
 static BOOL js_ts_const_enum_lookup(JSParseState *s, JSAtom enum_name,
                                     JSAtom member_name, JSValue *pval);
@@ -25864,9 +25979,15 @@ static void js_ts_free_decorator_list(JSContext *ctx, JSTSDecoratorEntry *head)
 {
     JSTSDecoratorEntry *e, *next;
     for (e = head; e; e = next) {
+        int ti;
         next = e->next;
         JS_FreeAtom(ctx, e->member_name);
         JS_FreeAtom(ctx, e->hidden_var_name);
+        JS_FreeAtom(ctx, e->type_meta.ident_atom);
+        JS_FreeAtom(ctx, e->return_type_meta.ident_atom);
+        for (ti = 0; ti < e->param_type_meta_count; ti++)
+            JS_FreeAtom(ctx, e->param_type_metas[ti].ident_atom);
+        js_free(ctx, e->param_type_metas);
         js_free(ctx, e);
     }
 }
@@ -25919,6 +26040,312 @@ static void js_ts_attach_pending_decorators(JSTSDecoratorEntry **ppending,
    js_ts_apply_class_decorators have run, since the class-decorator
    pass also needs to walk 'head' looking for JS_TS_DEC_CLASS/
    JS_TS_DEC_PARAMETER entries. */
+
+/* TS: emit the runtime-constructor VALUE corresponding to one
+   JSTSTypeMeta classification (for design:type/paramtypes/returntype),
+   pushing exactly one value onto the stack. No new opcodes -- global
+   builtin references (Number/String/.../Symbol) use the same
+   OP_scope_get_var already used everywhere else in this file; the
+   bigint special case reproduces tsc's own generated expression
+   verbatim ('typeof BigInt === "function" ? BigInt : Object'), and a
+   bare identifier reference (JS_TS_META_IDENT) is emitted with NO
+   safety net per the grill decision recorded on JSTSMetaKind. */
+static __exception int js_ts_emit_type_meta_value(JSParseState *s,
+                                                   const JSTSTypeMeta *m)
+{
+    JSFunctionDef *fd = s->cur_func;
+    JSAtom builtin_atom;
+
+    switch (m->kind) {
+    case JS_TS_META_NUMBER:    builtin_atom = JS_ATOM_Number; break;
+    case JS_TS_META_STRING:    builtin_atom = JS_ATOM_String; break;
+    case JS_TS_META_BOOLEAN:   builtin_atom = JS_ATOM_Boolean; break;
+    case JS_TS_META_SYMBOL:    builtin_atom = JS_ATOM_Symbol; break;
+    case JS_TS_META_ARRAY:     builtin_atom = JS_ATOM_Array; break;
+    case JS_TS_META_FUNCTION:  builtin_atom = JS_ATOM_Function; break;
+    case JS_TS_META_OBJECT:    builtin_atom = JS_ATOM_Object; break;
+    case JS_TS_META_NONE:      /* no annotation at all: real tsc's own
+                                   behaviour for e.g. an unannotated
+                                   property is design:type=Object (only
+                                   a genuinely absent RETURN type
+                                   annotation on a method uses void 0,
+                                   which is JS_TS_META_VOID, not NONE:
+                                   NONE only arises here for a property
+                                   with literally no ':Type' at all,
+                                   which real tsc also treats as
+                                   Object since it still has *some*
+                                   inferred type). */
+        builtin_atom = JS_ATOM_Object;
+        break;
+    case JS_TS_META_VOID:
+        emit_op(s, OP_undefined);
+        return 0;
+    case JS_TS_META_IDENT:
+        /* bare identifier: emit a direct reference, exactly as if the
+           user had written 'IdentName' as an expression at this
+           point. No 'typeof X !== "undefined"' guard (grill decision):
+           if 'm->ident_atom' names a type-only declaration with no
+           runtime value (e.g. an interface, or a type alias to
+           something not itself a plain builtin/class name), this
+           throws ReferenceError when the class is declared -- an
+           explicit, observable failure rather than a silently wrong
+           Object fallback. */
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, m->ident_atom);
+        emit_u16(s, fd->scope_level);
+        return 0;
+    case JS_TS_META_BIGINT:
+        /* 'typeof BigInt === "function" ? BigInt : Object', verbatim
+           reproduction of tsc's own generated expression (verified
+           against real tsc --emitDecoratorMetadata output) -- needed
+           because 'BigInt' may not exist as a global in every runtime
+           tsc targets, so it guards the reference with 'typeof'
+           (which tolerates an unresolved identifier without throwing)
+           before actually using the value. Mirrors exactly how
+           js_parse_unary's own TOK_TYPEOF case handles 'typeof x' on a
+           bare identifier: emit OP_scope_get_var then patch it in
+           place to OP_scope_get_var_undef (the "doesn't throw if
+           unresolved" variant) before the OP_typeof. */
+        {
+            JSAtom bigint_atom, func_str_atom;
+            int label_else, label_end;
+            JSValue func_str;
+
+            bigint_atom = JS_NewAtom(s->ctx, "BigInt");
+            if (bigint_atom == JS_ATOM_NULL)
+                return -1;
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, bigint_atom);
+            emit_u16(s, fd->scope_level);
+            JS_FreeAtom(s->ctx, bigint_atom);
+            if (get_prev_opcode(fd) == OP_scope_get_var) {
+                fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_get_var_undef;
+            }
+            emit_op(s, OP_typeof);
+            func_str = JS_NewString(s->ctx, "function");
+            if (JS_IsException(func_str))
+                return -1;
+            func_str_atom = JS_NewAtomStr(s->ctx, JS_VALUE_GET_STRING(func_str));
+            if (func_str_atom == JS_ATOM_NULL)
+                return -1;
+            emit_op(s, OP_push_atom_value);
+            emit_u32(s, func_str_atom);
+            emit_op(s, OP_strict_eq);
+            label_else = emit_goto(s, OP_if_false, -1);
+            bigint_atom = JS_NewAtom(s->ctx, "BigInt");
+            if (bigint_atom == JS_ATOM_NULL)
+                return -1;
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, bigint_atom);
+            emit_u16(s, fd->scope_level);
+            JS_FreeAtom(s->ctx, bigint_atom);
+            label_end = emit_goto(s, OP_goto, -1);
+            emit_label(s, label_else);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, JS_ATOM_Object);
+            emit_u16(s, fd->scope_level);
+            emit_label(s, label_end);
+        }
+        return 0;
+    default:
+        js_parse_error(s, "internal: unhandled metadata kind");
+        return -1;
+    }
+    emit_op(s, OP_scope_get_var);
+    emit_atom(s, builtin_atom);
+    emit_u16(s, fd->scope_level);
+    return 0;
+}
+
+/* TS: emit one 'emitDecoratorMetadata' entry -- verified against real
+   tsc output, '__metadata(key, value)' behaves exactly like any other
+   decorator in the '__decorate' composition (it is placed in the same
+   array, applied via the same "call and update desc if the result
+   isn't undefined" rule) EXCEPT that '__metadata' itself first checks
+   'typeof Reflect === "object" && typeof Reflect.metadata ===
+   "function"' and returns undefined (a no-op entry, effectively
+   skipped) if that guard fails -- since the reflect-metadata npm
+   package is what actually populates Reflect.metadata, and TS itself
+   never assumes it is present. Reproduces that guard directly rather
+   than emitting a reusable '__metadata' helper closure (consistent
+   with this file's "no runtime __decorate helper, expand everything
+   at compile time" design). For JS_TS_DEC_METHOD, 'desc_hidden' must
+   be a valid hidden-variable atom (already holding the current
+   descriptor, exactly like a real decorator call would receive/
+   update it); for JS_TS_DEC_PROPERTY, 'desc_hidden' is JS_ATOM_NULL
+   and the 2-argument decorator(target,key) form is used instead,
+   discarding the result (matches the ordinary property-decorator
+   case already handled the same way in js_ts_apply_decorators). */
+static __exception int js_ts_emit_metadata_apply(JSParseState *s,
+                                                 const char *key,
+                                                 const JSTSTypeMeta *m, /* NULL
+                                                     if 'value_hidden_var'
+                                                     should be read
+                                                     instead (used for
+                                                     design:paramtypes,
+                                                     whose value is a
+                                                     whole array built
+                                                     by the caller and
+                                                     stashed into a
+                                                     hidden variable
+                                                     BEFORE calling this
+                                                     function, rather
+                                                     than a single
+                                                     js_ts_emit_type_meta_value
+                                                     result) */
+                                                 JSAtom value_hidden_var, /* only
+                                                     read when m == NULL */
+                                                 JSAtom target_hidden,
+                                                 JSAtom member_name,
+                                                 JSAtom desc_hidden /* JS_ATOM_NULL for property */)
+{
+    JSFunctionDef *fd = s->cur_func;
+    JSAtom reflect_atom, metadata_str_atom, key_atom, str_atom;
+    JSValue tmp_str;
+    int label_skip;
+
+    /* if (!(typeof Reflect === "object" && typeof Reflect.metadata ===
+       "function")) goto skip; -- built as two independent
+       short-circuit checks, each jumping straight to 'skip' on
+       failure, rather than nesting -- simpler control flow than
+       trying to reproduce '&&' as a single expression here. */
+    reflect_atom = JS_NewAtom(s->ctx, "Reflect");
+    if (reflect_atom == JS_ATOM_NULL)
+        return -1;
+    emit_op(s, OP_scope_get_var);
+    emit_atom(s, reflect_atom);
+    emit_u16(s, fd->scope_level);
+    if (get_prev_opcode(fd) == OP_scope_get_var) {
+        fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_get_var_undef;
+    }
+    emit_op(s, OP_typeof);
+    tmp_str = JS_NewString(s->ctx, "object");
+    if (JS_IsException(tmp_str)) { JS_FreeAtom(s->ctx, reflect_atom); return -1; }
+    str_atom = JS_NewAtomStr(s->ctx, JS_VALUE_GET_STRING(tmp_str));
+    if (str_atom == JS_ATOM_NULL) { JS_FreeAtom(s->ctx, reflect_atom); return -1; }
+    emit_op(s, OP_push_atom_value);
+    emit_u32(s, str_atom);
+    emit_op(s, OP_strict_eq);
+    label_skip = emit_goto(s, OP_if_false, -1);
+
+    emit_op(s, OP_scope_get_var);
+    emit_atom(s, reflect_atom);
+    emit_u16(s, fd->scope_level);
+    metadata_str_atom = JS_NewAtom(s->ctx, "metadata");
+    if (metadata_str_atom == JS_ATOM_NULL) { JS_FreeAtom(s->ctx, reflect_atom); return -1; }
+    emit_op(s, OP_get_field);
+    emit_atom(s, metadata_str_atom);
+    emit_op(s, OP_typeof);
+    tmp_str = JS_NewString(s->ctx, "function");
+    if (JS_IsException(tmp_str)) { JS_FreeAtom(s->ctx, reflect_atom); return -1; }
+    str_atom = JS_NewAtomStr(s->ctx, JS_VALUE_GET_STRING(tmp_str));
+    if (str_atom == JS_ATOM_NULL) { JS_FreeAtom(s->ctx, reflect_atom); return -1; }
+    emit_op(s, OP_push_atom_value);
+    emit_u32(s, str_atom);
+    emit_op(s, OP_strict_eq);
+    label_skip = emit_goto(s, OP_if_false, label_skip); /* chain onto
+        the same target: emit_goto with an existing label argument
+        just emits a jump to that label (see its other call sites in
+        this file, e.g. the OP_goto chaining pattern used for
+        class-decorator application below) -- both failure paths land
+        on the same 'skip' point. */
+
+    /* Reflect.metadata(key, value) -- returns the decorator function
+       to apply (or possibly something falsy, matching '__metadata's
+       own "if (typeof ... === function) return Reflect.metadata(...)"
+       -- we don't second-guess what Reflect.metadata returns, we just
+       call it exactly like tsc's own generated code does). */
+    emit_op(s, OP_scope_get_var);
+    emit_atom(s, reflect_atom);
+    emit_u16(s, fd->scope_level);
+    JS_FreeAtom(s->ctx, reflect_atom);
+    emit_op(s, OP_get_field);
+    emit_atom(s, metadata_str_atom);
+    JS_FreeAtom(s->ctx, metadata_str_atom);
+    tmp_str = JS_NewString(s->ctx, key);
+    if (JS_IsException(tmp_str)) return -1;
+    key_atom = JS_NewAtomStr(s->ctx, JS_VALUE_GET_STRING(tmp_str));
+    if (key_atom == JS_ATOM_NULL) return -1;
+    emit_op(s, OP_push_atom_value);
+    emit_u32(s, key_atom);
+    if (m != NULL) {
+        if (js_ts_emit_type_meta_value(s, m))
+            return -1;
+    } else {
+        /* value was already built by the caller and stashed into
+           value_hidden_var BEFORE calling this function (e.g. a whole
+           array for design:paramtypes) -- just read it back by name,
+           no stack-order juggling needed since it was never left on
+           the stack across the Reflect/metadata lookups above. */
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, value_hidden_var);
+        emit_u16(s, fd->scope_level);
+    }
+    emit_op(s, OP_call);
+    emit_u16(s, 2); /* -- decoratorFn */
+
+    /* apply it: decoratorFn(target[, key][, desc]); if a descriptor is
+       involved (method case) and the result isn't undefined, update
+       desc -- otherwise (property case) discard the result. Mirrors
+       the exact same pattern already used for ordinary decorators in
+       js_ts_apply_decorators. member_name == JS_ATOM_NULL selects the
+       1-argument class-decorator-style call decoratorFn(target) with
+       no key at all (used for the constructor's design:paramtypes,
+       whose "decorator" acts like a class decorator, not a
+       method/property one -- verified: real tsc's __decorate call for
+       a class-level metadata entry passes only (decorators, Ctor),
+       matching the c<3 branch of its own __decorate helper). */
+    if (member_name == JS_ATOM_NULL) {
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, target_hidden);
+        emit_u16(s, fd->scope_level);
+        emit_op(s, OP_call);
+        emit_u16(s, 1);
+        emit_op(s, OP_drop); /* class-level metadata result is
+            discarded here: unlike a real class decorator, a metadata
+            entry never legitimately returns a replacement constructor
+            -- Reflect.metadata's own decorator implementation always
+            returns undefined for the target-only call form. */
+    } else if (desc_hidden != JS_ATOM_NULL) {
+        int label_no_result;
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, target_hidden);
+        emit_u16(s, fd->scope_level);
+        emit_op(s, OP_push_atom_value);
+        emit_atom(s, member_name);
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, desc_hidden);
+        emit_u16(s, fd->scope_level);
+        emit_op(s, OP_call);
+        emit_u16(s, 3);
+        emit_op(s, OP_dup);
+        emit_op(s, OP_undefined);
+        emit_op(s, OP_strict_eq);
+        label_no_result = emit_goto(s, OP_if_true, -1);
+        emit_op(s, OP_scope_put_var);
+        emit_atom(s, desc_hidden);
+        emit_u16(s, fd->scope_level);
+        {
+            int label_end = emit_goto(s, OP_goto, -1);
+            emit_label(s, label_no_result);
+            emit_op(s, OP_drop);
+            emit_label(s, label_end);
+        }
+    } else {
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, target_hidden);
+        emit_u16(s, fd->scope_level);
+        emit_op(s, OP_push_atom_value);
+        emit_atom(s, member_name);
+        emit_op(s, OP_call);
+        emit_u16(s, 2);
+        emit_op(s, OP_drop);
+    }
+    emit_label(s, label_skip);
+    return 0;
+}
+
+
 static __exception int js_ts_apply_decorators(JSParseState *s,
                                               JSTSDecoratorEntry *head,
                                               JSAtom class_var_name)
@@ -26003,6 +26430,81 @@ static __exception int js_ts_apply_decorators(JSParseState *s,
             emit_op(s, OP_scope_put_var_init);
             emit_atom(s, desc_hidden);
             emit_u16(s, fd->scope_level);
+        }
+
+        /* TS: emitDecoratorMetadata -- applied BEFORE the member's own
+           decorators (verified against real tsc: the decorator array
+           is '[dec, __metadata("design:type",...), __metadata(
+           "design:paramtypes",...), __metadata("design:returntype",
+           ...)]' and __decorate's single reversed pass therefore hits
+           returntype, then paramtypes, then type, then the real
+           decorator last). Entirely skipped (zero bytecode, zero
+           bookkeeping already done at parse time) if this member's
+           type_meta was never populated, i.e. e->type_meta.kind ==
+           JS_TS_META_NONE -- which is the case whenever
+           emitDecoratorMetadata classification simply never ran for
+           an undecorated declaration (the parse-time capture sites
+           only run their classification logic when ts_mode is set,
+           which is the only real cost for ordinary undecorated TS
+           code: a handful of extra character-scan cycles per type
+           annotation, never any extra bytecode). */
+        if (e->type_meta.kind != JS_TS_META_NONE) {
+            if (e->kind == JS_TS_DEC_METHOD) {
+                if (e->return_type_meta.kind != JS_TS_META_NONE) {
+                    if (js_ts_emit_metadata_apply(s, "design:returntype",
+                                                  &e->return_type_meta,
+                                                  JS_ATOM_NULL,
+                                                  target_hidden, e->member_name,
+                                                  desc_hidden))
+                        { ret = -1; goto out; }
+                }
+                if (e->param_type_metas) {
+                    /* design:paramtypes for a decorated METHOD (not
+                       the constructor -- that case is handled by
+                       js_ts_apply_class_decorators instead): value is
+                       an array literal, one entry per parameter. Built
+                       into a hidden variable first (rather than left
+                       on the stack across the Reflect/metadata lookups
+                       that js_ts_emit_metadata_apply itself performs),
+                       matching the same "stash into a named local,
+                       read it back later" pattern used everywhere else
+                       in this file for exactly this reason. */
+                    int pi;
+                    JSAtom arr_hidden;
+                    char name_buf[32];
+                    for (pi = 0; pi < e->param_type_meta_count; pi++) {
+                        if (js_ts_emit_type_meta_value(s, &e->param_type_metas[pi]))
+                            { ret = -1; goto out; }
+                    }
+                    emit_op(s, OP_array_from);
+                    emit_u16(s, e->param_type_meta_count);
+                    snprintf(name_buf, sizeof(name_buf), "<ts_dec_ptypes_%d>",
+                            s->ts_decorator_counter++);
+                    arr_hidden = JS_NewAtom(ctx, name_buf);
+                    if (arr_hidden == JS_ATOM_NULL) { ret = -1; goto out; }
+                    if (define_var(s, fd, arr_hidden, JS_VAR_DEF_LET) < 0) {
+                        JS_FreeAtom(ctx, arr_hidden);
+                        ret = -1; goto out;
+                    }
+                    emit_op(s, OP_scope_put_var_init);
+                    emit_atom(s, arr_hidden);
+                    emit_u16(s, fd->scope_level);
+                    if (js_ts_emit_metadata_apply(s, "design:paramtypes",
+                                                  NULL, arr_hidden,
+                                                  target_hidden, e->member_name,
+                                                  desc_hidden)) {
+                        JS_FreeAtom(ctx, arr_hidden);
+                        ret = -1; goto out;
+                    }
+                    JS_FreeAtom(ctx, arr_hidden);
+                }
+
+            }
+            if (js_ts_emit_metadata_apply(s, "design:type", &e->type_meta,
+                                          JS_ATOM_NULL,
+                                          target_hidden, e->member_name,
+                                          desc_hidden))
+                { ret = -1; goto out; }
         }
 
         /* Apply every decorator for this exact (member_name, is_static,
@@ -26122,10 +26624,16 @@ out:
    applied for the class." Both kinds may replace/observe the class
    binding: a class decorator's return value (if not undefined)
    replaces the bound constructor; the final (possibly replaced) value
-   is what 'class_var_name' ends up holding. No new opcodes. */
+   is what 'class_var_name' ends up holding. No new opcodes.
+   'ctor_fd' (may be NULL if the class has no explicit constructor)
+   supplies design:paramtypes for the constructor's parameters,
+   verified against real tsc: this is emitted whenever the class OR
+   any constructor parameter is decorated (design:type/returntype are
+   never emitted for a class itself -- classes have neither). */
 static __exception int js_ts_apply_class_decorators(JSParseState *s,
                                                      JSTSDecoratorEntry *head,
-                                                     JSAtom class_var_name)
+                                                     JSAtom class_var_name,
+                                                     JSFunctionDef *ctor_fd)
 {
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
@@ -26142,6 +26650,60 @@ static __exception int js_ts_apply_class_decorators(JSParseState *s,
     }
     if (!have_param && !have_class)
         return 0;
+
+    /* TS: emitDecoratorMetadata "design:paramtypes" for the
+       constructor, applied FIRST (verified against real tsc: the
+       array is '[classDec, __param(0,paramDec), __metadata(
+       "design:paramtypes",[...])]' and __decorate's single reversed
+       pass therefore hits design:paramtypes before any __param entry,
+       which in turn runs before any class decorator). Emitted
+       whenever the class OR any constructor parameter is decorated
+       (have_param || have_class), matching real tsc's behaviour of
+       generating design:paramtypes even for a class decorator alone
+       with no parameter decorators at all. ctor_fd may be NULL (class
+       has no explicit constructor) or have zero recorded parameter
+       types (constructor has zero parameters, or was never TS-mode
+       parsed with parameter types at all) -- both are simply skipped,
+       matching the fact that tsc itself only emits paramtypes when
+       there's something to describe. */
+    if (ctor_fd) { /* TS: verified against real tsc -- design:paramtypes
+        is emitted whenever the class has an EXPLICIT constructor (even
+        with zero parameters, producing an empty array), but NOT when
+        the class relies on an implicit default constructor. ctor_fd is
+        only ever set (see js_parse_class's 'ctor_fd = method_fd'
+        assignment) when the source actually wrote a
+        'constructor(...) {...}', so its mere non-NULL-ness is exactly
+        that condition -- ts_param_type_meta_count may legitimately be
+        0 here (zero-parameter constructor) and that's fine: the loop
+        below and OP_array_from(0) simply produce an empty array. */
+        int pi;
+        JSAtom arr_hidden;
+        char name_buf[32];
+        for (pi = 0; pi < ctor_fd->ts_param_type_meta_count; pi++) {
+            if (js_ts_emit_type_meta_value(s, &ctor_fd->ts_param_type_metas[pi]))
+                { ret = -1; goto out; }
+        }
+        emit_op(s, OP_array_from);
+        emit_u16(s, ctor_fd->ts_param_type_meta_count);
+        snprintf(name_buf, sizeof(name_buf), "<ts_dec_ctor_ptypes_%d>",
+                s->ts_decorator_counter++);
+        arr_hidden = JS_NewAtom(ctx, name_buf);
+        if (arr_hidden == JS_ATOM_NULL) { ret = -1; goto out; }
+        if (define_var(s, fd, arr_hidden, JS_VAR_DEF_LET) < 0) {
+            JS_FreeAtom(ctx, arr_hidden);
+            ret = -1; goto out;
+        }
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, arr_hidden);
+        emit_u16(s, fd->scope_level);
+        if (js_ts_emit_metadata_apply(s, "design:paramtypes", NULL,
+                                      arr_hidden, class_var_name,
+                                      JS_ATOM_NULL, JS_ATOM_NULL)) {
+            JS_FreeAtom(ctx, arr_hidden);
+            ret = -1; goto out;
+        }
+        JS_FreeAtom(ctx, arr_hidden);
+    }
 
     if (have_param) {
         /* Collect every JS_TS_DEC_PARAMETER entry into an array so it
@@ -26302,6 +26864,9 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
     JSAtom name = JS_ATOM_NULL, class_name = JS_ATOM_NULL, class_name1;
     JSAtom class_var_name = JS_ATOM_NULL;
     JSFunctionDef *method_fd, *ctor_fd;
+    JSFunctionDef *ts_explicit_ctor_fd; /* TS: see the capture site
+        further below, right before the default-constructor synthesis
+        that would otherwise make ctor_fd non-NULL unconditionally */
     int saved_js_mode, class_name_var_idx, prop_type, ctor_cpool_offset;
     int class_flags = 0, i, define_class_offset;
     BOOL is_static, is_private;
@@ -26750,12 +27315,57 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 emit_u16(s, s->cur_func->scope_level);
             }
 
-            /* TS: consume class field type annotation */
+            /* TS: consume class field type annotation. If this field
+               is decorated (pending_member_decorators non-empty),
+               additionally classify the type for emitDecoratorMetadata
+               ("design:type") -- js_ts_attach_pending_decorators
+               (called right below, once the field's name/kind are
+               known) has not yet run, so stash it straight onto the
+               still-pending entries; every entry for the same field
+               shares the same declared type. Skipped entirely for an
+               undecorated field: zero extra cost for plain TS code. */
             if (s->ts_mode && s->token.val == ':') {
-                if (next_token(s))
+                const uint8_t *type_start;
+                if (next_token(s)) /* consume ':' */
                     goto fail;
+                type_start = s->token.ptr; /* first token of the type
+                    itself, now that ':' has been consumed */
                 if (js_parse_ts_type(s))
                     goto fail;
+                /* NOTE: js_ts_attach_pending_decorators() for this
+                   field already ran (right at the top of this 'else
+                   if' branch, before the field name's ':' type
+                   annotation is even reached) -- pending_member_decorators
+                   is therefore already NULL by this point and checking
+                   it here would always be a no-op. Look the entries up
+                   in decorator_head directly instead (same pattern
+                   already used for a method's return-type back-fill,
+                   see the JS_TS_DEC_METHOD case above). */
+                {
+                    JSTSMetaKind kind;
+                    JSAtom ident = JS_ATOM_NULL;
+                    JSTSDecoratorEntry *pe;
+                    BOOL any_match = FALSE;
+                    for (pe = decorator_head; pe; pe = pe->next) {
+                        if (pe->kind == JS_TS_DEC_PROPERTY &&
+                            pe->member_name == name && pe->is_static == is_static) {
+                            any_match = TRUE;
+                            break;
+                        }
+                    }
+                    if (any_match) {
+                        kind = js_ts_classify_type_range(ctx, type_start,
+                                                         s->token.ptr, &ident);
+                        for (pe = decorator_head; pe; pe = pe->next) {
+                            if (pe->kind == JS_TS_DEC_PROPERTY &&
+                                pe->member_name == name && pe->is_static == is_static) {
+                                pe->type_meta.kind = kind;
+                                pe->type_meta.ident_atom = JS_DupAtom(ctx, ident);
+                            }
+                        }
+                    }
+                    JS_FreeAtom(ctx, ident);
+                }
             }
 
             if (s->token.val == '=') {
@@ -26862,6 +27472,45 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 decorator_head = method_fd->ts_param_decorators;
                 method_fd->ts_param_decorators = NULL;
             }
+            /* TS: back-fill this method's design:type(=Function)/
+               design:returntype classification onto the
+               JS_TS_DEC_METHOD entry already attached above (attach
+               happened BEFORE js_parse_function_decl2 ran, since the
+               method's real name/kind were known then but its return
+               type annotation was not parsed yet -- it lives inside
+               the function body/signature that js_parse_function_decl2
+               itself consumes). Only matters if this method was
+               actually decorated (decorator_head has a matching
+               entry); for an undecorated method the loop below simply
+               finds nothing and costs a handful of pointer
+               comparisons. Not applicable to a constructor (handled
+               separately at the class level via ctor_fd, see
+               js_ts_apply_class_decorators). */
+            if (func_type != JS_PARSE_FUNC_CLASS_CONSTRUCTOR &&
+                func_type != JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) {
+                JSTSDecoratorEntry *me;
+                for (me = decorator_head; me; me = me->next) {
+                    if (me->kind == JS_TS_DEC_METHOD &&
+                        me->member_name == name && me->is_static == is_static &&
+                        me->type_meta.kind == JS_TS_META_NONE) {
+                        me->type_meta.kind = JS_TS_META_FUNCTION;
+                        me->return_type_meta.kind = method_fd->ts_return_type_meta.kind;
+                        me->return_type_meta.ident_atom =
+                            JS_DupAtom(ctx, method_fd->ts_return_type_meta.ident_atom);
+                        /* move (not copy) the parameter-type array:
+                           the type_meta.kind==NONE guard above ensures
+                           this branch runs exactly once per method
+                           (the first matching entry claims the array;
+                           subsequent entries for the same method leave
+                           it NULL and js_ts_apply_decorators only ever
+                           needs to read it off ONE entry anyway). */
+                        me->param_type_metas = method_fd->ts_param_type_metas;
+                        me->param_type_meta_count = method_fd->ts_param_type_meta_count;
+                        method_fd->ts_param_type_metas = NULL;
+                        method_fd->ts_param_type_meta_count = 0;
+                    }
+                }
+            }
             if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
                 func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
                 ctor_fd = method_fd;
@@ -26903,6 +27552,20 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         goto fail;
     }
 
+    /* TS: capture "did the source write an explicit
+       'constructor(...) {...}'" into a SEPARATE variable before
+       js_parse_class_default_ctor below unconditionally overwrites
+       ctor_fd with a synthesized default constructor's own
+       JSFunctionDef when there was none -- verified against real tsc:
+       design:paramtypes is emitted for an explicit constructor (even
+       a zero-parameter one, producing an empty array) but NOT for an
+       implicit default constructor. ctor_fd itself must NOT be
+       touched here: it is used just below (ctor_fd->parent_cpool_idx)
+       regardless of whether the constructor is explicit or
+       synthesized, and js_ts_apply_class_decorators is called much
+       further down with this separate flag instead of ctor_fd's own
+       (always-true-by-then) non-NULL-ness. */
+    ts_explicit_ctor_fd = ctor_fd;
     if (!ctor_fd) {
         if (js_parse_class_default_ctor(s, class_flags & JS_DEFINE_CLASS_HAS_HERITAGE, &ctor_fd))
             goto fail;
@@ -27058,7 +27721,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         if (decorator_head) {
             if (js_ts_apply_decorators(s, decorator_head, class_var_name))
                 goto fail;
-            if (js_ts_apply_class_decorators(s, decorator_head, class_var_name))
+            if (js_ts_apply_class_decorators(s, decorator_head, class_var_name, ts_explicit_ctor_fd))
                 goto fail;
         }
     } else {
@@ -33965,6 +34628,22 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
         destroys this JSFunctionDef before that hand-off happens. */
         js_ts_free_decorator_list(ctx, fd->ts_param_decorators);
     }
+    JS_FreeAtom(ctx, fd->ts_return_type_meta.ident_atom); /* TS: safe
+        no-op (JS_ATOM_NULL) if this method was never decorated (the
+        common case) or if ownership was already moved into a
+        JSTSDecoratorEntry (see the back-fill site in js_parse_class,
+        which dup's rather than moves -- so this is always still owned
+        here regardless). */
+    if (fd->ts_param_type_metas) { /* TS: normally already moved (not
+        copied) into a JSTSDecoratorEntry by js_parse_class if this
+        method turned out to be decorated; freed here for the (much
+        more common) undecorated case, or defensively on any
+        early-failure path. */
+        int ti;
+        for (ti = 0; ti < fd->ts_param_type_meta_count; ti++)
+            JS_FreeAtom(ctx, fd->ts_param_type_metas[ti].ident_atom);
+        js_free(ctx, fd->ts_param_type_metas);
+    }
 
     if (fd->parent) {
         /* remove in parent list */
@@ -38667,12 +39346,50 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     if (next_token(s))
                         goto fail;
                 }
-                /* TS: consume parameter type annotation */
-                if (s->ts_mode && s->token.val == ':') {
-                    if (next_token(s))
-                        goto fail;
-                    if (js_parse_ts_type(s))
-                        goto fail;
+                /* TS: consume parameter type annotation. Classified
+                   unconditionally into fd->ts_param_type_metas[] (grown
+                   lazily below) -- verified against real tsc:
+                   design:paramtypes always includes EVERY parameter,
+                   defaulting to Object for one with no type annotation
+                   at all, as long as the enclosing method/constructor
+                   is decorated by *anything* (a single parameter
+                   decorator, a method decorator, or a class decorator
+                   for the constructor case). Whether that condition
+                   actually holds is only knowable later in
+                   js_parse_class, so this array is always populated
+                   for a TS-mode parameter list and simply discarded
+                   there if unused. */
+                {
+                    JSTSMetaKind pkind = JS_TS_META_OBJECT;
+                    JSAtom pident = JS_ATOM_NULL;
+                    if (s->ts_mode && s->token.val == ':') {
+                        const uint8_t *type_start;
+                        if (next_token(s))
+                            goto fail;
+                        type_start = s->token.ptr;
+                        if (js_parse_ts_type(s))
+                            goto fail;
+                        pkind = js_ts_classify_type_range(ctx, type_start,
+                                                          s->token.ptr, &pident);
+                    }
+                    if (s->ts_mode &&
+                        (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
+                         func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
+                         func_type == JS_PARSE_FUNC_METHOD) &&
+                        !rest) {
+                        JSTSTypeMeta *na = js_realloc(ctx, fd->ts_param_type_metas,
+                            sizeof(*na) * (fd->ts_param_type_meta_count + 1));
+                        if (!na) {
+                            js_parse_error(s, "out of memory");
+                            goto fail;
+                        }
+                        fd->ts_param_type_metas = na;
+                        fd->ts_param_type_metas[fd->ts_param_type_meta_count].kind = pkind;
+                        fd->ts_param_type_metas[fd->ts_param_type_meta_count].ident_atom = pident;
+                        fd->ts_param_type_meta_count++;
+                    } else {
+                        JS_FreeAtom(ctx, pident);
+                    }
                 }
                 if (rest) {
                     emit_op(s, OP_rest);
@@ -38815,12 +39532,27 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     if (next_token(s))
         goto fail;
 
-    /* TS: consume return type annotation */
+    /* TS: consume return type annotation. Classified unconditionally
+       (not gated on "is this method decorated" -- that isn't knowable
+       yet from inside js_parse_function_decl2, which has no visibility
+       into the enclosing class's decorator state) and stashed on this
+       function's own fd; js_parse_class reads it back after this call
+       returns and simply discards it if the method turns out to be
+       undecorated (a few wasted bytes of parse-time bookkeeping, never
+       emitted as bytecode either way -- zero runtime cost). */
     if (s->ts_mode && s->token.val == ':') {
+        const uint8_t *type_start;
         if (next_token(s))
             goto fail;
+        type_start = s->token.ptr;
         if (js_parse_ts_type(s))
             goto fail;
+        {
+            JSAtom ident = JS_ATOM_NULL;
+            fd->ts_return_type_meta.kind =
+                js_ts_classify_type_range(ctx, type_start, s->token.ptr, &ident);
+            fd->ts_return_type_meta.ident_atom = ident;
+        }
     }
 
     /* generator function: yield after the parameters are evaluated */
@@ -39299,6 +40031,150 @@ static __exception int js_parse_ts_primary_type(JSParseState *s)
         js_parse_error(s, "expected type");
         return -1;
     }
+}
+
+/* TS: classify the type annotation occupying source range [start, end)
+   -- already fully consumed once by js_parse_ts_type -- for
+   emitDecoratorMetadata purposes (see JSTSMetaKind's comment for the
+   exact scope/range-limit rationale). A lightweight character scan
+   over already-validated syntax, NOT a re-parse: js_parse_ts_type
+   already proved this range is grammatically valid TS type syntax, so
+   this only needs to recognise the outermost shape (a false-negative
+   here only degrades to the safe Object fallback, never mis-
+   classifies into something wrong) -- the bracket-depth tracking
+   below reacts only to actual bracket characters, not to '|'/'&' inside
+   them). */
+static JSTSMetaKind js_ts_classify_type_range(JSContext *ctx,
+                                              const uint8_t *start,
+                                              const uint8_t *end,
+                                              JSAtom *pident_atom)
+{
+    const uint8_t *p = start;
+    const uint8_t *q;
+    int depth;
+    BOOL has_top_level_union_or_intersection = FALSE;
+    BOOL is_arrow_function = FALSE;
+
+    *pident_atom = JS_ATOM_NULL;
+
+    /* skip leading whitespace/'readonly' is already consumed by
+       js_parse_ts_type before primary type, so start should already
+       point at meaningful content; still guard against stray
+       whitespace defensively. */
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        p++;
+    if (p >= end)
+        return JS_TS_META_OBJECT;
+
+    /* scan the whole range at bracket-depth 0 for a top-level '|' or
+       '&' (union/intersection -- both fold to Object, matching real
+       tsc) and for a top-level '=>' (arrow -- function type). Depth
+       tracking treats all of '(){}[]'/'<>' uniformly (same
+       simplification used elsewhere in this file, e.g.
+       js_ts_skip_decorator_expr): well-formed already-validated TS
+       type syntax is always correctly nested. */
+    depth = 0;
+    for (q = p; q < end; q++) {
+        switch (*q) {
+        case '(': case '[': case '{': case '<':
+            depth++;
+            break;
+        case ')': case ']': case '}': case '>':
+            if (depth > 0) depth--;
+            break;
+        case '|': case '&':
+            if (depth == 0)
+                has_top_level_union_or_intersection = TRUE;
+            break;
+        case '=':
+            if (depth == 0 && q + 1 < end && q[1] == '>')
+                is_arrow_function = TRUE;
+            break;
+        default:
+            break;
+        }
+    }
+    if (has_top_level_union_or_intersection)
+        return JS_TS_META_OBJECT;
+    if (is_arrow_function || *p == '(')
+        return JS_TS_META_FUNCTION;
+
+    /* postfix array 'T[]' (possibly 'T[][]...'): recognised by the
+       range ending in ']' with a matching top-level '[' -- distinct
+       from a tuple type '[number, string]', which STARTS with '[' (a
+       tuple falls through to the identifier/keyword checks below,
+       none of which match, so it safely lands on Object -- matching
+       real tsc, which does not special-case tuples either, see the
+       moved-out fuzz-test evidence '[number, string]' -> Array in the
+       grill background... actually tuples DID come back as Array in
+       real tsc testing, so treat a leading '[' the same as a
+       trailing '[]': both are Array). */
+    if (*p == '[')
+        return JS_TS_META_ARRAY;
+    if (end > p && end[-1] == ']') {
+        /* find the matching top-level '[' by scanning backward with a
+           depth counter, to confirm this ']' really is a postfix
+           array suffix on some primary type (not e.g. the tail of an
+           indexed-access type 'T["prop"]', which real TS type
+           positions permit but which -- like everything else not
+           explicitly handled here -- safely falls back to Object
+           rather than being mis-classified as a plain array). For
+           the M1-era grammar actually accepted by
+           js_parse_ts_primary_type (no indexed-access support), a
+           trailing ']' can only come from the postfix-array loop in
+           js_parse_ts_type, so this is safe without the backward
+           scan; kept simple deliberately. */
+        return JS_TS_META_ARRAY;
+    }
+
+    /* single keyword or bare identifier: the whole range must be one
+       token (no separators at depth 0 other than what's already been
+       ruled out above) for this to apply cleanly; multi-token shapes
+       that reach this point (e.g. 'a.b.c', 'Foo<T>') are handled by
+       comparing only the FIRST identifier/keyword token, which is
+       exactly what real tsc does too (dotted/generic type references
+       classify by their base name). */
+    {
+        const uint8_t *tok_start = p;
+        const uint8_t *tok_end = p;
+        while (tok_end < end &&
+               ((*tok_end >= 'a' && *tok_end <= 'z') ||
+                (*tok_end >= 'A' && *tok_end <= 'Z') ||
+                (*tok_end >= '0' && *tok_end <= '9') ||
+                *tok_end == '_' || *tok_end == '$'))
+            tok_end++;
+        if (tok_end > tok_start) {
+            size_t len = tok_end - tok_start;
+#define KW(s) (len == sizeof(s) - 1 && !memcmp(tok_start, s, len))
+            if (KW("number")) return JS_TS_META_NUMBER;
+            if (KW("string")) return JS_TS_META_STRING;
+            if (KW("boolean")) return JS_TS_META_BOOLEAN;
+            if (KW("symbol")) return JS_TS_META_SYMBOL;
+            if (KW("bigint")) return JS_TS_META_BIGINT;
+            if (KW("void")) return JS_TS_META_VOID;
+            if (KW("any") || KW("unknown") || KW("object") ||
+                KW("never") || KW("null") || KW("undefined"))
+                return JS_TS_META_OBJECT;
+#undef KW
+            /* bare identifier: emit a direct reference to it (grill
+               decision: no "typeof X !== 'undefined'" safety net). If
+               there's more after the identifier (e.g. '<T>' generic
+               args, '.member' qualifiers), only the base identifier
+               is used, matching real tsc's own behaviour for
+               dotted/generic type references. */
+            {
+                char buf[256];
+                size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+                memcpy(buf, tok_start, n);
+                buf[n] = '\0';
+                *pident_atom = JS_NewAtom(ctx, buf);
+                if (*pident_atom == JS_ATOM_NULL)
+                    return JS_TS_META_OBJECT;
+                return JS_TS_META_IDENT;
+            }
+        }
+    }
+    return JS_TS_META_OBJECT;
 }
 
 /* TS: consume a full type annotation (the ':' must already be consumed

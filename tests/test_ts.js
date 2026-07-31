@@ -422,4 +422,96 @@ class DecFoo9 {
 }
 print(comboOrder.join(","));
 
+// M6a-metadata: emitDecoratorMetadata (Reflect.metadata polyfill,
+// since QuickJS itself does not ship reflect-metadata -- matches the
+// real-world usage pattern where reflect-metadata is imported by user
+// code before design:type/paramtypes/returntype have any effect)
+Reflect.metadata = function(k, v) {
+    return function(target, key, descOrIdx) {
+        var obj = (typeof descOrIdx === "number") ? target : (key === undefined ? target : target);
+        obj.__meta = obj.__meta || {};
+        var storeKey = (key === undefined ? "" : key + ":") + k;
+        obj.__meta[storeKey] = v;
+        if (descOrIdx !== undefined && typeof descOrIdx === "object" && descOrIdx !== null) {
+            return descOrIdx;
+        }
+    };
+};
+
+function mdDec(target, key, desc) {}
+class Point9 {}
+class MetaLine {
+    @mdDec point: Point9;
+    @mdDec method(a: number, b: string): boolean { return true; }
+}
+print(MetaLine.prototype.__meta["point:design:type"] === Point9);
+print(MetaLine.prototype.__meta["method:design:type"] === Function);
+print(MetaLine.prototype.__meta["method:design:paramtypes"][0] === Number);
+print(MetaLine.prototype.__meta["method:design:paramtypes"][1] === String);
+print(MetaLine.prototype.__meta["method:design:returntype"] === Boolean);
+
+function mdParamDec(t, k, i) {}
+function mdClassDec(ctor) {}
+@mdClassDec
+class MetaCtor {
+    constructor(a: number, b: Point9) {}
+}
+print(MetaCtor.__meta["design:paramtypes"][0] === Number);
+print(MetaCtor.__meta["design:paramtypes"][1] === Point9);
+
+class MetaCtor2 {
+    constructor(@mdParamDec a: number, b: string) {}
+}
+print(MetaCtor2.__meta["design:paramtypes"][0] === Number);
+print(MetaCtor2.__meta["design:paramtypes"][1] === String);
+
+// regression: implicit default constructor (no explicit
+// 'constructor(){}') must NOT get design:paramtypes, even though the
+// class itself is decorated (real tsc distinguishes explicit vs.
+// implicit constructors here -- this was a real bug caught during
+// implementation: ctor_fd becomes non-NULL for the synthesized
+// default constructor too, so "ctor_fd != NULL" alone is NOT a valid
+// test for "has an explicit constructor")
+function mdNoopClassDec(ctor) {}
+@mdNoopClassDec
+class MetaNoCtor {}
+print(MetaNoCtor.__meta === undefined);
+
+// explicit zero-parameter constructor DOES get an empty
+// design:paramtypes array
+@mdNoopClassDec
+class MetaEmptyCtor {
+    constructor() {}
+}
+print(Array.isArray(MetaEmptyCtor.__meta["design:paramtypes"]) &&
+      MetaEmptyCtor.__meta["design:paramtypes"].length === 0);
+
+// union type -> Object fallback (matches real tsc)
+class MetaUnion {
+    @mdDec u: number | string;
+}
+print(MetaUnion.prototype.__meta["u:design:type"] === Object);
+
+// array type -> Array
+class MetaArr {
+    @mdDec a: number[];
+}
+print(MetaArr.prototype.__meta["a:design:type"] === Array);
+
+// bigint -> BigInt (QuickJS has a global BigInt)
+class MetaBig {
+    @mdDec b: bigint;
+}
+print(MetaBig.prototype.__meta["b:design:type"] === BigInt);
+
+// zero regression: no Reflect.metadata polyfill installed on a fresh
+// decorated class still works fine (no crash, decorator itself still runs)
+delete Reflect.metadata;
+function plainDec(target, key, desc) { return desc; }
+class NoMeta {
+    @plainDec
+    m(): number { return 42; }
+}
+print(new NoMeta().m());
+
 print("ALL TS TESTS PASSED");

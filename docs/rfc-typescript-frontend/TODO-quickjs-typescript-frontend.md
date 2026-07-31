@@ -49,8 +49,8 @@ Last updated: 2026-07-30
 | TS-61 | Skipped | 0 | N/A | — | 双后端 emit 架构骨架 | RFC §D3.4 | 本轮预算耗尽未做,推迟到M6b立项时一并设计 |
 | TS-62 | Done | 100 | Pass | `quickjs.c` `js_ts_apply_decorators` | legacy 类/方法/属性装饰器 emit(不引入运行时helper,编译期展开等价字节码) | RFC §D3.4 | 20+场景与真实tsc逐行对比;3个真实bug已修复 |
 | TS-63 | Done | 100 | Pass | `quickjs.c` `js_ts_apply_class_decorators`、`js_ts_skip_decorator_expr` | legacy **参数装饰器**(DI框架硬需求);核心难点是求值时机(类声明时一次,非每次construct) | RFC §D3.4 | tsc交叉验证发现"每次new重复求值"语义错误并修正为skip+跳转重解析机制 |
-| TS-64 | Not Started | 0 | Not Run | `quickjs.c` | 可选 `emitDecoratorMetadata`:受限类型序列化(`number`→`Number` 等) | RFC §D3.4、S2 | **grill已选定要做,本轮上下文预算耗尽未实现,已知缺口需用户决策下一步** |
-| TS-65 | Done | 100 | Pass | `tests/test_ts.js` | M6a 单测(140+行) | RFC §验证策略 | 与真实tsc交叉验证;子agent评审两次基础设施失败,改主会话自主核对关键项 |
+| TS-64 | Done | 100 | Pass | `quickjs.c` `js_ts_classify_type_range`/`js_ts_emit_metadata_apply` | `emitDecoratorMetadata`:`design:type`/`design:paramtypes`/`design:returntype`,受限类型序列化(8种基础类型+数组+函数+裸标识符精确映射,其余Object兜底) | RFC §D3.4、S2 | 用真实tsc验证全部规则;修复2个真实bug(attach时序/隐式构造函数误判);子agent评审三次基础设施故障失败,改主会话自主核对 |
+| TS-65 | Done | 100 | Pass | `tests/test_ts.js` | M6a + metadata 单测(200+行) | RFC §验证策略 | 与真实tsc交叉验证;30+场景;内存无泄漏 |
 | **M6b · 装饰器 stage 3(后续,标准生态)** | | | | | | | |
 | TS-66 | Not Started | 0 | Not Run | `quickjs.c` | stage3 装饰器:`(value, context)` 签名 + context 对象(kind/name/static/private/access) | RFC §D3.4 | — |
 | TS-67 | Not Started | 0 | Not Run | `quickjs.c` | `addInitializer` + `accessor` 关键字(auto-accessor) | RFC §D3.4 | — |

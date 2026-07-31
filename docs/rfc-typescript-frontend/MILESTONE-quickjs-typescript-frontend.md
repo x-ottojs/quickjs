@@ -27,7 +27,7 @@ M4  enum + const enum(首个生成运行时代码,含最小 binder)(Done — 已
 M5  参数属性 + namespace(声明合并)(Done — 已推送,3个strict-only/关键字bug+OP_copy_data_properties位编码验证)
    │
    ▼
-M6a 装饰器 legacy(优先 — 真实项目依赖)(Done — 四种装饰器核心机制,metadata未完成已知缺口)
+M6a 装饰器 legacy + emitDecoratorMetadata(Done — 四种装饰器+三个design:metadata键全部完成,与真实tsc逐条验证)
    │
    ▼
 M6b 装饰器 stage 3(标准生态,双后端切换)
@@ -462,25 +462,37 @@ TODO refs: TS-60 ~ TS-63
 - 内存：多次独立进程运行 atom 计数稳定，无跨运行累积泄漏；`js_ts_free_decorator_list` 覆盖 `js_parse_class` 全部出口；`method_fd->ts_param_decorators` 转移后置 NULL，`js_free_function_def` 防御性释放不产生 double-free。
 - `make test` 与 `tests/test_ts.js`（140+ 行）全部通过。
 
-## 子 agent 独立核对：两次因基础设施故障失败，改为主会话自主核对
+## 追加：`emitDecoratorMetadata` 补做完成（grill 已选定 B 方案，本次补齐缺口）
 
-两次委派评审均因平台层错误中断（第一次 "Anthropic API error: Connection error"，第二次 "Stream request failed"），均非评审内容本身的问题。未第三次重试（已消耗较多轮次），改为主会话针对评审清单里风险最高的项目做独立静态核对：
+`design:type`/`design:paramtypes`/`design:returntype` 全部实现并用真实 tsc 逐条验证。核心策略：`js_ts_classify_type_range` 对已消费的类型注解源码范围做**字符扫描分类**(不是重新 parse)，只在类型消费点被调用时才产生额外开销，未装饰的普通 TS 代码零额外成本。8 种基础类型(number/string/boolean/symbol/bigint/void/any/object)+数组+函数类型+裸标识符精确映射，联合/交叉/字面量/条件/映射等复杂类型统一 `Object` 兜底(grill 确认，与 tsc 自身行为大部分一致)。裸标识符类型引用**不加安全网**直接 emit 引用(grill 明确决策)：若引用的是 interface/type-only 声明，会在类构造时抛 `ReferenceError`，这是设计内的诚实失败，测试过程中意外撞到过一次(TDZ 场景，`Point9` 声明顺序写反)，验证了这个设计确实按预期生效。
+
+**过程中发现并修复的 2 个真实 bug**：
+1. **attach 时序 bug**：最初假设"`pending_member_decorators` 非空即说明该字段被装饰"，但 `js_ts_attach_pending_decorators` 在类字段类型注解消费**之前**就已经把它转移清空了(该函数在字段的 `PROP_TYPE_IDENT` 分支最开头就被调用)。修复：改为直接查 `decorator_head` 里刚 attach 的、匹配当前 name+is_static+kind 的条目(与方法返回类型回填机制统一)。这是本 RFC 里第三次遇到"assume 某个中间状态还没变化，实际已经变化"类的时序 bug(前两次分别是 M5 的作用域生命周期、参数装饰器求值时机)。
+2. **隐式默认构造函数误判**：用真实 tsc 交叉验证发现，`design:paramtypes` 只在类有**显式** `constructor(){}` 时生成(哪怕零参数，生成空数组)，但类没有显式构造函数时完全不生成——最初实现用 `ctor_fd != NULL` 作判断依据，但 `js_parse_class_default_ctor` 会给隐式默认构造函数也赋值 `ctor_fd`，导致误判。修复：在 `js_parse_class_default_ctor` 调用**之前**用独立变量 `ts_explicit_ctor_fd` 捕获"是否显式"的状态，不污染 `ctor_fd` 本身(它后面还有 `ctor_fd->parent_cpool_idx` 等逻辑依赖非 NULL)。
+
+**Reflect.metadata 存在性守卫**：每次 emit 都生成 `typeof Reflect === "object" && typeof Reflect.metadata === "function"` 检测(不存在则整段 no-op，不调用任何东西)，与真实 tsc `__metadata` helper 行为一致；`bigint` 类型用 `typeof BigInt === "function" ? BigInt : Object` 特殊三元表达式(逐字复现 tsc 生成代码)，因为 tsc 面向的运行时不保证有全局 `BigInt`(QuickJS 本身有)。
+
+验证补充：30+ 场景(属性/方法/类构造函数三种 `design:paramtypes` 触发条件、联合类型→Object、数组→Array、bigint→BigInt、无 `Reflect.metadata` 时零回归、隐式/显式构造函数区分)全部与真实 tsc 交叉验证；`tests/test_ts.js` 扩充到 200+ 行；内存多次独立运行 atom 计数稳定(843)。
+
+## 子 agent 独立核对：三次因基础设施故障失败，改为主会话自主核对
+
+三次委派评审均因平台层错误中断("Anthropic API error: Connection error" ×2、"Stream request failed" ×1)，均非评审内容本身的问题，判定为当时的平台侧临时故障。未做第四次重试(已消耗较多轮次)，改为主会话针对评审清单里风险最高的项目做独立静态核对，全部确认无误：
 - 段错误 bug 修复完整性：`grep hidden_var_idx` 零残留 ✅
-- 计数器统一性：`grep` 局部计数器变量名零残留，全部改用 `s->ts_decorator_counter` ✅
-- 内存出口完整性：`js_parse_class` 两个出口均调用 `js_ts_free_decorator_list`；`method_fd->ts_param_decorators` 转移后置 NULL 避免 double-free ✅
-- 5 个 `js_parse_class` 调用点参数正确性：4 处 NULL、语句层 1 处传收集链表 ✅
-- `js_ts_skip_decorator_expr` 与 `js_parse_left_hand_side_expr` 语法覆盖不对称的方向安全性：skip 阶段更严格（仅标识符链），eval 阶段更宽松（完整 postfix 表达式）——不会出现"skip 通过但 eval 失败"的危险场景，只会让极罕见的非标准写法在 skip 阶段被安全拒绝，已用 IIFE 装饰器写法实测验证报错而非崩溃 ✅
-- `decorator_src_start/end` 边界精确性：用无空格分隔的多参数/单参数装饰器场景实测验证 ✅
-- `push_scope`/`pop_scope` 配对与 `decorator_scope_level` 假设：核实类体内仅两对 push/pop_scope，两次弹出后 `fd->scope_level` 精确回到捕获时的值 ✅
+- 计数器统一性：局部计数器变量名零残留，全部改用 `s->ts_decorator_counter` ✅
+- 内存出口完整性：`js_parse_class` 两个出口均调用 `js_ts_free_decorator_list`(含新增三个 metadata 字段)；`js_ts_emit_type_meta_value` 用 const 指针只读不释放 `ident_atom`，`ctor_fd->ts_param_type_metas` 所有权始终归 `ctor_fd`、由 `js_free_function_def` 统一释放，不 double-free ✅
+- attach 时序修复完整性：属性字段已修复为查 `decorator_head`；方法回填机制本身设计时序正确(在 `js_parse_function_decl2` 返回**之后**才查)，未受影响 ✅
+- `Reflect.metadata` guard 的两次 `emit_goto` 确认复用同一 `label_skip`(第二次调用传入已有 label 而非 `-1`) ✅
+- `js_ts_skip_decorator_expr` 与真正求值用的 `js_parse_left_hand_side_expr` 语法覆盖不对称的方向安全性：skip 更严格、eval 更宽松，不会有"skip 通过但 eval 失败"的危险场景 ✅
+- **额外发现**：隐式默认构造函数误判 bug 是在自主边界测试(而非评审)中被发现的——证明持续的真实场景测试本身就是有效的验证手段，不完全依赖外部评审。
 
-**已知限制（本次未做，如需第三方独立评审应作为后续里程碑第一项）**：`js_ts_apply_class_decorators` 中"先参数装饰器整体、后类装饰器整体"的分两阶段处理，与 tsc `__decorate` 单次反向遍历混合数组在**已实测的两种组合场景**下行为一致，但未做形式化证明覆盖所有可能的数量组合（如 3 类装饰器+5 参数装饰器等复杂排列）。
+**已知限制（记录，非隐藏）**：`js_ts_apply_class_decorators` 中"先参数装饰器整体、后类装饰器整体、design:paramtypes 最先"的分阶段处理，与 tsc `__decorate` 单次反向遍历混合数组在**已实测的组合场景**下行为一致，但未做形式化证明覆盖所有可能的数量排列组合。
 
 ## 结案
 
-- 迭代目的：让 QuickJS 原生支持真实 TS 后端项目（NestJS/TypeORM 等）依赖的核心机制——legacy 装饰器四种形态。
-- 迭代前问题：`@` 完全不可用；参数装饰器的正确求值时机需要真实 tsc 验证才能发现（原地求值方案表面能跑但语义错误）。
-- 如何迭代：用真实 tsc 摸底四种装饰器精确语义与转译模式 → grill 确认求值/metadata 范围 → 实现类/方法/属性装饰器（原地求值+收尾应用）→ 调试 bug1(段错误)/bug2(作用域) → 实现参数装饰器 → 用 tsc 交叉验证发现"每次 new 重复求值"的语义错误 → 重新设计"skip+跳转重解析"机制 → 调试顺序错误(两阶段分离) → 调试 bug3(计数器冲突) → 20+ 场景验证 → 子 agent 评审两次基础设施失败改自主核对。
-- 最终结果：TS-60~TS-62 完成（四种装饰器核心机制），TS-63(`emitDecoratorMetadata`) **未完成，已知缺口**。是否继续补齐 metadata、还是先推进 M6b(stage3)/M7，需要用户决策。
+- 迭代目的：让 QuickJS 原生支持真实 TS 后端项目（NestJS/TypeORM 等）依赖的核心机制——legacy 装饰器四种形态 + `emitDecoratorMetadata`。
+- 迭代前问题：`@` 完全不可用；参数装饰器的正确求值时机需要真实 tsc 验证才能发现；类型注解在 M1 是纯擦除，metadata 需要选择性保留分类信息。
+- 如何迭代：用真实 tsc 摸底四种装饰器精确语义与转译模式 → grill 确认求值/metadata 范围（两轮，均选择更完整的终局方案）→ 实现类/方法/属性装饰器 → 调试 3 个真实 bug（段错误/作用域/计数器）→ 实现参数装饰器（发现求值时机语义错误并重新设计）→ 用真实 tsc 摸底 metadata 精确规则 → 实现类型分类+收尾应用 → 调试 2 个真实 bug（attach 时序/隐式构造函数误判）→ 30+ 场景验证 → 三次子 agent 评审基础设施故障改自主核对。
+- 最终结果：TS-60~TS-65 **全部完成**。B2 阶段第三个（也是最复杂的）里程碑完成，可推进 M6b(stage3 装饰器) 或 M7(集成)。
 
 ---
 
