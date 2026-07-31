@@ -546,6 +546,7 @@ TODO refs: TS-66 ~ TS-68
 - **类型运算符（B4，2026-08-01，RFC 范围外补充）**：`keyof T`/`infer U`（前缀）、`typeof expr`（TOK_TYPEOF）、索引访问 `T[K]`（数组后缀扩展）、条件类型 `T extends U ? X : Y`、映射类型 `{ [K in ...]: ... }`（原有对象字面量类型覆盖）全部支持——纯擦除。嵌套场景（条件作为类型参数/默认值/函数返回）验证通过，与真实 tsc 逐字符一致（`a 42 false 3`）。
 - **`declare module`（B5，2026-08-01，RFC 范围外补充）**：ambient module 声明（`declare module "m" { ... }` / shorthand `declare module "m";` / 嵌套）——整个块是类型环境，解析并丢弃；块内支持 `export const/function/interface/type/enum/declare const`（S9(a) 陷阱：非严格上下文 interface 是 TOK_IDENT）。`declare function` 的无体签名复用重载支持。与 tsc 一致。
 - **模板字面量类型 + import() 类型（B6，2026-08-01，RFC 范围外补充）**：`` `pre-${Type}post` ``（TS 4.1）——TOK_TEMPLATE 分段解析 + `js_parse_template_part` 恢复续段（占位符是类型，支持联合/嵌套/纯 `${string}`）；`import("./m").Member`（TS 2.9）——TOK_IMPORT 分支 + 可选 `.Member` 链（含 `.ns.Sub`）。表达式模板零回归。与 tsc 一致。
+- **映射类型键重映射（B7，2026-08-01，RFC 范围外补充）**：`{ [K in keyof T as NewKey]: V }`（TS 4.1）——对象字面量类型的深度计数跳过扩展为**跳过模板字面量**（含嵌套模板与占位符，`}` 后 `js_parse_template_part` 恢复续段）。支持条件重映射（`as K extends "a" ? ... : never`）与嵌套模板。与 tsc 一致。
 - 已知限制（记录，非隐藏）：metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
 
 # Milestone M7: 集成与端到端

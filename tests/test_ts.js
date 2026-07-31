@@ -671,3 +671,15 @@ print("ALL TS TESTS PASSED");
     print(`val=${tplX}` === "val=5");
 }
 print("ALL TS TESTS PASSED");
+
+// B7: 映射类型键重映射 (TS 4.1)
+{
+    type TRemap = { [K in "a" | "b" as `get${K}`]: K };
+    type TRemapCond = { [K in keyof { a: number } as K extends "a" ? `x${K}` : never]: K };
+    type TRemapNest = { [K in "a" as `p-${`n-${K}`}`]: K };
+    const tr: TRemap = { geta: "a", getb: "b" };
+    const tn: TRemapNest = { "p-n-a": "a" };
+    print(tr.geta === "a" && tr.getb === "b");
+    print(tn["p-n-a"] === "a");
+}
+print("ALL TS TESTS PASSED");

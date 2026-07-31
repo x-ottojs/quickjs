@@ -41442,6 +41442,118 @@ static __exception int js_parse_ts_primary_type(JSParseState *s)
                     js_parse_error(s, "unterminated object type");
                     return -1;
                 }
+                if (s->token.val == TOK_TEMPLATE) {
+                    /* template literal type inside the object type
+                       (e.g. a mapped-type key remap `` `get${K}` ``):
+                       skip the whole template INCLUDING its ${...}
+                       placeholders -- the lexer yields one
+                       TOK_TEMPLATE token per segment, so consume
+                       until the closing backtick segment (sep == '`')
+                       while placeholder types are skipped via their
+                       own tokens */
+                    for (;;) {
+                        if (s->token.u.str.sep == '`') {
+                            if (next_token(s))
+                                return -1;
+                            break;
+                        }
+                        /* placeholder: '$' template token, then the
+                           type tokens until '}' -- brace depth of the
+                           placeholder does not count toward the
+                           object type's depth */
+                        if (next_token(s))
+                            return -1;
+                        /* skip tokens until the matching '}' of the
+                           placeholder (nested templates included) */
+                        {
+                            int pdepth = 1;
+                            while (pdepth > 0) {
+                                if (s->token.val == TOK_EOF) {
+                                    js_parse_error(s, "unterminated template in object type");
+                                    return -1;
+                                }
+                                if (s->token.val == TOK_TEMPLATE) {
+                                    /* nested template: skip it fully
+                                       (segments + placeholders),
+                                       resuming each continuation
+                                       with js_parse_template_part */
+                                    for (;;) {
+                                        if (s->token.u.str.sep == '`') {
+                                            if (next_token(s))
+                                                return -1;
+                                            break;
+                                        }
+                                        if (next_token(s))
+                                            return -1;
+                                        /* placeholder type tokens
+                                           until '}' */
+                                        {
+                                            int ndepth = 1;
+                                            while (ndepth > 0) {
+                                                if (s->token.val == TOK_EOF) {
+                                                    js_parse_error(s, "unterminated template in object type");
+                                                    return -1;
+                                                }
+                                                if (s->token.val == TOK_TEMPLATE) {
+                                                    /* deeper nested
+                                                       template:
+                                                       recurse via the
+                                                       same loop --
+                                                       consume it */
+                                                    while (s->token.u.str.sep != '`') {
+                                                        if (next_token(s))
+                                                            return -1;
+                                                        if (s->token.val == TOK_EOF) {
+                                                            js_parse_error(s, "unterminated template in object type");
+                                                            return -1;
+                                                        }
+                                                    }
+                                                    if (next_token(s))
+                                                        return -1;
+                                                    continue;
+                                                }
+                                                if (s->token.val == '{') {
+                                                    ndepth++;
+                                                } else if (s->token.val == '}') {
+                                                    ndepth--;
+                                                    if (ndepth == 0) {
+                                                        s->buf_ptr = s->token.ptr + 1;
+                                                        s->got_lf = FALSE;
+                                                        if (js_parse_template_part(s, s->buf_ptr))
+                                                            return -1;
+                                                        break;
+                                                    }
+                                                }
+                                                if (next_token(s))
+                                                    return -1;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if (s->token.val == '{') {
+                                    pdepth++;
+                                } else if (s->token.val == '}') {
+                                    pdepth--;
+                                    if (pdepth == 0) {
+                                        /* resume the template after
+                                           the placeholder's '}' (same
+                                           as js_parse_ts_type's
+                                           TOK_TEMPLATE handling) */
+                                        s->buf_ptr = s->token.ptr + 1;
+                                        s->got_lf = FALSE;
+                                        if (js_parse_template_part(s, s->buf_ptr))
+                                            return -1;
+                                        break;
+                                    }
+                                }
+                                if (next_token(s))
+                                    return -1;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if (s->token.val == '{') {
                     depth++;
                 } else if (s->token.val == '}') {
