@@ -22429,6 +22429,9 @@ typedef struct JSParseState {
     BOOL stage3_decorators; /* TS: true = TC39 stage-3 decorator
         semantics (like tsc experimentalDecorators=false); false (the
         default) = legacy experimentalDecorators semantics */
+    BOOL ts_using_await;   /* TS: set by the TOK_AWAIT statement case
+        when 'await using' is recognized; consumed by
+        js_parse_ts_using to select async disposal */
 
     /* TS: 'const enum' constant-folding table (see js_ts_const_enum_lookup).
        Populated as 'const enum' declarations with only literal-constant
@@ -33065,6 +33068,28 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 goto fail;
             break;
         }
+        /* TS 5.2: 'await using Name = expr;' -- 'await' is only a
+           keyword in async contexts; in a plain function it lexes as
+           an identifier, so detect the pair textually here (only in
+           async functions is it a real await-using; otherwise the
+           async check below reports the proper error). */
+        if (s->ts_mode && s->token.u.ident.atom == JS_ATOM_await) {
+            const uint8_t *q = s->buf_ptr;
+            while (q < s->buf_end && (*q == ' ' || *q == '\t'))
+                q++;
+            if (q + 5 <= s->buf_end && q[0] == 'u' && q[1] == 's' &&
+                q[2] == 'i' && q[3] == 'n' && q[4] == 'g' &&
+                !lre_js_is_ident_next(q[5])) {
+                if (!(s->cur_func->func_kind & JS_FUNC_ASYNC)) {
+                    js_parse_error(s, "'await using' is only valid in async functions");
+                    goto fail;
+                }
+                if (next_token(s)) /* consume 'await' */
+                    goto fail;
+                s->ts_using_await = TRUE;
+                return js_parse_ts_using(s, decl_mask);
+            }
+        }
         /* TS 5.2: 'using Name = expr;' explicit resource management.
            'using' is a plain identifier: it is the declaration only
            when followed by an identifier and '=' (or a destructuring
@@ -33126,6 +33151,29 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         if (js_parse_expect_semi(s))
             goto fail;
         break;
+
+    case TOK_AWAIT:
+        /* TS 5.2: 'await using Name = expr;' async resource
+           management. 'await' is a keyword: only a using-declaration
+           prefix when the NEXT word is 'using'. */
+        if (s->ts_mode) {
+            const uint8_t *q = s->buf_ptr;
+            while (q < s->buf_end && (*q == ' ' || *q == '\t'))
+                q++;
+            if (q + 5 <= s->buf_end && q[0] == 'u' && q[1] == 's' &&
+                q[2] == 'i' && q[3] == 'n' && q[4] == 'g' &&
+                !lre_js_is_ident_next(q[5])) {
+                if (!(s->cur_func->func_kind & JS_FUNC_ASYNC)) {
+                    js_parse_error(s, "'await using' is only valid in async functions");
+                    goto fail;
+                }
+                if (next_token(s)) /* consume 'await' */
+                    goto fail;
+                s->ts_using_await = TRUE;
+                return js_parse_ts_using(s, decl_mask);
+            }
+        }
+        goto hasexpr;
 
     case TOK_ENUM:
         if (!s->ts_mode) {
@@ -42267,6 +42315,8 @@ static __exception int js_parse_ts_using(JSParseState *s, int decl_mask)
     JSAtom name = JS_ATOM_NULL;
     BlockEnv block_env;
 
+    BOOL is_await = s->ts_using_await;
+    s->ts_using_await = FALSE;
     (void)decl_mask;
     /* consume 'using' itself (the caller left it as the current
        token); the resource name is then parsed by js_parse_var below
@@ -42279,7 +42329,8 @@ static __exception int js_parse_ts_using(JSParseState *s, int decl_mask)
     }
     name = JS_DupAtom(ctx, s->token.u.ident.atom);
 
-    dispose_atom = JS_ATOM_Symbol_dispose;
+    dispose_atom = is_await ? JS_ATOM_Symbol_asyncDispose :
+                              JS_ATOM_Symbol_dispose;
     label_catch = new_label(s);
     label_finally = new_label(s);
     label_end = new_label(s);
@@ -42355,17 +42406,23 @@ static __exception int js_parse_ts_using(JSParseState *s, int decl_mask)
        -> [.., v, result]; drop result -> [.., v]; to unify with the
        jump path's 3 slots, push 2 dummies -> [.., v, u, u]; l_done
        pops all 3. */
-    /* dispose: value[Symbol.dispose]() -- no guard. tsc's helper
-       silently skips null/undefined/non-disposable values; we throw
-       like any plain property access instead (a 'using' value is
-       required to be disposable by TS's type system; documented
-       divergence). The finally body runs with the gosub entry value
-       at the BOTTOM of the stack (the caller drops it after OP_ret),
-       exactly like TOK_TRY's finally block. */
+    /* dispose: value[Symbol.dispose]() (or
+       await value[Symbol.asyncDispose]() for 'await using') -- no
+       guard. tsc's helper silently skips null/undefined/
+       non-disposable values; we throw like any plain property access
+       instead (a 'using' value is required to be disposable by TS's
+       type system; documented divergence). The finally body runs
+       with the gosub entry value at the BOTTOM of the stack (the
+       caller drops it after OP_ret), exactly like TOK_TRY's finally
+       block. */
     emit_op(s, OP_get_field2);
     emit_atom(s, dispose_atom);
     emit_op(s, OP_call_method);
     emit_u16(s, 0);
+    if (is_await) {
+        emit_op(s, OP_await);
+        s->cur_func->has_await = TRUE;
+    }
     emit_op(s, OP_drop);
     emit_op(s, OP_ret);
     pop_break_entry(s->cur_func);

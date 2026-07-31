@@ -540,7 +540,8 @@ TODO refs: TS-66 ~ TS-68
   4. **finally 体的变量读取用 try 体 scope**（pop_scope 后 fd->scope_level 已恢复外层）
   5. **js_parse_ts_using 开头先消费 `using`**（调用方留下它）
   - 语义：LIFO（嵌套 try 天然）、异常路径（dispose 后 rethrow）、块作用域、嵌套 using、消歧（`using` 后跟标识符/`[`/`{` 才是声明）——与真实 tsc 逐字符一致（`d:b d:a caught:boom after`）
-  - 已知差异（记录）：非 dispose 值（null/undefined/数字）在 dispose 时抛 TypeError（tsc helper 静默跳过——TS 类型系统禁止，已记录）；`await using` 未实现（async disposal 需 async 上下文机制）
+  - **`await using`（B3，2026-08-01）**：async 资源管理——`await using Name = expr;` 用 `Symbol.asyncDispose` + finally 内 `OP_await`（复用 using 的 try/finally 结构）；识别：`await` 在普通函数是标识符（非 async 不转关键字），TOK_IDENT case 文本检测 `await using` 对（buf_ptr），非 async 报 "only valid in async functions"；与真实 tsc 逐字符一致（`body ad:b ad:a after`）；可与同步 using 混合（LIFO 统一）
+  - 已知差异（记录）：非 dispose 值（null/undefined/数字）在 dispose 时抛 TypeError（tsc helper 静默跳过——TS 类型系统禁止，已记录）
   - `Symbol.dispose`/`Symbol.asyncDispose` 注册（前次保留）
 - 已知限制（记录，非隐藏）：metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
 

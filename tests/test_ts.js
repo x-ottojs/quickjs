@@ -596,3 +596,23 @@ print("ALL TS TESTS PASSED");
     print(typeof Symbol.asyncDispose === "symbol");
 }
 print("ALL TS TESTS PASSED");
+
+// B3: await using (async 资源管理)
+{
+    function mkAsyncRes(name) {
+        return { async [Symbol.asyncDispose]() { await Promise.resolve(); print("ad:" + name); }, name };
+    }
+    var alog = [];
+    function mkAsyncLog(name) {
+        return { async [Symbol.asyncDispose]() { await Promise.resolve(); alog.push(name); }, name };
+    }
+    async function ausingF() {
+        await using ua = mkAsyncLog("a");
+        await using ub = mkAsyncLog("b");
+        print("ausing-body");
+    }
+    ausingF().then(function() {
+        print(JSON.stringify(alog) === JSON.stringify(["b", "a"])); // LIFO
+        print("ALL TS TESTS PASSED");
+    });
+}
