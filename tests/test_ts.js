@@ -683,3 +683,19 @@ print("ALL TS TESTS PASSED");
     print(tn["p-n-a"] === "a");
 }
 print("ALL TS TESTS PASSED");
+
+// B8: unique symbol / 构造签名类型 / declare 字段
+{
+    type USym = unique symbol;
+    type CtorSig = new (a: number) => string;
+    class DeclField {
+        declare x: number;
+        constructor() { this.x = 42; }
+    }
+    const us: USym = Symbol();
+    const cs: CtorSig = (a) => String(a);
+    print(typeof us === "symbol");
+    print(cs(7) === "7");
+    print(new DeclField().x === 42);
+}
+print("ALL TS TESTS PASSED");

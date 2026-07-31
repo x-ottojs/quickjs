@@ -547,6 +547,7 @@ TODO refs: TS-66 ~ TS-68
 - **`declare module`（B5，2026-08-01，RFC 范围外补充）**：ambient module 声明（`declare module "m" { ... }` / shorthand `declare module "m";` / 嵌套）——整个块是类型环境，解析并丢弃；块内支持 `export const/function/interface/type/enum/declare const`（S9(a) 陷阱：非严格上下文 interface 是 TOK_IDENT）。`declare function` 的无体签名复用重载支持。与 tsc 一致。
 - **模板字面量类型 + import() 类型（B6，2026-08-01，RFC 范围外补充）**：`` `pre-${Type}post` ``（TS 4.1）——TOK_TEMPLATE 分段解析 + `js_parse_template_part` 恢复续段（占位符是类型，支持联合/嵌套/纯 `${string}`）；`import("./m").Member`（TS 2.9）——TOK_IMPORT 分支 + 可选 `.Member` 链（含 `.ns.Sub`）。表达式模板零回归。与 tsc 一致。
 - **映射类型键重映射（B7，2026-08-01，RFC 范围外补充）**：`{ [K in keyof T as NewKey]: V }`（TS 4.1）——对象字面量类型的深度计数跳过扩展为**跳过模板字面量**（含嵌套模板与占位符，`}` 后 `js_parse_template_part` 恢复续段）。支持条件重映射（`as K extends "a" ? ... : never`）与嵌套模板。与 tsc 一致。
+- **`unique symbol`/构造签名/declare 字段（B8，2026-08-01，RFC 范围外补充）**：`unique symbol`（TS 2.7，'unique'+symbol 关键字）、构造签名类型 `new (a: T) => R`（TS 2.0，TOK_NEW 分支 fallthrough 到 `(` 处理器）、类内 `declare x: T;` 字段（ts_abstract 同款修饰符识别 + 擦除；`declare m(): T;` 无体签名复用重载支持；有体 declare 方法报错与 tsc 语义一致）。与 tsc 一致。
 - 已知限制（记录，非隐藏）：metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
 
 # Milestone M7: 集成与端到端

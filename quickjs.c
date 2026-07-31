@@ -27752,6 +27752,20 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                     goto fail;
             }
         }
+        /* TS: 'declare' member modifier -- pure erasure: the member
+           is an ambient declaration (the value already exists at
+           runtime, e.g. injected by a host); parsed and dropped like
+           an abstract member. Same disambiguation ('declare = 5' /
+           'declare()' are ordinary members). */
+        if (s->ts_mode && !ts_abstract &&
+            js_ts_is_pseudo_keyword_str(s, "declare")) {
+            int nxt = peek_token(s, TRUE);
+            if (!(nxt == ';' || nxt == '}' || nxt == '(' || nxt == '=')) {
+                ts_abstract = TRUE;
+                if (next_token(s)) /* consume 'declare' */
+                    goto fail;
+            }
+        }
         if (s->token.val == TOK_STATIC) {
             int next = peek_token(s, TRUE);
             if (!(next == ';' || next == '}' || next == '(' || next == '='))
@@ -41229,14 +41243,31 @@ static __exception int js_parse_ts_primary_type(JSParseState *s)
     if (s->token.val == TOK_IDENT) {
         JSAtom ka = JS_NewAtom(s->ctx, "keyof");
         JSAtom ia = JS_NewAtom(s->ctx, "infer");
+        JSAtom ua = JS_NewAtom(s->ctx, "unique");
         BOOL is_keyof = (s->token.u.ident.atom == ka);
         BOOL is_infer = (s->token.u.ident.atom == ia);
+        BOOL is_unique = (s->token.u.ident.atom == ua);
         JS_FreeAtom(s->ctx, ka);
         JS_FreeAtom(s->ctx, ia);
+        JS_FreeAtom(s->ctx, ua);
         if (is_keyof || is_infer) {
             if (next_token(s)) /* consume keyof/infer */
                 return -1;
             return js_parse_ts_type(s);
+        }
+        if (is_unique) {
+            /* 'unique symbol' (TS 2.7) -- 'unique' followed by the
+               'symbol' keyword */
+            if (next_token(s)) /* consume 'unique' */
+                return -1;
+            if (s->token.val != TOK_IDENT ||
+                s->token.u.ident.atom != JS_ATOM_symbol) {
+                js_parse_error(s, "expected 'symbol' after 'unique'");
+                return -1;
+            }
+            if (next_token(s)) /* consume 'symbol' */
+                return -1;
+            return 0;
         }
     }
     if (s->token.val == TOK_TYPEOF) {
@@ -41346,6 +41377,18 @@ static __exception int js_parse_ts_primary_type(JSParseState *s)
         if (next_token(s))
             return -1;
         return 0;
+    case TOK_NEW:
+        /* constructor signature types: 'new (a: T) => R' (TS 2.0) --
+           same shape as a function type with a 'new' prefix */
+        if (next_token(s)) /* consume 'new' */
+            return -1;
+        if (s->token.val != '(') {
+            js_parse_error(s, "expected '(' after 'new' in type");
+            return -1;
+        }
+        /* fall through to the '(' handler below (it parses the
+           parameter list and the optional '=>' return type) */
+        /* fallthrough */
     case '(':
         {
             /* could be grouping '(Type)', function type
