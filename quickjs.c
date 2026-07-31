@@ -22276,6 +22276,14 @@ typedef enum {
                               may be decorated) */
     JS_TS_DEC_PROPERTY,   /* no descriptor; decorator return value
                               ignored */
+    JS_TS_DEC_ACCESSOR,   /* TS stage-3 'accessor Name' auto-accessor:
+                              (value, context) with kind="accessor";
+                              a backing private field holds the value
+                              and synthesized get/set expose it. Only
+                              meaningful in stage3 mode (legacy
+                              get/set decorators use JS_TS_DEC_METHOD
+                              as before). */
+
     JS_TS_DEC_PARAMETER,  /* target member's parameter; return value
                               ignored; folded into the *same*
                               __decorate-style list as the enclosing
@@ -27148,7 +27156,8 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
         int i, group_count = 0;
 
         
-        if (e->kind != JS_TS_DEC_METHOD && e->kind != JS_TS_DEC_PROPERTY)
+        if (e->kind != JS_TS_DEC_METHOD && e->kind != JS_TS_DEC_PROPERTY &&
+            e->kind != JS_TS_DEC_ACCESSOR)
             continue;
 
         for (i = 0; i < done_count; i++) {
@@ -27297,7 +27306,9 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
                constructor ("not a function"). */
             emit_op(s, OP_object);
             emit_op(s, OP_push_atom_value);
-            emit_atom(s, e->kind == JS_TS_DEC_PROPERTY ? JS_NewAtom(ctx, "field") : JS_NewAtom(ctx, "method"));
+            emit_atom(s, e->kind == JS_TS_DEC_PROPERTY ? JS_NewAtom(ctx, "field") :
+                      (e->kind == JS_TS_DEC_ACCESSOR ? JS_NewAtom(ctx, "accessor") :
+                       JS_NewAtom(ctx, "method")));
             emit_op(s, OP_define_field);
             emit_atom(s, JS_NewAtom(ctx, "kind"));
             emit_op(s, OP_push_atom_value);
@@ -27329,7 +27340,8 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             /* argv[4]: initializers -- field: the field's own
                initializers array (hidden var, defined below); method:
                null (tsc's exact shape) */
-            if (e->kind == JS_TS_DEC_PROPERTY) {
+            if (e->kind == JS_TS_DEC_PROPERTY ||
+                e->kind == JS_TS_DEC_ACCESSOR) {
                 JSAtom iv = JS_ATOM_NULL;
                 for (cur = e; cur; cur = cur->next) {
                     if (cur->kind == e->kind &&
@@ -27416,6 +27428,9 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
     int saved_js_mode, class_name_var_idx, prop_type, ctor_cpool_offset;
     int class_flags = 0, i, define_class_offset;
     BOOL is_static, is_private;
+    BOOL ts_accessor = FALSE; /* TS (stage3): 'accessor Name' */
+    JSAtom backing_name = JS_ATOM_NULL; /* TS (stage3): auto-accessor
+        backing private field name '<name><accessor>' (owned) */
     const uint8_t *class_start_ptr = s->token.ptr;
     const uint8_t *start_ptr;
     ClassFieldsDef class_fields[2];
@@ -27769,6 +27784,22 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 prop_type = PROP_TYPE_IDENT;
             }
         }
+        /* TS (stage3 only): 'accessor Name' auto-accessor. 'accessor'
+           is a plain identifier (not a keyword): it is the keyword
+           only when followed by an actual property name -- 'accessor
+           = 5;' / 'accessor();' / 'accessor;' are ordinary members
+           named accessor (same disambiguation as 'static'). */
+        if (s->ts_mode && s->stage3_decorators &&
+            js_ts_is_pseudo_keyword_str(s, "accessor")) {
+            int nxt = peek_token(s, TRUE);
+            if (!(nxt == ';' || nxt == '}' || nxt == '(' || nxt == '=')) {
+                ts_accessor = TRUE;
+                if (next_token(s)) /* consume 'accessor' */
+                    goto fail;
+            }
+        }
+        JS_FreeAtom(ctx, backing_name);
+        backing_name = JS_ATOM_NULL;
         if (is_static)
             emit_op(s, OP_swap);
         start_ptr = s->token.ptr;
@@ -27909,9 +27940,11 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             /* TS: property decorator -- no descriptor, decorator
                return value ignored (per TS docs: "there is currently
                no mechanism to describe an instance property ... The
-               return value is ignored too"). */
+               return value is ignored too"). stage3 auto-accessors
+               attach with their own kind instead. */
             js_ts_attach_pending_decorators(&pending_member_decorators,
                                             &decorator_head,
+                                            ts_accessor ? JS_TS_DEC_ACCESSOR :
                                             JS_TS_DEC_PROPERTY, ctx, name,
                                             is_static);
             if (ts3_field) {
@@ -27937,7 +27970,8 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                     goto fail;
                 }
                 for (pe = decorator_head; pe; pe = pe->next) {
-                    if (pe->kind == JS_TS_DEC_PROPERTY &&
+                    if ((pe->kind == JS_TS_DEC_PROPERTY ||
+                         pe->kind == JS_TS_DEC_ACCESSOR) &&
                         pe->member_name == name &&
                         pe->is_static == is_static &&
                         pe->ts3_inits_var == JS_ATOM_NULL) {
@@ -27947,6 +27981,13 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 }
                 JS_FreeAtom(ctx, inits);
                 JS_FreeAtom(ctx, extras);
+            }
+
+            /* TS (stage3): auto-accessor backing field name */
+            if (ts_accessor) {
+                backing_name = js_atom_concat_str(ctx, name, "<accessor>");
+                if (backing_name == JS_ATOM_NULL)
+                    goto fail;
             }
 
             /* XXX: spec: not consistent with method name checks */
@@ -27968,6 +28009,25 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 emit_op(s, OP_scope_put_var_init);
                 emit_atom(s, name);
                 emit_u16(s, s->cur_func->scope_level);
+            } else if (ts_accessor) {
+                /* TS (stage3): auto-accessor backing private field
+                   '#name<accessor>' -- synthesized get/set below read
+                   and write it; registered like any private field
+                   symbol (class-body scope variable holding the
+                   private symbol value) */
+                if (find_private_class_field(ctx, fd, backing_name,
+                                             fd->scope_level) >= 0) {
+                    goto private_field_already_defined;
+                }
+                if (add_private_class_field(s, fd, backing_name,
+                                            JS_VAR_PRIVATE_FIELD, is_static) < 0)
+                    goto fail;
+                emit_op(s, OP_private_symbol);
+                emit_atom(s, backing_name);
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, backing_name);
+                emit_u16(s, s->cur_func->scope_level);
+                class_fields[is_static].need_brand = TRUE;
             }
 
             if (!cf->fields_init_fd) {
@@ -28004,8 +28064,14 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                shared method extras array first (it is spliced into
                the FIRST field's initializer), then the previous
                member's own extras (a field's extras run at the NEXT
-               field's point). */
-            if (ts3_field) {
+               field's point). NOTE: this runs for EVERY field /
+               auto-accessor in stage3 mode (not only decorated ones):
+               tsc splices the previous member's extraInitializers
+               into the next field's initializer expression regardless
+               of whether that next field is decorated (verified
+               against real tsc output -- an undecorated field between
+               two decorated ones still runs the first one's extras). */
+            if (s->stage3_decorators && decorator_head) {
             {
                 JSAtom pending_extra = JS_ATOM_NULL;
                 int order[2];
@@ -28075,6 +28141,10 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             } else if (is_private) {
                 emit_op(s, OP_scope_get_var);
                 emit_atom(s, name);
+                emit_u16(s, s->cur_func->scope_level);
+            } else if (ts_accessor) {
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, backing_name);
                 emit_u16(s, s->cur_func->scope_level);
             }
 
@@ -28162,7 +28232,8 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                     JSTSDecoratorEntry *pe;
                     JSAtom inits_var = JS_ATOM_NULL;
                     for (pe = decorator_head; pe; pe = pe->next) {
-                        if (pe->kind == JS_TS_DEC_PROPERTY &&
+                        if ((pe->kind == JS_TS_DEC_PROPERTY ||
+                             pe->kind == JS_TS_DEC_ACCESSOR) &&
                             pe->member_name == name &&
                             pe->is_static == is_static) {
                             inits_var = pe->ts3_inits_var;
@@ -28190,7 +28261,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 emit_op(s, OP_call);
                 emit_u16(s, 3);
             }
-            if (is_private) {
+            if (is_private || ts_accessor) {
                 set_object_name_computed(s);
                 emit_op(s, OP_define_private_field);
             } else if (name == JS_ATOM_NULL) {
@@ -28210,7 +28281,8 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 JSTSDecoratorEntry *pe;
                 JSAtom extras_var = JS_ATOM_NULL;
                 for (pe = decorator_head; pe; pe = pe->next) {
-                    if (pe->kind == JS_TS_DEC_PROPERTY &&
+                    if ((pe->kind == JS_TS_DEC_PROPERTY ||
+                         pe->kind == JS_TS_DEC_ACCESSOR) &&
                         pe->member_name == name &&
                         pe->is_static == is_static) {
                         extras_var = pe->ts3_extras_var;
@@ -28224,6 +28296,64 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 ts3_prev_extra[is_static] = extras_var;
             }
             s->cur_func = s->cur_func->parent;
+            if (ts_accessor) {
+                /* TS (stage3): synthesize 'get name() { return
+                   this.#backing; }' and 'set name(v) { this.#backing
+                   = v; }' and define them on the class object (stack
+                   top: the class object is still there -- static
+                   fields swapped it up; instance fields kept it via
+                   define_field's n_push=1) */
+                int si;
+                for (si = 0; si < 2; si++) {
+                    JSFunctionDef *afd;
+                    int cpool_idx;
+                    afd = js_new_function_def(ctx, fd, FALSE, FALSE,
+                                              s->filename, s->buf_start,
+                                              &s->get_line_col_cache);
+                    if (!afd)
+                        goto fail;
+                    afd->func_name = JS_ATOM_NULL;
+                    afd->has_prototype = FALSE;
+                    afd->has_home_object = TRUE;
+                    afd->has_arguments_binding = FALSE;
+                    afd->has_this_binding = TRUE;
+                    afd->is_derived_class_constructor = FALSE;
+                    afd->new_target_allowed = TRUE;
+                    afd->super_call_allowed = FALSE;
+                    afd->super_allowed = FALSE;
+                    afd->arguments_allowed = FALSE;
+                    afd->func_kind = JS_FUNC_NORMAL;
+                    afd->func_type = JS_PARSE_FUNC_GETTER + si;
+                    s->cur_func = afd;
+                    /* body: getter -> return this.#backing;
+                       setter -> this.#backing = arg0; return */
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, JS_ATOM_this);
+                    emit_u16(s, 0);
+                    if (si == 0) {
+                        emit_op(s, OP_scope_get_private_field);
+                        emit_atom(s, backing_name);
+                        emit_u16(s, 0);
+                        emit_return(s, TRUE);
+                    } else {
+                        emit_op(s, OP_get_arg);
+                        emit_u16(s, 0);
+                        emit_op(s, OP_scope_put_private_field);
+                        emit_atom(s, backing_name);
+                        emit_u16(s, 0);
+                        emit_return(s, FALSE);
+                    }
+                    s->cur_func = fd;
+                    cpool_idx = cpool_add(s, JS_NULL);
+                    afd->parent_cpool_idx = cpool_idx;
+                    emit_op(s, OP_fclosure);
+                    emit_u32(s, cpool_idx);
+                    emit_op(s, OP_define_method);
+                    emit_atom(s, name);
+                    emit_u8(s, si == 0 ? OP_DEFINE_METHOD_GETTER :
+                                         OP_DEFINE_METHOD_SETTER);
+                }
+            }
             if (js_parse_expect_semi(s))
                 goto fail;
         } else {
@@ -28481,7 +28611,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
            the fields-init function runs before any constructor code.
            A class with NO instance fields at all (only decorated
            methods) synthesizes the fields-init function for this. */
-        if (s->stage3_decorators &&
+        if (s->stage3_decorators && decorator_head &&
             (ts3_prev_extra[0] != JS_ATOM_NULL ||
              (ts3_method_extra[0] != JS_ATOM_NULL &&
               !ts3_method_extra_consumed[0]))) {
@@ -28701,9 +28831,10 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                    decorated static methods but no static fields), and
                    any last static field's own extras. 'this' at class
                    tail is the class object itself. */
-                if (ts3_prev_extra[1] != JS_ATOM_NULL ||
-                    (ts3_method_extra[1] != JS_ATOM_NULL &&
-                     !ts3_method_extra_consumed[1])) {
+                if (decorator_head &&
+                    (ts3_prev_extra[1] != JS_ATOM_NULL ||
+                     (ts3_method_extra[1] != JS_ATOM_NULL &&
+                      !ts3_method_extra_consumed[1]))) {
                     JSAtom tail_extra[2];
                     int tail_count = 0, ti;
                     if (ts3_prev_extra[1] != JS_ATOM_NULL)

@@ -74,3 +74,35 @@ print("ALL STAGE3 TESTS PASSED");
     print(JSON.stringify(log) === JSON.stringify(["extra:s1","extra:m","extra:a","extra:b"]));
 }
 print("ALL STAGE3 TESTS PASSED");
+
+// TS-67b: accessor 关键字 (auto-accessor, stage3)
+{
+    var alog: string[] = [];
+    function achain(tag) {
+        return function(value, context) {
+            alog.push("dec:" + tag);
+            return { get: value.get, set: value.set, init: (prev) => prev * 2 };
+        };
+    }
+    function aai(tag) {
+        return function(value, context) {
+            context.addInitializer(function() { alog.push("extra:" + tag); });
+            return value;
+        };
+    }
+    class Acc {
+        @aai("a") a = 1;
+        plain = 5;                    // 未装饰字段消费 a 的 extra
+        @achain("x") accessor x = 10; // init 链: 10*2
+        @aai("m") m() {}
+        @aai("sx") static accessor sx = 100;
+    }
+    var af = new Acc();
+    // 与真实 tsc (--target ES2022) 逐字符一致
+    print(af.x === 20);                        // accessor init 链
+    af.x = 30;
+    print(af.x === 30);                        // get/set 正常工作
+    print(Acc.sx === 100);                     // 静态 accessor
+    print(JSON.stringify(alog) === JSON.stringify(["dec:x","extra:sx","extra:m","extra:a"]));
+}
+print("ALL STAGE3 TESTS PASSED");
