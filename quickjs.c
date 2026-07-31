@@ -27429,6 +27429,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
     int class_flags = 0, i, define_class_offset;
     BOOL is_static, is_private;
     BOOL ts_accessor = FALSE; /* TS (stage3): 'accessor Name' */
+    BOOL ts_abstract = FALSE; /* TS: 'abstract' member modifier */
     JSAtom backing_name = JS_ATOM_NULL; /* TS (stage3): auto-accessor
         backing private field name '<name><accessor>' (owned) */
     const uint8_t *class_start_ptr = s->token.ptr;
@@ -27733,6 +27734,21 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             }
         }
         is_static = FALSE;
+        /* TS: 'abstract' member modifier -- pure erasure: the member
+           is dropped entirely (tsc emits no code for abstract
+           members). 'abstract' is a plain identifier: it is the
+           modifier only when the next word is a member name
+           (identifier not followed by '=' / '(' / ';' / '}'),
+           mirroring the static/accessor disambiguation. */
+        if (s->ts_mode && !ts_abstract &&
+            js_ts_is_pseudo_keyword_str(s, "abstract")) {
+            int nxt = peek_token(s, TRUE);
+            if (!(nxt == ';' || nxt == '}' || nxt == '(' || nxt == '=')) {
+                ts_abstract = TRUE;
+                if (next_token(s)) /* consume 'abstract' */
+                    goto fail;
+            }
+        }
         if (s->token.val == TOK_STATIC) {
             int next = peek_token(s, TRUE);
             if (!(next == ';' || next == '}' || next == '(' || next == '='))
@@ -27811,12 +27827,66 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         is_private = prop_type & PROP_TYPE_PRIVATE;
         prop_type &= ~PROP_TYPE_PRIVATE;
 
+        if (ts_abstract) {
+            /* TS: abstract member -- pure erasure: tsc emits NOTHING
+               for it. Forms: 'abstract m(): T;' (method signature),
+               'abstract get v(): T;' / 'abstract set v(x: T);'
+               (accessor signature), 'abstract field: T;'. All end in
+               ';' without a body: consume the optional parameter
+               list / type annotation and the trailing ';'. */
+            if (s->token.val == '(') {
+                /* skip the parameter list with balanced parens:
+                   'abstract m(a: T, b?: U): R;' -- decorators cannot
+                   appear on abstract parameters in a signature, so a
+                   plain skip is safe */
+                int depth = 1;
+                if (next_token(s))
+                    goto fail;
+                while (depth > 0) {
+                    if (s->token.val == '(') {
+                        depth++;
+                    } else if (s->token.val == ')') {
+                        depth--;
+                    } else if (s->token.val == TOK_EOF) {
+                        js_parse_error(s, "unexpected end of input in parameter list");
+                        goto fail;
+                    }
+                    if (next_token(s))
+                        goto fail;
+                }
+            }
+            if (s->ts_mode && s->token.val == ':') {
+                if (next_token(s)) /* consume ':' */
+                    goto fail;
+                if (js_parse_ts_type(s))
+                    goto fail;
+            }
+            if (s->token.val == '=') {
+                if (next_token(s))
+                    goto fail;
+                if (js_parse_assign_expr(s))
+                    goto fail;
+            }
+            if (js_parse_expect_semi(s))
+                goto fail;
+            JS_FreeAtom(ctx, name);
+            name = JS_ATOM_NULL;
+            ts_abstract = FALSE;
+            continue;
+        }
+
         if ((name == JS_ATOM_constructor && !is_static &&
              prop_type != PROP_TYPE_IDENT) ||
             (name == JS_ATOM_prototype && is_static) ||
             name == JS_ATOM_hash_constructor) {
             js_parse_error(s, "invalid method name");
             goto fail;
+        }
+        if (ts_abstract && prop_type == PROP_TYPE_IDENT) {
+            /* abstract method with no body: 'abstract m(): T;' --
+               consumed by the field branch's ts_abstract block below,
+               but js_parse_property_name may classify 'm' followed by
+               ':' oddly; force IDENT treatment */
         }
         if (prop_type == PROP_TYPE_GET || prop_type == PROP_TYPE_SET) {
             BOOL is_set = prop_type - PROP_TYPE_GET;
@@ -28528,6 +28598,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             emit_op(s, OP_swap);
         JS_FreeAtom(ctx, name);
         name = JS_ATOM_NULL;
+        ts_abstract = FALSE;
     }
 
     if (s->token.val != '}') {
@@ -32992,6 +33063,38 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                                        JS_FUNC_NORMAL, JS_ATOM_NULL,
                                        s->token.ptr))
                 goto fail;
+            break;
+        }
+        /* TS: 'abstract class' -- 'abstract' is a plain identifier
+           (not a keyword), a modifier only when directly followed by
+           'class'. Pure erasure: an abstract class is an ordinary
+           class at runtime (tsc emits it unchanged; abstract members
+           are dropped individually). */
+        /* NOTE: peek_token uses simple_next_token, which returns
+           TOK_IDENT for keywords (S9(b) trap -- the same lexer
+           weakening already hit for 'enum' in M4): 'class' peeks as
+           TOK_IDENT. The token after the peek is examined through
+           s->buf_ptr (peek does not move s->token, but DOES advance
+           the local copy -- so the text right after 'abstract ' in
+           buf_ptr is the start of the next word). */
+        if (s->ts_mode &&
+            js_ts_is_pseudo_keyword_str(s, "abstract")) {
+            const uint8_t *q = s->buf_ptr;
+            while (q[0] == ' ' || q[0] == '\t')
+                q++;
+            if (!(q[0] == 'c' && q[1] == 'l' && q[2] == 'a' &&
+                  q[3] == 's' && q[4] == 's' &&
+                  !lre_js_is_ident_next(q[5]))) {
+                goto hasexpr;
+            }
+                        if (!(decl_mask & DECL_MASK_OTHER)) {
+                js_parse_error(s, "class declarations can't appear in single-statement context");
+                goto fail;
+            }
+            if (next_token(s)) /* consume 'abstract' */
+                return -1;
+            if (js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE, NULL))
+                return -1;
             break;
         }
         goto hasexpr;

@@ -539,3 +539,30 @@ print(new ImplCircle().baseMethod() === 1);
 // .ts extension auto-enables the TS frontend in the module loader.
 
 print("ALL TS TESTS PASSED");
+
+// B1: abstract class/method/property (pure erasure)
+{
+    abstract class AbsBase {
+        abstract m(a: number, b?: string): number;
+        abstract get v(): string;
+        abstract set v(x: string);
+        abstract field: number;
+        concrete(): number { return 1; }
+    }
+    var absB = new AbsBase();
+    print(Object.keys(absB).length === 0);
+    print(typeof AbsBase.prototype.m === "undefined");
+    print(typeof AbsBase.prototype.v === "undefined");
+    class AbsD extends AbsBase {
+        m(a, b) { return a; }
+        get v() { return "v"; }
+        set v(x) {}
+        field = 5;
+    }
+    print(new AbsD().m(2) === 2);
+    print(new AbsD().v === "v" && new AbsD().field === 5);
+    // 消歧: abstract 作普通标识符
+    class AbsC { abstract = 5; }
+    print(new AbsC().abstract === 5);
+}
+print("ALL TS TESTS PASSED");

@@ -532,7 +532,8 @@ TODO refs: TS-66 ~ TS-68
 - 现状：C helper 与 emit 层全部打通，`--ts-stage3` 全场景（方法/属性/静态/多装饰器/顺序/替换/context）验证通过，`tests/test_ts_stage3.js` 挂入 make test 全绿，内存无泄漏。
 - **TS-67 补完（A1，2026-07-31）**：字段初始化改写（`x = __runInitializers(this, _inits, init)`）、构造函数 extraInitializers 注入（fields_init 末尾）、静态 extra（类尾）、方法共享 `_instanceExtraInitializers`（第一个字段初始化点消费，tsc 语义）全部实现，与真实 tsc 逐字符对照一致。修复 4 类真实 bug：①fields_init_fd 内用外层 scope_level 导致 resolve_scope_var 越界死循环（sample 抓栈定位）②数组必须 `OP_array_from 0`（OP_object 无 unshift/push）③字段装饰器 ctor 必须传 null（传类导致 defineProperty 污染类对象）④方法 extra 覆盖字段 prev（共享 extras 数组改为开头预留 + 无条件定义）。
 - **accessor 关键字（A2，2026-07-31）**：`@dec accessor x = 10` 完整实现——backing 私有字段（`#x<accessor>`）+ 合成 get/set 函数（`js_new_function_def` + 手工 emit `scope_get/put_private_field`）+ kind="accessor" 装饰（C helper is_accessor 分支） + init 链/extra 链（复用 A1 机制）。消歧：`accessor` 后跟 `;`/`}`/`(`/`=` 时是普通字段名。顺带修复 A1 隐藏 bug：prev extra 消费扩展到**未装饰**字段/accessor（tsc 语义：`plain = (__runInitializers(this, _a_extraInitializers), 5)`）。与真实 tsc 逐字符一致。
-- 已知限制（记录，非隐藏）：metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
+- **abstract 类/成员（B1，2026-07-31，RFC 范围外补充）**：`abstract class` / `abstract m(): T;` / `abstract get/set` / `abstract field` 纯擦除实现——abstract class 即普通 class（tsc 语义），abstract 成员完全删除（消费参数表/类型注解/`;`，零字节码）。消歧：`abstract` 后跟 `;`/`}`/`(`/`=` 为普通标识符（字段/方法名）。识别用 buf_ptr 文本匹配（peek_token 对关键字返回 TOK_IDENT——S9(b) 陷阱）。与 tsc 输出一致。
+- 已知限制（记录，非隐藏）：metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）；`using`/`await using` 未实现（需 Symbol.dispose 注册 + try/finally 结构，工作量较大）。
 
 # Milestone M7: 集成与端到端
 Status: **Done(TS-70/TS-71/TS-72)**
