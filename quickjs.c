@@ -24145,6 +24145,7 @@ BOOL JS_DetectModuleTS(const char *input, size_t input_len)
     const uint8_t *p = (const uint8_t *)input;
     const uint8_t *end = p + input_len;
 
+    int brace_depth = 0;
     skip_shebang(&p, end);
     while (p < end) {
         uint8_t c = *p;
@@ -24189,8 +24190,25 @@ BOOL JS_DetectModuleTS(const char *input, size_t input_len)
                                (*p >= '0' && *p <= '9') ||
                                *p == '_' || *p == '$'))
                 p++;
-            if (p - start == 6 && memcmp(start, "export", 6) == 0)
-                return TRUE;
+            if (p - start == 6 && memcmp(start, "export", 6) == 0) {
+                /* 'export' inside a namespace/interface body is
+                   namespace-export syntax, not module syntax (the TS
+                   frontend lowers namespaces to IIFEs); only a
+                   top-level-ish export makes it a module. Track
+                   brace depth: namespace bodies are '{' at depth >= 1
+                   relative to the program -- but a module's top-level
+                   exports are at depth 0, while namespace exports are
+                   inside the namespace's '{'. The lexer-level scan
+                   can't tell 'namespace X {' from 'export {...}',
+                   so use a heuristic: if the nearest preceding
+                   non-whitespace word before the current '{' was
+                   'namespace' or 'interface' or 'module' (ambient),
+                   the brace is a namespace body and its exports are
+                   not module syntax. Simple approximation: track
+                   brace depth and only accept 'export' at depth 0. */
+                if (brace_depth == 0)
+                    return TRUE;
+            }
             if (p - start == 6 && memcmp(start, "import", 6) == 0) {
                 /* 'import(' and 'import.' are dynamic import /
                    import.meta, not module syntax */
@@ -24198,9 +24216,18 @@ BOOL JS_DetectModuleTS(const char *input, size_t input_len)
                 while (q < end && (*q == ' ' || *q == '\t' || *q == '\n' ||
                                    *q == '\r'))
                     q++;
-                if (q < end && *q != '(' && *q != '.')
+                if (q < end && *q != '(' && *q != '.') {
+                    fprintf(stderr, "[DT] import at offset %ld\n", (long)(start - (const uint8_t*)input));
                     return TRUE;
+                }
             }
+        } else if (c == '{') {
+            brace_depth++;
+            p++;
+        } else if (c == '}') {
+            if (brace_depth > 0)
+                brace_depth--;
+            p++;
         } else {
             p++;
         }
