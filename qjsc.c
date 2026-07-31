@@ -306,10 +306,14 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
             JS_FreeValue(ctx, val);
         } else {
             JSValue func_val;
-
+            int eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY;
+            /* TS: a .ts module is compiled with the TS frontend on
+               (M7: qjsc .ts module chains work) */
+            if (has_suffix(module_name, ".ts"))
+                eval_flags |= JS_EVAL_FLAG_TS;
             /* compile the module */
             func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+                               eval_flags);
             js_free(ctx, buf);
             if (JS_IsException(func_val))
                 return NULL;
@@ -347,7 +351,15 @@ static void compile_file(JSContext *ctx, FILE *fo,
     if (module < 0) {
         module = (has_suffix(filename, ".mjs") ||
                   JS_DetectModule((const char *)buf, buf_len));
+        /* TS: .ts files may start with type-only constructs before
+           their first export/import -- use the full-source detector */
+        if (!module && has_suffix(filename, ".ts"))
+            module = JS_DetectModuleTS((const char *)buf, buf_len);
     }
+    /* TS: the .ts extension implies TypeScript mode automatically
+       (M7: qjsc compiles .ts sources directly) */
+    if (has_suffix(filename, ".ts"))
+        eval_flags |= JS_EVAL_FLAG_TS;
     if (module)
         eval_flags |= JS_EVAL_TYPE_MODULE;
     else

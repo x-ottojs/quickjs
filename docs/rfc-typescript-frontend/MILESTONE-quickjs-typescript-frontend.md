@@ -532,8 +532,8 @@ TODO refs: TS-66 ~ TS-68
 - 建议：新会话/干净上下文重审 emit 层，优先验证 closure_var 索引疑点。
 
 # Milestone M7: 集成与端到端
-Status: **Done(TS-70/TS-72) + Partial(TS-71 qjsc)**
-Progress: 80%
+Status: **Done(TS-70/TS-71/TS-72)**
+Progress: 100%
 Depends on: M1-M6 全部
 RFC refs: §目标、前置 RFC §T3
 TODO refs: TS-70 ~ TS-72
@@ -557,9 +557,11 @@ TODO refs: TS-70 ~ TS-72
 - 跨模块：export enum/interface/class/implements/`import type`/循环导入全通
 - 内存：`-d` atom 计数稳定无泄漏
 
-## 已知限制（记录，非隐藏）
+## TS-71 补完（qjsc AOT）
 
-- **TS-71 未完成**：`qjsc.c` 无 `JS_EVAL_FLAG_TS`——AOT 编译 `.ts` 文件尚不支持（qjs 运行期已验证）。待补：qjsc 加 TS flag + 与前置 RFC F2/F3 组合验证。
+- `qjsc.c` 双编译入口（compile_file + 模块 loader）按 `.ts` 扩展名自动加 `JS_EVAL_FLAG_TS`
+- 新增公共 API `JS_DetectModuleTS`（quickjs.c/h）：全源码词法扫描（跳注释/字符串/模板），修复 `JS_DetectModule` 只看首 token 导致 interface/enum 开头模块误判的问题；qjs/qjsc autodetect 双路径接入
+- 端到端验证：`examples/ts_aot_demo.ts`（interface/enum/class/参数属性/泛型）→ `qjsc -c` → `examples/ts_aot_host.c` 零 parser 宿主 → `AOT main() = 11`
 
 ## 结案
 

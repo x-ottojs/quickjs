@@ -32,3 +32,4 @@ libwinpthread*.dll
 
 # otto local workspace state
 .otto/
+out.c

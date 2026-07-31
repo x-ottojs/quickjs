@@ -839,6 +839,11 @@ JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
                             JSValueConst new_target,
                             int argc, JSValueConst *argv);
 JS_BOOL JS_DetectModule(const char *input, size_t input_len);
+/* TS: same as JS_DetectModule() but scans the whole source instead of
+   only the first token, so .ts files that begin with type-only
+   constructs (interface/enum/type/declare) before their first
+   export/import are still detected as modules. */
+JS_BOOL JS_DetectModuleTS(const char *input, size_t input_len);
 /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
 JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
                 const char *filename, int eval_flags);

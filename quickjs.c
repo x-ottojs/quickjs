@@ -24107,6 +24107,79 @@ BOOL JS_DetectModule(const char *input, size_t input_len)
     }
 }
 
+/* TS: module detection for .ts sources. JS_DetectModule() only looks
+   at the first token, which misclassifies TS files that start with
+   type-only declarations (interface/enum/type/declare) and only reach
+   their first export/import later. This scans the whole source with a
+   minimal lexer that skips comments and string literals. */
+BOOL JS_DetectModuleTS(const char *input, size_t input_len)
+{
+    const uint8_t *p = (const uint8_t *)input;
+    const uint8_t *end = p + input_len;
+
+    skip_shebang(&p, end);
+    while (p < end) {
+        uint8_t c = *p;
+        if (c == '/' && p + 1 < end) {
+            if (p[1] == '/') {
+                p += 2;
+                while (p < end && *p != '\n')
+                    p++;
+            } else if (p[1] == '*') {
+                p += 2;
+                while (p + 1 < end && !(p[0] == '*' && p[1] == '/'))
+                    p++;
+                p += 2;
+            } else {
+                p++;
+            }
+        } else if (c == '\'' || c == '"' || c == '`') {
+            uint8_t q = c;
+            p++;
+            while (p < end) {
+                if (*p == '\\') {
+                    p += 2;
+                } else if (*p == q) {
+                    p++;
+                    break;
+                } else if (q == '`' && *p == '$' && p + 1 < end && p[1] == '{') {
+                    /* template substitution: stop at ${ and resume
+                       scanning as code (string state is not tracked
+                       precisely, but a nested export/import inside a
+                       substitution is a module anyway) */
+                    p += 2;
+                    break;
+                } else {
+                    p++;
+                }
+            }
+        } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   c == '_' || c == '$') {
+            const uint8_t *start = p;
+            while (p < end && ((*p >= 'a' && *p <= 'z') ||
+                               (*p >= 'A' && *p <= 'Z') ||
+                               (*p >= '0' && *p <= '9') ||
+                               *p == '_' || *p == '$'))
+                p++;
+            if (p - start == 6 && memcmp(start, "export", 6) == 0)
+                return TRUE;
+            if (p - start == 6 && memcmp(start, "import", 6) == 0) {
+                /* 'import(' and 'import.' are dynamic import /
+                   import.meta, not module syntax */
+                const uint8_t *q = p;
+                while (q < end && (*q == ' ' || *q == '\t' || *q == '\n' ||
+                                   *q == '\r'))
+                    q++;
+                if (q < end && *q != '(' && *q != '.')
+                    return TRUE;
+            }
+        } else {
+            p++;
+        }
+    }
+    return FALSE;
+}
+
 static inline int get_prev_opcode(JSFunctionDef *fd) {
     if (fd->last_opcode_pos < 0 || dbuf_error(&fd->byte_code))
         return OP_invalid;

@@ -57,7 +57,7 @@ Last updated: 2026-07-30
 | TS-68 | Not Started | 0 | Not Run | `tests/` | M6b 单测 + 与 M6a 的开关切换验证(`--ts-stage3` CLI 已就绪,默认 legacy) | RFC §验证策略 | 依赖 TS-66 emit 修复 |
 | **M7 · 集成与端到端** | | | | | | | |
 | TS-70 | Done | 100 | Pass | `qjs.c`, `quickjs-libc.c` | `.ts` 文件扩展名自动识别(qjs eval_file + js_module_loader 均自动加 `JS_EVAL_FLAG_TS`)+ CLI 开关 | RFC §目标 | 跨文件 import 链/循环导入全通过 |
-| TS-71 | Partial | 60 | Partial | `qjsc.c` | AOT 链路:qjs 运行期已验证(端到端 e2e 覆盖 M1-M6a 全特性),**qjsc 编译器未加 TS flag** | 前置 RFC §T3 | qjsc.c 无 `JS_EVAL_FLAG_TS`,待补 |
+| TS-71 | Done | 100 | Pass | `qjsc.c` + `examples/ts_aot_demo.ts`/`ts_aot_host.c` | AOT 链路:qjsc 编译 .ts(interface/enum/class/参数属性/泛型)→ C 字节码 → 零 parser 宿主执行导出 main() | 前置 RFC §T3 | 端到端验证 `AOT main() = 11`;新增 `JS_DetectModuleTS`(全源码扫描,修复 interface 开头模块误判——JS_DetectModule 只看首 token);qjs/qjsc 双路径接入 |
 | TS-72 | Done | 100 | Pass | `tests/test_ts.js`, `tests/test_ts_module.ts` | 端到端串联用例 + 模块链套件 + make test 挂载 | 核心·推进路径约束 | M7 顺带修复4个真实缺口:export interface/enum 保留字token判断、implements 子句、链式 `!` 断言、模块loader TS flag |
 
 ## M7 集成修复记录(4个真实缺口)
