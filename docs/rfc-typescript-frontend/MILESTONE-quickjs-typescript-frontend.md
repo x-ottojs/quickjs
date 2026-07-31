@@ -498,8 +498,8 @@ TODO refs: TS-60 ~ TS-63
 
 
 # Milestone M6b: 装饰器 stage 3 (标准生态)
-Status: **Partial(C helper 完成并验证 / emit 层未完成)**
-Progress: 50%
+Status: **Done(TS-66/TS-68) + Partial(TS-67 范围限制)**
+Progress: 90%
 Depends on: M6a
 RFC refs: §D3.4
 TODO refs: TS-66 ~ TS-68
@@ -514,22 +514,23 @@ TODO refs: TS-66 ~ TS-68
 1. **C helper（完成，验证通过）**：`quickjs-libc.c` 实现 `__esDecorate`/`__runInitializers`，6 参数调用形状完整复刻 tsc（ctor/descriptorIn/decorators/contextIn/initializers/extraInitializers）；context 支持 kind=method/field/accessor/getter/setter/class；`context.addInitializer` 经 `JS_NewCFunctionData` 闭包 push 进 extraInitializers。**直接 JS 调用全场景验证通过**（方法/字段/类装饰器、addInitializer、init 链、descriptor 更新、类替换）。
 2. **引用计数契约（本次调试核心收获）**：`JS_GetProperty`/`JS_GetGlobalObject`/`JS_New*`/`JS_Call` 返回新引用归调用者；`JS_SetProperty(Str)` 消费值参数（所有路径）；`JS_Call` 不消费 argv（COPY_ARGV）；`JS_GetOwnPropertyNames` 返回 atom 须逐个 `JS_FreeAtom`；**`JS_GetGlobalObject` 返回值必须显式 `JS_FreeValue`**（漏释放泄漏整个对象图，曾表现为 552 个对象假泄漏 + 断言崩溃）。
 3. **CLI 链路（完成）**：`JS_EVAL_FLAG_TS_STAGE3 (1<<9)` + `JSParseState.stage3_decorators` + `qjs --ts-stage3` + `js_parse_class` 应用点分支（stage3 走 `js_ts_apply_stage3_decorators`，跳过 legacy 两函数）。
-4. **emit 层（未完成）**：`js_ts_apply_stage3_decorators` 生成 `__esDecorate` 调用字节码——context 对象构建（kind/name/static/private/access/metadata 七字段）、decorators 数组打包存隐藏变量、6 参数按 argv 顺序 push、callee 经 `Reflect.__esDecorate` 获取。**运行时报 `TypeError: not a function`（at @dec 行），C helper 从未被调用**。
+4. **emit 层（完成）**：`js_ts_apply_stage3_decorators` 生成 `__esDecorate` 调用字节码——context 对象构建（kind/name/static/private/access/metadata 七字段）、decorators 数组打包存隐藏变量、6 参数按 argv 顺序 push、callee 经 `Object.__esDecorate`（预定义 atom 桥接）获取。端到端验证通过（`--ts-stage3` 全场景）。
 
-## 未解决 bug 排查记录（供干净上下文重审）
+## not-a-function bug 排查记录（已解决，2026-07-31）
 
-- 字节码 dump 逐行核对：栈平衡正确、参数顺序正确（argv[0]=ctor...argv[5]=extra）、`array_from` 后立即 `put_var_init` 存隐藏变量
-- `Reflect.__esDecorate` 运行时存在且为 function；class 收尾的全局解析验证可用（`get_var print` + call 调试打印成功）
-- C helper 入口打印从未出现 → `call 6` 的 callee（`get_field __esDecorate` 结果）运行时非函数
-- **最大疑点**：`get_var N: Reflect` 与主流程 `get_var N: print` 疑似**共享 closure_var 索引**（不同 dump 中均见索引 4/5 附近的相邻分配）——`get_field` 在错误对象上读 `__esDecorate` 得 undefined → call undefined → "not a function"。需验证 `resolve_variables` 对动态 atom（`JS_NewAtom("Reflect")`）的 `JS_CLOSURE_GLOBAL` fallback 去重是否按 atom 正确进行
-- 已尝试且无效：预定义 atom 替代动态 atom（atom.h 末尾新增 7 个 atom）；不释放 `refl_atom`/`es_dec_atom`；`get_var globalThis`/`Object`/`Reflect` 三种桥接对象
-- 已提交为 wip commit（`023f99e`/`5af95d9`/`06b2322`），双端均已推送（JD 为 weiyanhai 版）
+症状：`--ts-stage3` 下 `@dec` 行报 `TypeError: not a function`，C helper 从未被调用。排查过程的关键教训：
+
+1. **`OP_call` 操作数约定（根因之一）**：QuickJS 是 **callee 先压栈、参数按 argv 顺序在后**——`call N` 计算 `call_argv = sp - N`，callee 在 `call_argv[-1]`（参数**下方**）。原实现参数先压、函数最后，导致 call 6 的 callee 变成栈底参数（类构造器）。**判定方法**：`get_var print; push_const; call 1` 调试打印成功（callee=print 在底）而 `dup; get_var print; push; call 2` 失败（callee 错位）——两种假设下单参数调用都成立，多参数调用才能区分。
+2. **`OP_define_field` 语义（根因之二）**：n_pop=2、n_push=1——**消费对象+值并压回对象**，等价于对象字面量 `object; push; define_field`（**无 dup**）。原实现每个字段前 `OP_dup`，6 字段栈上多 6 个对象 → call 6 操作数窗口错位。用 `./qjs -d -e 'var o={a:1,b:2}'` 的真实字节码对照发现。
+3. **隐藏变量计数器（根因之三）**：`<ts3_decs_%d>` 必须用全局 `s->ts_decorator_counter`——函数内局部计数器使第二个装饰 class 报 "invalid redefinition of lexical identifier"。
+4. **顺序语义（tsc 交叉验证）**：装饰器数组必须 **source 序**（`@a @b` → `[a,b]`），helper 反向遍历 → 最靠近成员的（b）先应用；成员间按**声明顺序**（`decorator_head` 是 reverse-of-source，应用函数内局部反转）。**顺带修复 M6a 同款跨成员顺序 bug**（实测 `ver,count,greet` → 修正为 `greet,count,ver`，与 tsc 一致）。
+5. 早期"callee 获取 undefined"的假象全部来自调试代码自身违反调用约定或插在错误位置（如 `es_dec_atom` 赋值前）——**调试代码必须先用真实字节码对照验证自身正确**。
 
 ## 结案
 
 - 迭代目的：stage3 装饰器标准生态支持（对齐现代 TS 项目）。
-- 现状：C helper 与开关链路就绪且验证；emit 层 1 个运行时 bug 未解（已记录全部线索）。**M6b 标记为未完成**，不阻塞 M7（已完成）与 legacy 路径（零回归）。
-- 建议：新会话/干净上下文重审 emit 层，优先验证 closure_var 索引疑点。
+- 现状：C helper 与 emit 层全部打通，`--ts-stage3` 全场景（方法/属性/静态/多装饰器/顺序/替换/context）验证通过，`tests/test_ts_stage3.js` 挂入 make test 全绿，内存无泄漏。
+- 已知限制（记录，非隐藏）：字段初始化改写与构造函数 extraInitializers 注入未实现（addInitializer 收集但不运行）；`accessor` 关键字未实现；metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
 
 # Milestone M7: 集成与端到端
 Status: **Done(TS-70/TS-71/TS-72)**

@@ -26438,6 +26438,25 @@ static __exception int js_ts_apply_decorators(JSParseState *s,
     JSTSDecoratorEntry **done = NULL;
     int done_count = 0, done_alloc = 0;
     int ret = 0;
+    /* the '@' collector PREPENDS, so head is reverse-of-source; this
+       function only handles METHOD/PROPERTY entries (class/parameter
+       ones are skipped below and handled by
+       js_ts_apply_class_decorators, which must keep the original
+       order), so reversing the LOCAL pointer restores declaration
+       order for members -- matching tsc, which emits one
+       __decorate(...) call per member in source order (verified
+       2026-07-31: legacy applied 'ver,count,greet' before the fix,
+       tsc applies 'greet,count,ver'). */
+    {
+        JSTSDecoratorEntry *p = NULL, *c = head, *nxt;
+        while (c) {
+            nxt = c->next;
+            c->next = p;
+            p = c;
+            c = nxt;
+        }
+        head = p;
+    }
     for (e = head; e; e = e->next) {
         JSTSDecoratorEntry *cur;
         BOOL already_done = FALSE;
@@ -26964,12 +26983,34 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
     JSTSDecoratorEntry **done = NULL;
     int done_count = 0, done_alloc = 0;
     int ret = 0;
-    int hidden_counter = 0;
     JSAtom es_dec_atom, refl_atom;
 
+    /* the '@' collector PREPENDS, so head is reverse-of-source; the
+       member application order must be declaration order (tsc emits
+       one __esDecorate call per member, in source order) -- reverse
+       the list locally before iterating */
+    {
+        JSTSDecoratorEntry *p = NULL, *c = head, *nxt;
+        while (c) {
+            nxt = c->next;
+            c->next = p;
+            p = c;
+            c = nxt;
+        }
+        head = p;
+    }
+
     es_dec_atom = JS_NewAtom(ctx, "__esDecorate");
-    refl_atom = JS_NewAtom(ctx, "Reflect");
-    if (es_dec_atom == JS_ATOM_NULL || refl_atom == JS_ATOM_NULL) {
+    /* bridge via the predefined Object atom: resolve_variables has a
+       reliable global path for predefined atoms (legacy metadata emit
+       uses JS_ATOM_Object the same way), while a dynamic
+       JS_NewAtom("Reflect") global fallback did NOT resolve at
+       runtime (get_var returned something whose __esDecorate was
+       undefined). js_std_add_helpers mirrors __esDecorate onto
+       Object for exactly this reason. */
+    refl_atom = JS_ATOM_Object;
+
+    if (es_dec_atom == JS_ATOM_NULL) {
         ret = -1;
         goto out;
     }
@@ -26999,7 +27040,11 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
         {
             JSAtom arr_hidden;
             char nbuf[32];
-            snprintf(nbuf, sizeof(nbuf), "<ts3_decs_%d>", hidden_counter++);
+            /* unique across the whole parse: two decorated classes in
+               the same top-level function must not collide (the
+               per-call hidden_counter caused "invalid redefinition of
+               lexical identifier" on the second class) */
+            snprintf(nbuf, sizeof(nbuf), "<ts3_decs_%d>", s->ts_decorator_counter++);
             arr_hidden = JS_NewAtom(ctx, nbuf);
             if (arr_hidden == JS_ATOM_NULL) { ret = -1; goto out; }
             {
@@ -27013,25 +27058,58 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
                     ret = -1; goto out;
                 }
             }
-            for (cur = e; cur; cur = cur->next) {
-                if (cur->kind != e->kind || cur->member_name != e->member_name ||
-                    cur->is_static != e->is_static)
-                    continue;
-                group_count++;
-                emit_op(s, OP_scope_get_var);
-                emit_atom(s, cur->hidden_var_name);
-                emit_u16(s, fd->scope_level);
-                if (done_count >= done_alloc) {
-                    int na = done_alloc ? done_alloc * 2 : 8;
-                    JSTSDecoratorEntry **nd = js_realloc(ctx, done, sizeof(*nd) * na);
-                    if (!nd) {
-                        JS_FreeAtom(ctx, arr_hidden);
-                        ret = -1; goto out;
+            {
+                /* collect the group's entries first, then emit their
+                   values in REVERSE (source order): the decorator
+                   list is reverse-of-source (the '@' collector
+                   prepends), but __esDecorate iterates its array
+                   backwards like tsc's -- so the array must be
+                   [topDec ... bottomDec] (source order) for the
+                   bottom-most decorator (closest to the member) to
+                   be applied first, matching tsc exactly. */
+                JSTSDecoratorEntry **grp = NULL;
+                int g = 0, ga = 0;
+                for (cur = e; cur; cur = cur->next) {
+                    if (cur->kind != e->kind || cur->member_name != e->member_name ||
+                        cur->is_static != e->is_static)
+                        continue;
+                    if (g >= ga) {
+                        int na = ga ? ga * 2 : 8;
+                        JSTSDecoratorEntry **ng = js_realloc(ctx, grp, sizeof(*ng) * na);
+                        if (!ng) {
+                            js_free(ctx, grp);
+                            JS_FreeAtom(ctx, arr_hidden);
+                            ret = -1; goto out;
+                        }
+                        grp = ng;
+                        ga = na;
                     }
-                    done = nd;
-                    done_alloc = na;
+                    grp[g++] = cur;
+                    if (done_count >= done_alloc) {
+                        int na = done_alloc ? done_alloc * 2 : 8;
+                        JSTSDecoratorEntry **nd = js_realloc(ctx, done, sizeof(*nd) * na);
+                        if (!nd) {
+                            js_free(ctx, grp);
+                            JS_FreeAtom(ctx, arr_hidden);
+                            ret = -1; goto out;
+                        }
+                        done = nd;
+                        done_alloc = na;
+                    }
+                    done[done_count++] = cur;
                 }
-                done[done_count++] = cur;
+                /* head was reversed to declaration order above, so
+                   grp[] is already source order [topDec..bottomDec]:
+                   emit in that order so the array handed to
+                   __esDecorate is [a, b] for '@a @b' -- the helper
+                   iterates backwards (like tsc), applying b first */
+                for (i = 0; i < g; i++) {
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, grp[i]->hidden_var_name);
+                    emit_u16(s, fd->scope_level);
+                }
+                js_free(ctx, grp);
+                group_count = g;
             }
             emit_op(s, OP_array_from);
             emit_u16(s, group_count);
@@ -27039,35 +27117,56 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             emit_atom(s, arr_hidden);
             emit_u16(s, fd->scope_level);
 
-            /* Step 2: push the six arguments in EXACT argv order:
-               argv[0]=ctor, argv[1]=descriptorIn(null),
-               argv[2]=decorators array, argv[3]=context object,
-               argv[4]=initializers(null), argv[5]=extra(dummy obj) */
-            emit_op(s, OP_scope_get_var);       /* argv[0]: ctor = the
-                class itself (NOT its prototype) -- __esDecorate
-                internally resolves target = static ? ctor :
-                ctor.prototype, exactly like tsc's own call shape
-                __esDecorate(Ctor, null, decs, ctx, ...) */
+            /* ---- stage3 __esDecorate call: QUICKJS OPERAND ORDER ----
+               QuickJS's OP_call convention (confirmed by bytecode
+               debugging 2026-07-31): the CALLEE is pushed FIRST, then
+               the arguments in argv order: [callee, arg1, ..., argN].
+               call N computes call_argv = sp - N and takes
+               call_argv[-1] as the callee (below the args). The
+               previous version pushed args first and the function
+               last, which made call 6 treat the CLASS CONSTRUCTOR as
+               the callee and shifted every argument by one slot
+               ("TypeError: not a function" at the @dec line). */
+            /* callee: Reflect.__esDecorate (auto-init global, resolves
+               reliably in class-tail position -- same mechanism the
+               legacy metadata emit relies on) */
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, refl_atom);
+            emit_u16(s, fd->scope_level);
+            emit_op(s, OP_get_field);
+            emit_atom(s, es_dec_atom);
+            /* stack: [fn] */
+
+            /* argv[0]: ctor = the class itself (NOT its prototype) --
+               __esDecorate internally resolves target = static ?
+               ctor : ctor.prototype, exactly like tsc's call shape */
+            emit_op(s, OP_scope_get_var);
             emit_atom(s, class_var_name);
             emit_u16(s, fd->scope_level);
-            emit_op(s, OP_null);                /* argv[1] */
-            emit_op(s, OP_scope_get_var);       /* argv[2]: decs */
+            /* argv[1]: descriptorIn = null */
+            emit_op(s, OP_null);
+            /* argv[2]: decorators array (read back from hidden local) */
+            emit_op(s, OP_scope_get_var);
             emit_atom(s, arr_hidden);
             emit_u16(s, fd->scope_level);
-
-            /* argv[3]: context object */
+            /* argv[3]: context object -- NOTE: no OP_dup before each
+               define_field: OP_define_field pops the object+value and
+               PUSHES THE OBJECT BACK (n_pop=2, n_push=1), exactly
+               like a plain object literal's bytecode
+               (object; push; define_field). The earlier version
+               emitted a dup per field, leaving one extra object on
+               the stack per field, which shifted call 6's operand
+               window and made the callee resolve to the class
+               constructor ("not a function"). */
             emit_op(s, OP_object);
-            emit_op(s, OP_dup);
             emit_op(s, OP_push_atom_value);
             emit_atom(s, e->kind == JS_TS_DEC_PROPERTY ? JS_NewAtom(ctx, "field") : JS_NewAtom(ctx, "method"));
             emit_op(s, OP_define_field);
             emit_atom(s, JS_NewAtom(ctx, "kind"));
-            emit_op(s, OP_dup);
             emit_op(s, OP_push_atom_value);
             emit_atom(s, e->member_name);
             emit_op(s, OP_define_field);
             emit_atom(s, JS_ATOM_name);
-            emit_op(s, OP_dup);
             {
                 JSValue b = JS_NewBool(ctx, e->is_static);
                 if (JS_IsException(b)) { JS_FreeAtom(ctx, arr_hidden); ret = -1; goto out; }
@@ -27076,7 +27175,6 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             }
             emit_op(s, OP_define_field);
             emit_atom(s, JS_ATOM_static);
-            emit_op(s, OP_dup);
             {
                 JSValue b = JS_NewBool(ctx, FALSE);
                 if (JS_IsException(b)) { JS_FreeAtom(ctx, arr_hidden); ret = -1; goto out; }
@@ -27085,24 +27183,19 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             }
             emit_op(s, OP_define_field);
             emit_atom(s, JS_ATOM_private);
-            emit_op(s, OP_dup);
             emit_op(s, OP_object); /* access: {} */
             emit_op(s, OP_define_field);
             emit_atom(s, JS_NewAtom(ctx, "access"));
-            emit_op(s, OP_dup);
             emit_op(s, OP_undefined); /* metadata */
             emit_op(s, OP_define_field);
             emit_atom(s, JS_NewAtom(ctx, "metadata"));
-
-            emit_op(s, OP_null);    /* argv[4]: initializers */
-            emit_op(s, OP_object);  /* argv[5]: extra (dummy) */
-
-            /* callee (last on stack): Reflect.__esDecorate */
-            emit_op(s, OP_scope_get_var);
-            emit_atom(s, refl_atom);
-            emit_u16(s, fd->scope_level);
-            emit_op(s, OP_get_field);
-            emit_atom(s, es_dec_atom);
+            /* argv[4]: initializers (method: null; field: fresh obj) */
+            emit_op(s, OP_null);
+            /* argv[5]: extraInitializers (fresh obj) */
+            emit_op(s, OP_object);
+            /* stack: [fn, ctor, null, decs, ctx, null, extra] --
+               call 6: call_argv = sp-6 -> argv[0]=ctor ...
+               argv[5]=extra, call_argv[-1] = fn = callee. */
             emit_op(s, OP_call);
             emit_u16(s, 6);
             emit_op(s, OP_drop);

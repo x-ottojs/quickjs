@@ -4230,11 +4230,9 @@ static JSValue js_ts_es_decorate(JSContext *ctx, JSValueConst this_val,
     uint32_t len, i;
     BOOL is_accessor, is_static, is_class, is_field;
 
-    fprintf(stderr, "[dbg-esd] entry, argc=%d\n", argc);
-    kind_v = JS_GetPropertyStr(ctx, context_in, "kind");
+        kind_v = JS_GetPropertyStr(ctx, context_in, "kind");
     if (JS_IsException(kind_v)) {
-        fprintf(stderr, "[dbg-esd] kind get failed\n");
-        return JS_EXCEPTION;
+                return JS_EXCEPTION;
     }
     kind_c = JS_ToCString(ctx, kind_v);
     if (!kind_c) {
@@ -4308,9 +4306,6 @@ static JSValue js_ts_es_decorate(JSContext *ctx, JSValueConst this_val,
         gopd = JS_GetPropertyStr(ctx, obj, "getOwnPropertyDescriptor");
         args[0] = target;
         args[1] = name_v;
-        fprintf(stderr, "[dbg-gopd] target tag=%d name tag=%d is_obj=%d\n",
-                JS_VALUE_GET_TAG(target), JS_VALUE_GET_TAG(name_v),
-                JS_IsObject(target));
         descriptor = JS_Call(ctx, gopd, obj, 2, args);
         JS_FreeValue(ctx, gopd);
         JS_FreeValue(ctx, obj);
@@ -4558,6 +4553,10 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
                       JS_NewCFunction(ctx, js_ts_es_decorate, "__esDecorate", 6));
     JS_SetPropertyStr(ctx, global_obj, "__runInitializers",
                       JS_NewCFunction(ctx, js_ts_run_initializers, "__runInitializers", 2));
+    /* mirror onto Object as well: the TS frontend's emitted bytecode
+       resolves the callee through the predefined Object atom (dynamic
+       atoms do not reliably hit the global fallback in class-tail
+       position), so Object.__esDecorate must exist */
     {
         JSValue r_obj = JS_GetPropertyStr(ctx, global_obj, "Reflect");
         if (!JS_IsException(r_obj) && JS_IsObject(r_obj)) {
@@ -4565,6 +4564,15 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
             JS_SetPropertyStr(ctx, r_obj, "__esDecorate", fn);
         }
         JS_FreeValue(ctx, r_obj);
+    }
+    {
+        /* JS_SetPropertyStr CONSUMES its value argument on every path
+           (success or failure) -- do NOT JS_FreeValue(fn) after it */
+        JSValue o = JS_GetPropertyStr(ctx, global_obj, "Object");
+        JSValue fn = JS_GetPropertyStr(ctx, global_obj, "__esDecorate");
+        if (!JS_IsException(o) && JS_IsObject(o) && !JS_IsException(fn))
+            JS_SetPropertyStr(ctx, o, "__esDecorate", fn);
+        JS_FreeValue(ctx, o);
     }
 
     JS_FreeValue(ctx, global_obj);

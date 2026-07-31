@@ -469,6 +469,7 @@ ifdef CONFIG_SHARED_LIBS
 	$(WINE) ./qjs$(EXE) examples/test_point.js
 endif
 	$(WINE) ./qjs$(EXE) --ts tests/test_ts.js
+	$(WINE) ./qjs$(EXE) --ts-stage3 tests/test_ts_stage3.js
 	$(WINE) ./qjs$(EXE) -m tests/test_ts_module.ts
 
 stats: qjs$(EXE)

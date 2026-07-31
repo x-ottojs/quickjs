@@ -315,6 +315,7 @@ void help(void)
            "    --script       load as ES6 script (default=autodetect)\n"
            "    --strict       force strict mode\n"
            "    --ts           parse input as TypeScript (consume type annotations)\n"
+           "    --ts-stage3    TypeScript with TC39 stage-3 decorators (default: legacy)\n"
            "-I  --include file include an additional file\n"
            "    --std          make 'std' and 'os' available to the loaded script\n"
            "-T  --trace        trace memory allocation\n"
