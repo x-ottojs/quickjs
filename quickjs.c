@@ -26985,9 +26985,9 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             emit_op(s, OP_object);
             emit_op(s, OP_dup);
             emit_op(s, OP_push_atom_value);
-            emit_atom(s, e->kind == JS_TS_DEC_PROPERTY ? JS_ATOM_field : JS_ATOM_method);
+            emit_atom(s, e->kind == JS_TS_DEC_PROPERTY ? JS_NewAtom(ctx, "field") : JS_NewAtom(ctx, "method"));
             emit_op(s, OP_define_field);
-            emit_atom(s, JS_ATOM_kind);
+            emit_atom(s, JS_NewAtom(ctx, "kind"));
             emit_op(s, OP_dup);
             emit_op(s, OP_push_atom_value);
             emit_atom(s, e->member_name);
@@ -27014,11 +27014,11 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             emit_op(s, OP_dup);
             emit_op(s, OP_object); /* access: {} */
             emit_op(s, OP_define_field);
-            emit_atom(s, JS_ATOM_access);
+            emit_atom(s, JS_NewAtom(ctx, "access"));
             emit_op(s, OP_dup);
             emit_op(s, OP_undefined); /* metadata */
             emit_op(s, OP_define_field);
-            emit_atom(s, JS_ATOM_metadata);
+            emit_atom(s, JS_NewAtom(ctx, "metadata"));
 
             emit_op(s, OP_null);    /* argv[4]: initializers */
             emit_op(s, OP_object);  /* argv[5]: extra (dummy) */
@@ -27029,7 +27029,6 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             emit_u16(s, fd->scope_level);
             emit_op(s, OP_get_field);
             emit_atom(s, es_dec_atom);
-
             emit_op(s, OP_call);
             emit_u16(s, 6);
             emit_op(s, OP_drop);
