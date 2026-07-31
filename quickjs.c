@@ -26969,13 +26969,13 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
                argv[0]=ctor, argv[1]=descriptorIn(null),
                argv[2]=decorators array, argv[3]=context object,
                argv[4]=initializers(null), argv[5]=extra(dummy obj) */
-            emit_op(s, OP_scope_get_var);       /* argv[0]: ctor */
+            emit_op(s, OP_scope_get_var);       /* argv[0]: ctor = the
+                class itself (NOT its prototype) -- __esDecorate
+                internally resolves target = static ? ctor :
+                ctor.prototype, exactly like tsc's own call shape
+                __esDecorate(Ctor, null, decs, ctx, ...) */
             emit_atom(s, class_var_name);
             emit_u16(s, fd->scope_level);
-            if (!e->is_static) {
-                emit_op(s, OP_get_field);
-                emit_atom(s, JS_ATOM_prototype);
-            }
             emit_op(s, OP_null);                /* argv[1] */
             emit_op(s, OP_scope_get_var);       /* argv[2]: decs */
             emit_atom(s, arr_hidden);
