@@ -25163,8 +25163,12 @@ static int __exception js_parse_property_name(JSParseState *s,
     ident_found:
         if (is_non_reserved_ident &&
             prop_type == PROP_TYPE_IDENT && allow_var) {
+            /* TS: a '<' after the name means a generic method
+               'g<T>(...)' -- keep IDENT so the caller's generic-
+               method handling can consume the type parameters */
             if (!(s->token.val == ':' ||
-                  (s->token.val == '(' && allow_method))) {
+                  (s->token.val == '(' && allow_method) ||
+                  (s->ts_mode && s->token.val == '<'))) {
                 prop_type = PROP_TYPE_VAR;
             }
         }
@@ -25199,7 +25203,10 @@ static int __exception js_parse_property_name(JSParseState *s,
         goto invalid_prop;
     }
     if (prop_type != PROP_TYPE_IDENT && prop_type != PROP_TYPE_VAR &&
-        s->token.val != '(') {
+        s->token.val != '(' && !(s->ts_mode && s->token.val == '<')) {
+        /* TS: 'get<T>(' is a generic method named get -- allow the
+           pending '<' (type parameters) so the caller's generic-
+           method handling consumes them */
         JS_FreeAtom(s->ctx, name);
     invalid_prop:
         js_parse_error(s, "invalid property name");
@@ -27798,6 +27805,22 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             if (!(next == ';' || next == '}' || next == '(' || next == '='))
                 is_static = TRUE;
         }
+        /* TS: 'private'/'protected'/'public' member modifiers --
+           pure erasure (no runtime effect; QuickJS has no access
+           control). TOK_PRIVATE/TOK_PROTECTED/TOK_PUBLIC are
+           reserved tokens (strict keywords); consume them when
+           followed by a member name. */
+        while (s->token.val == TOK_PRIVATE || s->token.val == TOK_PROTECTED ||
+               s->token.val == TOK_PUBLIC) {
+            int next = peek_token(s, TRUE);
+            if (next == ';' || next == '}' || next == '(' || next == '=') {
+                /* 'private' etc. used as a member NAME (rare but
+                   legal in non-strict JS) -- stop */
+                break;
+            }
+            if (next_token(s)) /* consume the modifier */
+                goto fail;
+        }
         prop_type = -1;
         if (is_static) {
             if (next_token(s))
@@ -27867,6 +27890,49 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             prop_type = js_parse_property_name(s, &name, TRUE, FALSE, TRUE);
             if (prop_type < 0)
                 goto fail;
+        }
+        /* TS: generic METHOD -- 'g<T>(x: T): R { ... }' has the type
+           parameter list between the name and '('. The name was just
+           parsed by js_parse_property_name; consume '<T, U extends V>'
+           so the method branch (which expects '(') handles it. */
+                if (s->ts_mode && s->token.val == '<') {
+            if (next_token(s)) /* consume '<' */
+                goto fail;
+            if (next_token(s)) /* read the first type parameter */
+                goto fail;
+            for (;;) {
+                if (s->token.val != TOK_IDENT)
+                    break; /* trailing comma or '>' */
+                if (next_token(s))
+                    goto fail;
+                if (s->token.val == TOK_EXTENDS) {
+                    if (next_token(s))
+                        goto fail;
+                    if (js_parse_ts_type(s))
+                        goto fail;
+                }
+                if (s->token.val == '=') {
+                    if (next_token(s))
+                        goto fail;
+                    if (js_parse_ts_type(s))
+                        goto fail;
+                }
+                if (s->token.val != ',')
+                    break; /* token is '>' */
+                if (next_token(s))
+                    goto fail;
+            }
+            if (s->token.val == '>' || js_ts_rescan_greater(s) == 0) {
+                if (next_token(s))
+                    goto fail;
+            } else {
+                js_parse_error(s, "expected '>' in generic method type parameters");
+                goto fail;
+            }
+            /* a generic member is always a method -- downgrade
+               getter/setter misclassification ('get<T>()' is a
+               method named get, not a getter) */
+            prop_type = PROP_TYPE_IDENT;
         }
         is_private = prop_type & PROP_TYPE_PRIVATE;
         prop_type &= ~PROP_TYPE_PRIVATE;
@@ -28040,6 +28106,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 }
                 emit_u8(s, OP_DEFINE_METHOD_GETTER + is_set);
             }
+        } else if (prop_type == PROP_TYPE_IDENT && s->token.val == '<') {
         } else if (prop_type == PROP_TYPE_IDENT && s->token.val != '(') {
             ClassFieldsDef *cf = &class_fields[is_static];
             JSAtom field_var_name = JS_ATOM_NULL;
@@ -30309,7 +30376,13 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         } else {
             if (js_parse_postfix_expr(s, 0))
                 return -1;
-            accept_lparen = TRUE;
+            /* TS: 'new Map<string, number>()' -- generic constructor
+               call; consume the type arguments (no bytecode) so the
+               '<' is not parsed as a comparison */
+            if (s->ts_mode && s->token.val == '<' &&
+                js_ts_try_generic_call(s)) {
+                /* type arguments consumed; expect '(' */
+            }
             if (s->token.val != '(') {
                 /* new operator on an object */
                 emit_source_pos(s, s->token.ptr);
@@ -30395,7 +30468,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         JSFunctionDef *fd = s->cur_func;
         BOOL has_optional_chain = FALSE;
 
-        if (s->token.val == '<' && accept_lparen &&
+                if (s->token.val == '<' && accept_lparen &&
             js_ts_try_generic_call(s)) {
             /* TS: 'f<T>(x)' style generic call — type arguments have
                been consumed (emitting no bytecode); the parser is now
@@ -30783,6 +30856,12 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             }
             if (next_token(s))
                 return -1;
+            /* TS: a member access is callable -- allow 'f.m<T>(x)'
+               generic method calls at the loop-top '<' check (only
+               in TS mode; a plain JS member access must keep the
+               original accept_lparen semantics for Worker etc.) */
+            if (s->ts_mode)
+                accept_lparen = TRUE;
         } else if (s->token.val == '[') {
             int prev_op;
             op_token_ptr = s->token.ptr;
@@ -32404,6 +32483,21 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 ce->param_index = -1;
                 ce->next = class_decorators;
                 class_decorators = ce;
+            }
+            if (s->token.val == TOK_EXPORT) {
+                /* TS: '@dec export class X' -- decorated exported
+                   class (M6a gap: decorators only worked with plain
+                   'class', real projects export decorated classes) */
+                if (next_token(s)) /* consume 'export' */
+                    goto fail;
+                if (s->token.val == TOK_DEFAULT) {
+                    js_parse_error(s, "decorated default export class is not supported");
+                    goto fail;
+                }
+                if (js_parse_class(s, FALSE, JS_PARSE_EXPORT_NAMED,
+                                    class_decorators))
+                    goto fail;
+                return 0;
             }
             if (s->token.val != TOK_CLASS) {
                 js_parse_error(s, "expected 'class' after decorator(s)");
