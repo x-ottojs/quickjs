@@ -42259,127 +42259,24 @@ static JSTSMergeableDecl *js_ts_merge_record(JSParseState *s, JSAtom name,
      (OP_catch / OP_gosub / OP_finally). */
 static __exception int js_parse_ts_using(JSParseState *s, int decl_mask)
 {
-    JSContext *ctx = s->ctx;
-    JSFunctionDef *fd = s->cur_func;
-    int label_catch, label_finally, label_end;
-    int saved_scope_level;
-    JSAtom dispose_atom;
-    JSAtom name = JS_ATOM_NULL;
-    BlockEnv block_env;
-
-    (void)decl_mask;
-    if (js_parse_expect(s, TOK_IDENT) < 0) {
-        /* 'await using' (async disposal) is a known range limit */
-        if (s->token.val == TOK_AWAIT) {
-            js_parse_error(s, "'await using' is not supported (async disposal)");
-        } else {
-            js_parse_error(s, "identifier expected after 'using'");
-        }
-        return -1;
-    }
-    name = JS_DupAtom(ctx, s->token.u.ident.atom);
-    if (next_token(s))
-        goto fail;
-
-    dispose_atom = JS_ATOM_Symbol_dispose;
-    label_catch = new_label(s);
-    label_finally = new_label(s);
-    label_end = new_label(s);
-
-    /* declare the resource variable as a const in a new scope so it
-       does not leak past the using statement's block */
-    push_scope(s);
-    saved_scope_level = fd->scope_level;
-    if (js_define_var(s, name, TOK_CONST) < 0)
-        goto fail;
-
-    /* try: OP_catch routes exceptions to the catch label, which
-       immediately gosubs the finally body then rethrows (finally-only
-       try) */
-    emit_goto(s, OP_catch, label_catch);
-    /* drop_count=2: the finally body's label is reached from the try
-       body (stack has the dummy undefined) and from the catch path
-       (stack has the exception) -- both depth 1, and the checker
-       treats finally-entry stacks specially (same value TOK_TRY
-       passes for its finally-only form) */
-    push_break_entry(s->cur_func, &block_env, JS_ATOM_NULL, -1, -1, 2);
-    block_env.label_finally = label_finally;
-
-    if (js_parse_expect(s, '='))
-        goto fail;
-    if (js_parse_assign_expr(s))
-        goto fail;
-    /* stack: value */
-    emit_op(s, OP_scope_put_var_init);
-    emit_atom(s, name);
-    emit_u16(s, saved_scope_level);
-
-    /* parse the rest of the enclosing block's statements until '}'
-       or EOF (a using declaration covers the rest of its block) */
-    if (s->token.val != '}') {
-        for (;;) {
-            if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
-                goto fail;
-            if (s->token.val == '}' || s->token.val == TOK_EOF)
-                break;
-        }
-    }
-
-    pop_break_entry(s->cur_func);
-
-    if (js_is_live_code(s)) {
-        /* drop the catch offset */
-        emit_op(s, OP_drop);
-        /* must push dummy value to keep same stack size */
-        emit_op(s, OP_undefined);
-        emit_goto(s, OP_gosub, label_finally);
-        emit_op(s, OP_drop);
-
-        emit_goto(s, OP_goto, label_end);
-    }
-
-    /* exception path (OP_catch landed here): the exception value is
-       at TOS, gosub to the finally body, then rethrow */
-    emit_label(s, label_catch);
-    emit_goto(s, OP_gosub, label_finally);
-    emit_op(s, OP_throw);
-
-    /* finally body: dispose -- reached via OP_gosub. The gosub
-       return value is dropped by the CALLER after the gosub; the
-       finally body itself runs with an empty stack (same as a plain
-       finally block: body + OP_ret). */
-    emit_label(s, label_finally);
-    emit_op(s, OP_scope_get_var);
-    emit_atom(s, name);
-    emit_u16(s, saved_scope_level);
-    /* stack: [.., value] (return address is deeper, untouched)
-       if (value != null && value != undefined) value[Symbol.dispose]();
-       -- label-based guards; every branch pops the duplicated value
-       so the stack depth at each label matches (the checker compares
-       stack depth at label targets) */
-    /* dispose: value[Symbol.dispose]() -- a 'using' variable's
-       value is required to be disposable by TS's type system; a null
-       value is a type error in TS and throws here like any other
-       property access (tsc's helper silently skips null -- recorded
-       as a known divergence: we throw instead). The stack value is
-       consumed by get_field2/call_method, leaving it empty. */
-    emit_op(s, OP_get_field2);
-    emit_atom(s, dispose_atom);
-    emit_op(s, OP_call_method);
-    emit_u16(s, 0);
-    emit_op(s, OP_drop);
-    emit_op(s, OP_ret);
-
-    emit_label(s, label_end);
-
-    pop_scope(s);
-    JS_FreeAtom(ctx, name);
-    return 0;
-
-fail:
-    JS_FreeAtom(ctx, name);
+    /* TS 5.2 'using' -- implementation ROLLED BACK (2026-08-01):
+       the hand-built try/finally bytecode trips the stack checker
+       ("inconsistent stack size" at the OP_catch label: the goto's
+       stack and the fallthrough path disagree by one slot, first=3
+       now=2) for functions that end without a return statement, and
+       the root cause (6 stray bytes before the OP_catch goto --
+       two push_i16-style constants whose emitter is unclear) was not
+       resolved within budget. Symbol.dispose/Symbol.asyncDispose
+       registration is KEPT (harmless, useful for userland code).
+       A correct implementation needs either a TOK_TRY-equivalent
+       emit path (reusing js_parse_block + push_break_entry exactly
+       like the real try statement) or the tsc-style helper approach.
+       See MILESTONE-quickjs-typescript-frontend.md, 'using' section. */
+    (void)s; (void)decl_mask;
+    js_parse_error(s, "'using' declarations are not supported in this build (rolled back)");
     return -1;
 }
+
 
 static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const,
                                    BOOL is_export)

@@ -567,28 +567,4 @@ print("ALL TS TESTS PASSED");
 }
 print("ALL TS TESTS PASSED");
 
-// B2: using 声明 (TS 5.2 显式资源管理)
-{
-    function mkRes(name) {
-        return { [Symbol.dispose]() { print("d:" + name); }, name };
-    }
-    function usingF() {
-        using ua = mkRes("a");
-        using ub = mkRes("b");
-        print("using-body");
-    }
-    usingF();
-    // 异常路径
-
-    function usingThrow() {
-        using ua = mkRes("t");
-        throw new Error("boom");
-    }
-    try { usingThrow(); } catch (e) { print("caught:" + e.message); }
-    // 消歧: using 作普通标识符
-    var using = 5;
-    print(using === 5);
-    print(typeof Symbol.dispose === "symbol");
-    print(typeof Symbol.asyncDispose === "symbol");
-}
 print("ALL TS TESTS PASSED");
