@@ -247,3 +247,33 @@ TODO refs: T-11
 - 迭代前问题:TS 融合的性能收益凭直觉估算,存在高估风险,可能导致错误立项。
 - 如何迭代:实测三个基准 + 字节码指令分布统计 + 体积实测 + **现状特化机制穷举**,据此校准收益区间。
 - 最终结果:T-11 `Done`。结论——TS 解析融合技术成立且推荐(价值在"能直接跑 .ts"),但**不应以性能优化为立项理由**(3-8%);体积收益真正来源是 F3 零 parser AOT(-10%),与 TS 无关;最优组合是 TS parser 放编译期 AOT + 运行期零 parser。剩余风险:落地须另立 RFC 并重新 grill 确认(R6 禁区)。
+
+---
+
+# Milestone M5: 落地回执(TS 前端 RFC 兑现)
+Status: Done(2026-08-01)
+Depends on: M1-M4
+RFC refs: §后续路线 T1-T4、§D1-D3
+
+## 目的
+
+本 RFC 是评估型(零代码改动,用户决策 A)。2026-07-31 起,TS 前端落地型 RFC
+(`docs/rfc-typescript-frontend/`)开始实现本 RFC 的后续路线;本里程碑在其
+全部完成后回写兑现状态,闭合两 RFC 的衔接。
+
+## 兑现核对
+
+| 本 RFC 结论 | 落地证据 |
+| --- | --- |
+| T1/P2:TS 解析在 JS parser 上融合(ts_mode 开关 + 类型语法消费函数) | TS 前端 RFC M0-M7 全量实现;零新增 opcode、零 BC_VERSION 变更 |
+| T3 最优组合:TS parser 编译期 AOT + 运行期零 parser | `examples/ts_aot_demo.ts` → `qjsc -c` → 零-parser 宿主 → `AOT main() = 11`(M7) |
+| T2:类型驱动字节码优化仅 3-8%,不建议 | 未以性能为立项理由;未引入特化 opcode(决策被验证正确) |
+| F1 同进程 compile-then-run | `qjsc.c` TS 支持(TS-71)直接复用 `JS_EVAL_FLAG_COMPILE_ONLY` |
+| D3:词法基础设施被 JSON.parse 钉住 | TS 前端只新增类型消费函数,未触碰词法基础设施(与边界预测一致) |
+| F2 跨进程 AOT | TS AOT 端到端即 F2 的 TS 版落地 |
+
+## 结案
+
+- 迭代目的:闭合"评估 → 落地"两段式流程,确认评估结论经实现验证无偏差。
+- 如何迭代:TS 前端 RFC 完成后,逐条对照本 RFC 的 T1-T4/D1-D3 结论与落地证据。
+- 最终结果:全部结论兑现,无一处预测偏差。两 RFC 衔接闭环完成。

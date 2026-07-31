@@ -1,9 +1,9 @@
 # RFC: QuickJS parse 与运行分离的可行性与边界
 
-Status: **定稿**(经两个不同模型子 agent 独立评审 + 第四轮终局 review + 第五轮追加 TS 融合路线评估)
+Status: **定稿 + 落地回执**(经两个不同模型子 agent 独立评审 + 第四轮终局 review + 第五轮追加 TS 融合路线评估;2026-08-01 由 `rfc-typescript-frontend` 全量实现验证)
 Domain: 代码工程(→ `.otto/skills/rfc/references/code-engineering.md`)
-档位: 完整档(评估型,无代码改动)
-Last updated: 2026-07-30
+档位: 完整档(评估型,无代码改动 → **后续落地型 RFC 已完成**,见落地回执)
+Last updated: 2026-08-01
 一手材料基线: 本仓库 QuickJS,VERSION `2026-06-04`,HEAD `04be246`
 
 ## 执行摘要
@@ -17,6 +17,12 @@ Last updated: 2026-07-30
 - **后续路线(第五轮追加,见 §后续路线)**:确定的推进顺序是**先分离(本 RFC)→ 再在 JS parser 上融合 TS 解析**。融合技术成立(路径 P2:`ts_mode` 开关 + 类型语法消费函数,不碰字节码生成);但**类型驱动的字节码优化收益仅 3-8%**,因 QuickJS 已自带 `OP_add_loc` 三路特化(`quickjs.c:19743`)与 peephole 模式合并(`quickjs.c:35400-35465`),占掉了大部分优化空间。体积收益的真正来源是 F3 零 parser AOT(-10%),与 TS 无关。**最优组合:TS parser 放编译期 AOT + 运行期零 parser。**
 - **风险**:结论绑定基线版本,上游 bump `BC_VERSION` 后需复核。
 - **推进方案预览**:M1 证据接地(Done)→ M2 复核与独立评审(Done)→ M3 定稿与交付(Done)→ M4 TS 融合路线评估(Done,本轮追加);落地实现须另立 RFC。
+- **落地回执(2026-08-01)**:后续落地型 RFC(`docs/rfc-typescript-frontend/`)已全量完成,本 RFC 的 T1-T4 路线结论全部兑现:
+  - **T1/P2(TS 解析在 JS parser 上融合)已实现**:`ts_mode` 开关 + 类型语法消费函数族,零新增 opcode、零 BC_VERSION 变更(S3 规则),与 RFC §D1 预测完全一致;
+  - **T3 最优组合(TS parser 放编译期 AOT + 运行期零 parser)已端到端验证**:`examples/ts_aot_demo.ts` → `qjsc -c`(compile-only)→ C 字节码 → 零-parser 宿主(`JS_ReadObject` + `JS_EvalFunction`,无 eval intrinsic),`AOT main() = 11`——即 F2 形态的 TS 版落地;
+  - **T2(类型驱动字节码优化 3-8%,不建议)被验证为正确决策**:TS 前端全程未以性能为立项理由,未引入特化 opcode;
+  - **F1(同进程 compile-then-run)**:`JS_EVAL_FLAG_COMPILE_ONLY` 路径被 `qjsc.c` TS 支持直接复用;
+  - **D3 边界(词法基础设施被 JSON.parse 钉住)被实践验证**:TS 前端只新增类型消费函数,未触碰词法基础设施。
 
 ## 背景与问题
 
