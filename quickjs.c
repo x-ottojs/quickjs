@@ -41249,16 +41249,91 @@ static __exception int js_parse_ts_primary_type(JSParseState *s)
         return 0;
     }
     switch (s->token.val) {
+    case TOK_IMPORT:
+        /* TS import types: import("./mod").Member (TS 2.9) -- the
+           module specifier is a string literal; optional '.Member'
+           chain follows */
+        if (next_token(s)) /* consume 'import' */
+            return -1;
+        if (s->token.val != '(') {
+            js_parse_error(s, "expected '(' after import type");
+            return -1;
+        }
+        if (next_token(s)) /* consume '(' */
+            return -1;
+        if (s->token.val != TOK_STRING) {
+            js_parse_error(s, "expected module specifier in import type");
+            return -1;
+        }
+        if (next_token(s)) /* consume the string */
+            return -1;
+        if (s->token.val != ')') {
+            js_parse_error(s, "expected ')' in import type");
+            return -1;
+        }
+        if (next_token(s)) /* consume ')' */
+            return -1;
+        /* optional '.Member' chain */
+        while (s->token.val == '.') {
+            if (next_token(s))
+                return -1;
+            if (s->token.val != TOK_IDENT) {
+                js_parse_error(s, "expected name after '.' in import type");
+                return -1;
+            }
+            if (next_token(s))
+                return -1;
+        }
+        return 0;
     case TOK_IDENT:
         /* type name (with optional generic args) */
         return js_parse_ts_type_name(s);
     case TOK_STRING:
     case TOK_NUMBER:
-    case TOK_TEMPLATE:
-        /* literal types: string, number, template literal */
+        /* literal types: string, number */
         if (next_token(s))
             return -1;
         return 0;
+    case TOK_TEMPLATE:
+        /* template literal types: `pre-${Type}post-...` (TS 4.1).
+           The lexer tokenizes the template in segments: a
+           TOK_TEMPLATE token carries the cooked string in u.str.str
+           and the terminator in u.str.sep ('`' = end, '$' = followed
+           by '{' + expression). For a TYPE template the placeholders
+           are themselves types (e.g. ${string}), so parse each
+           placeholder with js_parse_ts_type. */
+        for (;;) {
+            if (s->token.u.str.sep == '`') {
+                if (next_token(s)) /* consume the closing backtick */
+                    return -1;
+                return 0;
+            }
+            /* sep == '$': the lexer has already consumed '${' (it
+               yields TOK_TEMPLATE with sep='$' and the NEXT token is
+               the expression/type inside the braces) -- parse the
+               placeholder type, then expect '}' and the next
+               TOK_TEMPLATE segment */
+            if (next_token(s)) /* consume the '$' template token */
+                return -1;
+            if (js_parse_ts_type(s)) /* placeholder type */
+                return -1;
+            if (s->token.val != '}') {
+                js_parse_error(s, "expected '}' in template literal type");
+                return -1;
+            }
+            /* consume '}' and resume the template: the lexer needs
+               js_parse_template_part (the same call the expression
+               template path makes at quickjs.c:25032) to re-tokenize
+               the continuation segment from buf_ptr */
+            s->buf_ptr = s->token.ptr + 1;
+            s->got_lf = FALSE;
+            if (js_parse_template_part(s, s->buf_ptr))
+                return -1;
+            if (s->token.val != TOK_TEMPLATE) {
+                js_parse_error(s, "expected template continuation");
+                return -1;
+            }
+        }
     case TOK_NULL:
     case TOK_TRUE:
     case TOK_FALSE:

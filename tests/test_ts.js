@@ -655,3 +655,19 @@ print("ALL TS TESTS PASSED");
     print(dmVersion === 1);
 }
 print("ALL TS TESTS PASSED");
+
+// B6: 模板字面量类型 + import() 类型
+{
+    type TTpl = `pre-${string}-${number}`;
+    type TTpl2 = `a${`nested-${boolean}`}b`;
+    type TImp = import("./m").Foo;
+    type TImp2 = import("./m").ns.Sub;
+    const tt: TTpl = "pre-x-1";
+    const ti: TImp = {} as any;
+    print(tt === "pre-x-1");
+    print(typeof ti === "object");
+    // 表达式模板零回归
+    var tplX = 5;
+    print(`val=${tplX}` === "val=5");
+}
+print("ALL TS TESTS PASSED");
