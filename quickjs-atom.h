@@ -279,6 +279,11 @@ DEF(Symbol_hasInstance, "Symbol.hasInstance")
 DEF(Symbol_species, "Symbol.species")
 DEF(Symbol_unscopables, "Symbol.unscopables")
 DEF(Symbol_asyncIterator, "Symbol.asyncIterator")
+/* TS: explicit resource management (TS 5.2 'using') well-known
+   symbols -- registered on the Symbol constructor's static props by
+   js_init_symbol_constructor */
+DEF(Symbol_dispose, "Symbol.dispose")
+DEF(Symbol_asyncDispose, "Symbol.asyncDispose")
 
 
 #endif /* DEF */
