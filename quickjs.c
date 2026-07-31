@@ -22354,6 +22354,23 @@ typedef struct JSTSDecoratorEntry {
        simply freed instead, see js_free_function_def). */
     JSTSTypeMeta *param_type_metas;
     int param_type_meta_count;
+    /* TS (stage3 only, JS_TS_DEC_METHOD/PROPERTY): names of the
+       hidden local variables holding this member's initializers and
+       extraInitializers arrays. Created (define_var + OP_object +
+       put_var_init) by js_ts_apply_stage3_decorators at class-tail
+       (after the class object is bound), but the ATOMS are reserved
+       during member parsing so the field-initializer rewrite inside
+       <class_fields_init> (which is emitted before the class tail)
+       can reference them; resolve_variables runs after the whole
+       parse, so forward references are fine. For JS_TS_DEC_METHOD
+       the initializers slot is unused (JS_ATOM_NULL -- tsc passes
+       null) and the extraInitializers slot is SHARED across all
+       methods of the same static-ness (tsc's single
+       _instanceExtraInitializers / _staticExtraInitializers per
+       class), so only the first method entry owns the atom (later
+       ones reuse it via js_parse_class's local). */
+    JSAtom ts3_inits_var;
+    JSAtom ts3_extras_var;
     /* ordering within the same (kind, member_name, is_static,
        param_index) group: entries are appended in source order and
        later applied in *reverse* (bottom-to-top call order per TS
@@ -24867,6 +24884,17 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
                                                       JSTSDecoratorEntry *head,
                                                       JSAtom class_var_name,
                                                       int decorator_scope_level);
+/* TS (stage3): define + initialize (as empty REAL arrays) every
+   initializers/extraInitializers hidden var of every decorated
+   member. Called from js_parse_class BEFORE the static fields-init
+   runs (static field initializers reference these arrays; static
+   fields are initialized at class-construction time, before the
+   decorator-apply point). Also called (idempotently safe) at the
+   apply point if needed. */
+static __exception int js_ts_apply_stage3_define_arrays(JSParseState *s,
+                                                        JSTSDecoratorEntry *head,
+                                                        int decorator_scope_level,
+                                                        const JSAtom method_extra[2]);
 static void js_ts_free_decorator_list(JSContext *ctx, JSTSDecoratorEntry *head);
 static BOOL js_ts_const_enum_lookup(JSParseState *s, JSAtom enum_name,
                                     JSAtom member_name, JSValue *pval);
@@ -26065,6 +26093,8 @@ static void js_ts_free_decorator_list(JSContext *ctx, JSTSDecoratorEntry *head)
         next = e->next;
         JS_FreeAtom(ctx, e->member_name);
         JS_FreeAtom(ctx, e->hidden_var_name);
+        JS_FreeAtom(ctx, e->ts3_inits_var);
+        JS_FreeAtom(ctx, e->ts3_extras_var);
         JS_FreeAtom(ctx, e->type_meta.ident_atom);
         JS_FreeAtom(ctx, e->return_type_meta.ident_atom);
         for (ti = 0; ti < e->param_type_meta_count; ti++)
@@ -26972,6 +27002,94 @@ out:
    decorators that only observe/replace values (the overwhelmingly
    common case), while addInitializer-based initializers are silently
    collected-but-not-run -- a known, recorded gap, not a crash. */
+static __exception int js_ts_apply_stage3_define_arrays(JSParseState *s,
+                                                          JSTSDecoratorEntry *head,
+                                                          int decorator_scope_level,
+                                                          const JSAtom method_extra[2])
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    JSTSDecoratorEntry *e2;
+    int ret = 0;
+    int si;
+
+    /* the shared method extraInitializers arrays are reserved
+       unconditionally (see js_parse_class): define them too, so a
+       field's initialization point can consume them safely even when
+       the class has no decorated methods (empty array = no-op) */
+    for (si = 0; si < 2; si++) {
+        JSAtom a = method_extra[si];
+        if (a == JS_ATOM_NULL)
+            continue;
+        {
+            int saved_scope = fd->scope_level;
+            int dv;
+            fd->scope_level = decorator_scope_level;
+            dv = define_var(s, fd, a, JS_VAR_DEF_LET);
+            fd->scope_level = saved_scope;
+            if (dv < 0) {
+                ret = -1;
+                goto out;
+            }
+        }
+        emit_op(s, OP_array_from);
+        emit_u16(s, 0);
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, a);
+        emit_u16(s, decorator_scope_level);
+    }
+    for (e2 = head; e2; e2 = e2->next) {
+        JSAtom arrs[2];
+        int ai;
+        arrs[0] = e2->ts3_inits_var;
+        arrs[1] = e2->ts3_extras_var;
+        for (ai = 0; ai < 2; ai++) {
+            if (arrs[ai] == JS_ATOM_NULL)
+                continue;
+            /* the shared method extras arrays were already defined
+               unconditionally above */
+            if (arrs[ai] == method_extra[0] || arrs[ai] == method_extra[1])
+                continue;
+            /* skip if already defined by an earlier entry (methods
+               share one extras array per static-ness) */
+            {
+                JSTSDecoratorEntry *e3;
+                BOOL seen = FALSE;
+                for (e3 = head; e3 != e2; e3 = e3->next) {
+                    if (e3->ts3_inits_var == arrs[ai] ||
+                        e3->ts3_extras_var == arrs[ai]) {
+                        seen = TRUE;
+                        break;
+                    }
+                }
+                if (seen)
+                    continue;
+            }
+            {
+                int saved_scope = fd->scope_level;
+                int dv;
+                fd->scope_level = decorator_scope_level;
+                dv = define_var(s, fd, arrs[ai], JS_VAR_DEF_LET);
+                fd->scope_level = saved_scope;
+                if (dv < 0) {
+                    ret = -1;
+                    goto out;
+                }
+            }
+            /* a REAL array (tsc uses [] literals): the helper calls
+               unshift/push on these, which plain OP_object-created
+               objects lack */
+            emit_op(s, OP_array_from);
+            emit_u16(s, 0);
+            emit_op(s, OP_scope_put_var_init);
+            emit_atom(s, arrs[ai]);
+            emit_u16(s, decorator_scope_level);
+        }
+    }
+out:
+    return ret;
+}
+
 static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
                                                       JSTSDecoratorEntry *head,
                                                       JSAtom class_var_name,
@@ -27000,6 +27118,15 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
         head = p;
     }
 
+    /* NOTE: the initializers/extraInitializers ARRAY CREATION no
+       longer happens here -- it moved to
+       js_ts_apply_stage3_define_arrays() (called from js_parse_class
+       BEFORE the static fields-init runs, since static field
+       initializers reference these arrays and static fields are
+       initialized at class-construction time, before this apply
+       function is reached). This function only emits the
+       __esDecorate calls, reading the arrays back. */
+
     es_dec_atom = JS_NewAtom(ctx, "__esDecorate");
     /* bridge via the predefined Object atom: resolve_variables has a
        reliable global path for predefined atoms (legacy metadata emit
@@ -27020,6 +27147,7 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
         BOOL already_done = FALSE;
         int i, group_count = 0;
 
+        
         if (e->kind != JS_TS_DEC_METHOD && e->kind != JS_TS_DEC_PROPERTY)
             continue;
 
@@ -27103,20 +27231,20 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
                    emit in that order so the array handed to
                    __esDecorate is [a, b] for '@a @b' -- the helper
                    iterates backwards (like tsc), applying b first */
-                for (i = 0; i < g; i++) {
+                                for (i = 0; i < g; i++) {
                     emit_op(s, OP_scope_get_var);
                     emit_atom(s, grp[i]->hidden_var_name);
                     emit_u16(s, fd->scope_level);
                 }
                 js_free(ctx, grp);
                 group_count = g;
-            }
-            emit_op(s, OP_array_from);
+                            }
+                        emit_op(s, OP_array_from);
             emit_u16(s, group_count);
-            emit_op(s, OP_scope_put_var_init);
-            emit_atom(s, arr_hidden);
+                        emit_op(s, OP_scope_put_var_init);
+                        emit_atom(s, arr_hidden);
             emit_u16(s, fd->scope_level);
-
+            
             /* ---- stage3 __esDecorate call: QUICKJS OPERAND ORDER ----
                QuickJS's OP_call convention (confirmed by bytecode
                debugging 2026-07-31): the CALLEE is pushed FIRST, then
@@ -27127,29 +27255,38 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
                last, which made call 6 treat the CLASS CONSTRUCTOR as
                the callee and shifted every argument by one slot
                ("TypeError: not a function" at the @dec line). */
-            /* callee: Reflect.__esDecorate (auto-init global, resolves
+                        /* callee: Reflect.__esDecorate (auto-init global, resolves
                reliably in class-tail position -- same mechanism the
                legacy metadata emit relies on) */
             emit_op(s, OP_scope_get_var);
-            emit_atom(s, refl_atom);
-            emit_u16(s, fd->scope_level);
-            emit_op(s, OP_get_field);
+                        emit_atom(s, refl_atom);
+                        emit_u16(s, fd->scope_level);
+                        emit_op(s, OP_get_field);
             emit_atom(s, es_dec_atom);
-            /* stack: [fn] */
+                        /* stack: [fn] */
 
-            /* argv[0]: ctor = the class itself (NOT its prototype) --
-               __esDecorate internally resolves target = static ?
-               ctor : ctor.prototype, exactly like tsc's call shape */
-            emit_op(s, OP_scope_get_var);
-            emit_atom(s, class_var_name);
-            emit_u16(s, fd->scope_level);
+                        /* argv[0]: ctor -- the class itself for
+               methods/accessors (__esDecorate internally resolves
+               target = static ? ctor : ctor.prototype), but NULL for
+               FIELDS: tsc emits __esDecorate(null, null, ...) for
+               fields, and passing the class would make the helper
+               defineProperty an empty descriptor onto the
+               class/prototype, creating a non-writable property that
+               later breaks the real field assignment */
+            if (e->kind == JS_TS_DEC_PROPERTY) {
+                emit_op(s, OP_null);
+            } else {
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, class_var_name);
+                emit_u16(s, fd->scope_level);
+            }
             /* argv[1]: descriptorIn = null */
             emit_op(s, OP_null);
-            /* argv[2]: decorators array (read back from hidden local) */
+                                    /* argv[2]: decorators array (read back from hidden local) */
             emit_op(s, OP_scope_get_var);
             emit_atom(s, arr_hidden);
             emit_u16(s, fd->scope_level);
-            /* argv[3]: context object -- NOTE: no OP_dup before each
+                        /* argv[3]: context object -- NOTE: no OP_dup before each
                define_field: OP_define_field pops the object+value and
                PUSHES THE OBJECT BACK (n_pop=2, n_push=1), exactly
                like a plain object literal's bytecode
@@ -27189,17 +27326,58 @@ static __exception int js_ts_apply_stage3_decorators(JSParseState *s,
             emit_op(s, OP_undefined); /* metadata */
             emit_op(s, OP_define_field);
             emit_atom(s, JS_NewAtom(ctx, "metadata"));
-            /* argv[4]: initializers (method: null; field: fresh obj) */
-            emit_op(s, OP_null);
-            /* argv[5]: extraInitializers (fresh obj) */
-            emit_op(s, OP_object);
-            /* stack: [fn, ctor, null, decs, ctx, null, extra] --
+            /* argv[4]: initializers -- field: the field's own
+               initializers array (hidden var, defined below); method:
+               null (tsc's exact shape) */
+            if (e->kind == JS_TS_DEC_PROPERTY) {
+                JSAtom iv = JS_ATOM_NULL;
+                for (cur = e; cur; cur = cur->next) {
+                    if (cur->kind == e->kind &&
+                        cur->member_name == e->member_name &&
+                        cur->is_static == e->is_static) {
+                        iv = cur->ts3_inits_var;
+                        break;
+                    }
+                }
+                if (iv == JS_ATOM_NULL) {
+                    js_parse_error(s, "internal: missing ts3 inits var (apply)");
+                    ret = -1;
+                    goto out;
+                }
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, iv);
+                emit_u16(s, fd->scope_level);
+            } else {
+                emit_op(s, OP_null);
+            }
+            /* argv[5]: extraInitializers -- this member's array
+               (methods share one per static-ness) */
+            {
+                JSAtom ev = JS_ATOM_NULL;
+                for (cur = e; cur; cur = cur->next) {
+                    if (cur->kind == e->kind &&
+                        cur->member_name == e->member_name &&
+                        cur->is_static == e->is_static) {
+                        ev = cur->ts3_extras_var;
+                        break;
+                    }
+                }
+                if (ev == JS_ATOM_NULL) {
+                    js_parse_error(s, "internal: missing ts3 extras var (apply)");
+                    ret = -1;
+                    goto out;
+                }
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, ev);
+                emit_u16(s, fd->scope_level);
+            }
+            /* stack: [fn, ctor, null, decs, ctx, inits, extra] --
                call 6: call_argv = sp-6 -> argv[0]=ctor ...
                argv[5]=extra, call_argv[-1] = fn = callee. */
-            emit_op(s, OP_call);
+                        emit_op(s, OP_call);
             emit_u16(s, 6);
             emit_op(s, OP_drop);
-
+            
             JS_FreeAtom(ctx, arr_hidden);
         }
     }
@@ -27265,6 +27443,59 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
        back after both have been popped. Captured just below, right
        before the first push_scope(). */
     int decorator_scope_level = 0;
+    /* TS (stage3 only): the "previous decorated member's
+       extraInitializers array" per static-ness, consumed (run) at the
+       next decorated FIELD's initialization point inside
+       <class_fields_init> -- mirroring tsc, which splices
+       __runInitializers(this, _prev_extraInitializers) into the next
+       field's initializer expression; a still-non-NULL entry at the
+       end of the member list is the LAST one and is run at the tail
+       of the fields-init function (or, for a class with no instance
+       fields, in a synthesized fields-init function). JS_ATOM_NULL
+       when the previous decorated member was a method (methods have
+       no initialization point; their shared extraInitializers array
+       is chained only when a following field consumes it). */
+    JSAtom ts3_prev_extra[2] = { JS_ATOM_NULL, JS_ATOM_NULL };
+    /* TS (stage3 only): shared extraInitializers array for methods,
+       one per static-ness (tsc's single _instanceExtraInitializers /
+       _staticExtraInitializers). Reserved (atom only) by the first
+       decorated method; the variable itself is defined lazily at
+       class tail by js_ts_apply_stage3_decorators. */
+    JSAtom ts3_method_extra[2] = { JS_ATOM_NULL, JS_ATOM_NULL };
+    /* set once the shared method extras array has been consumed at a
+       field initialization point (so it is not run again at the
+       fields-init tail) */
+    int ts3_method_extra_consumed[2] = { 0, 0 };
+    /* TS (stage3 only): reserve the shared method extraInitializers
+       atoms up-front, so a field's initialization point (emitted
+       while parsing fields that may PRECEDE the decorated methods)
+       can reference the array even before any method is seen. The
+       arrays are defined (empty) unconditionally by
+       js_ts_apply_stage3_define_arrays when the class has any
+       decorators -- running an empty array is a no-op, so a class
+       with only decorated fields pays one harmless empty call per
+       construction. tsc splices _instanceExtraInitializers into the
+       FIRST field's initializer regardless of method position; this
+       matches that ordering. */
+    {
+        char nb[32];
+        int si;
+        for (si = 0; si < 2; si++) {
+            snprintf(nb, sizeof(nb), "<ts3_mextra_%d>",
+                     s->ts_decorator_counter++);
+            ts3_method_extra[si] = JS_NewAtom(ctx, nb);
+            if (ts3_method_extra[si] == JS_ATOM_NULL)
+                goto fail;
+        }
+    }
+    /* reserved up-front so field initializer points (emitted while
+       parsing fields that may precede the methods) can reference the
+       shared method extraInitializers array even before any method is
+       parsed; lazily created in the method branches below on first
+       decorated method */
+    /* TS (stage3 only): atom for Object.__runInitializers (the field
+       initializer rewrite), lazily created on first use. */
+    JSAtom ts3_run_init_atom = JS_ATOM_NULL;
 
     /* classes are parsed and executed in strict mode */
     saved_js_mode = fd->js_mode;
@@ -27559,6 +27790,10 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         if (prop_type == PROP_TYPE_GET || prop_type == PROP_TYPE_SET) {
             BOOL is_set = prop_type - PROP_TYPE_GET;
             JSFunctionDef *method_fd;
+            /* TS (stage3 only): this accessor is decorated (decided
+               before the attach call below) */
+            BOOL ts3_method = (s->stage3_decorators &&
+                               pending_member_decorators != NULL);
 
             /* TS: accessors are decorated like methods (shared
                PropertyDescriptor); TS only allows the decorator on
@@ -27570,6 +27805,36 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                                             &decorator_head,
                                             JS_TS_DEC_METHOD, ctx, name,
                                             is_static);
+            if (ts3_method) {
+                /* TS (stage3): methods/accessors share ONE
+                   extraInitializers array per static-ness (tsc's
+                   _instanceExtraInitializers/_staticExtraInitializers);
+                   reserve it on first use and record it on every entry
+                   of this member. Chain it as the "previous extra" so
+                   the next decorated FIELD's initialization point runs
+                   it (methods have no initialization point of their
+                   own). */
+                JSTSDecoratorEntry *pe;
+                for (pe = decorator_head; pe; pe = pe->next) {
+                    if (pe->kind == JS_TS_DEC_METHOD &&
+                        pe->member_name == name &&
+                        pe->is_static == is_static &&
+                        pe->ts3_extras_var == JS_ATOM_NULL) {
+                        pe->ts3_extras_var =
+                            JS_DupAtom(ctx, ts3_method_extra[is_static]);
+                    }
+                }
+                /* NOTE: do NOT touch ts3_prev_extra here -- methods
+                   have no initialization point of their own; the
+                   shared method extras array is consumed at the FIRST
+                   field's initialization point (or the fields-init
+                   tail if the class has no fields), exactly like tsc
+                   splices _instanceExtraInitializers into the first
+                   field initializer. Setting prev here would clobber
+                   an earlier field's pending extras (observed bug:
+                   'extra:y' lost when a decorated method followed the
+                   last decorated field). */
+            }
 
             if (is_private) {
                 int idx, var_kind, is_static1;
@@ -27633,6 +27898,11 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         } else if (prop_type == PROP_TYPE_IDENT && s->token.val != '(') {
             ClassFieldsDef *cf = &class_fields[is_static];
             JSAtom field_var_name = JS_ATOM_NULL;
+            /* TS (stage3 only): this field is decorated (decided
+               BEFORE the attach call below, which empties
+               pending_member_decorators) */
+            BOOL ts3_field = (s->stage3_decorators &&
+                              pending_member_decorators != NULL);
 
             /* class field */
 
@@ -27644,6 +27914,40 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                                             &decorator_head,
                                             JS_TS_DEC_PROPERTY, ctx, name,
                                             is_static);
+            if (ts3_field) {
+                /* TS (stage3): reserve this field's initializers /
+                   extraInitializers hidden-var names and record them
+                   on every entry of this field (the variable itself
+                   is defined + initialized at class tail by
+                   js_ts_apply_stage3_decorators; the field-init
+                   rewrite below references the name forward, which
+                   resolve_variables resolves after the full parse). */
+                JSAtom inits, extras;
+                char nb[32];
+                JSTSDecoratorEntry *pe;
+                snprintf(nb, sizeof(nb), "<ts3_inits_%d>",
+                         s->ts_decorator_counter++);
+                inits = JS_NewAtom(ctx, nb);
+                snprintf(nb, sizeof(nb), "<ts3_extras_%d>",
+                         s->ts_decorator_counter++);
+                extras = JS_NewAtom(ctx, nb);
+                if (inits == JS_ATOM_NULL || extras == JS_ATOM_NULL) {
+                    JS_FreeAtom(ctx, inits);
+                    JS_FreeAtom(ctx, extras);
+                    goto fail;
+                }
+                for (pe = decorator_head; pe; pe = pe->next) {
+                    if (pe->kind == JS_TS_DEC_PROPERTY &&
+                        pe->member_name == name &&
+                        pe->is_static == is_static &&
+                        pe->ts3_inits_var == JS_ATOM_NULL) {
+                        pe->ts3_inits_var = JS_DupAtom(ctx, inits);
+                        pe->ts3_extras_var = JS_DupAtom(ctx, extras);
+                    }
+                }
+                JS_FreeAtom(ctx, inits);
+                JS_FreeAtom(ctx, extras);
+            }
 
             /* XXX: spec: not consistent with method name checks */
             if (name == JS_ATOM_constructor || name == JS_ATOM_prototype) {
@@ -27685,6 +27989,79 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 emit_u16(s, s->cur_func->scope_level);
             }
             s->cur_func = cf->fields_init_fd;
+            /* TS (stage3): run the PREVIOUS decorated member's
+               extraInitializers at this field's initialization point
+               (tsc splices __runInitializers(this, _prev_extra) into
+               the next field's initializer expression; the fields-init
+               function executes field initializers in declaration
+               order, so this runs after the previous member was fully
+               initialized and before this field is). The previous
+               member is a field or a method (methods have no
+               initialization point of their own, so their shared
+               extraInitializers chain is consumed here). */
+            /* TS (stage3): run pending extraInitializers at this
+               field's initialization point. Order (matching tsc): the
+               shared method extras array first (it is spliced into
+               the FIRST field's initializer), then the previous
+               member's own extras (a field's extras run at the NEXT
+               field's point). */
+            if (ts3_field) {
+            {
+                JSAtom pending_extra = JS_ATOM_NULL;
+                int order[2];
+                int oi;
+                /* method shared extras first, then prev field's */
+                order[0] = 1; order[1] = 0;
+                for (oi = 0; oi < 2; oi++) {
+                    if (order[oi] == 1) {
+                        /* consumed at the FIRST field's initialization
+                           point, regardless of where the decorated
+                           methods are declared (tsc splices
+                           _instanceExtraInitializers into the first
+                           field initializer) -- the array is always
+                           defined (empty when no decorated method),
+                           so this is a harmless no-op otherwise */
+                        if (ts3_method_extra[is_static] != JS_ATOM_NULL &&
+                            ts3_method_extra_consumed[is_static] == 0) {
+                            pending_extra = ts3_method_extra[is_static];
+                            ts3_method_extra_consumed[is_static] = 1;
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        if (ts3_prev_extra[is_static] != JS_ATOM_NULL) {
+                            pending_extra = ts3_prev_extra[is_static];
+                            ts3_prev_extra[is_static] = JS_ATOM_NULL;
+                        } else {
+                            continue;
+                        }
+                    }
+                    if (ts3_run_init_atom == JS_ATOM_NULL) {
+                        ts3_run_init_atom = JS_NewAtom(ctx, "__runInitializers");
+                        if (ts3_run_init_atom == JS_ATOM_NULL)
+                            goto fail;
+                    }
+                    /* callee: Object.__runInitializers (predefined-atom
+                       bridge, same reasoning as __esDecorate) */
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, JS_ATOM_Object);
+                    emit_u16(s, s->cur_func->scope_level);
+                    emit_op(s, OP_get_field);
+                    emit_atom(s, ts3_run_init_atom);
+                    /* argv[0]: this */
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, JS_ATOM_this);
+                    emit_u16(s, 0);
+                    /* argv[1]: pending extraInitializers array */
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, pending_extra);
+                    emit_u16(s, s->cur_func->scope_level);
+                    emit_op(s, OP_call);
+                    emit_u16(s, 2);
+                    emit_op(s, OP_drop);
+                }
+            }
+            }
             emit_op(s, OP_scope_get_var);
             emit_atom(s, JS_ATOM_this);
             emit_u16(s, 0);
@@ -27754,6 +28131,53 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 }
             }
 
+            if (ts3_field) {
+                /* TS (stage3): rewrite the field initializer into
+                   __runInitializers(this, _inits, <init>) -- the
+                   decorator-supplied init functions chain over the
+                   declared initial value (tsc's exact shape for
+                   decorated fields; for an undecorated field no code
+                   is emitted, zero cost for plain TS). Push callee +
+                   first two args BEFORE parsing the initializer so
+                   the stack order is [.., fn, this, inits, value]
+                   -> call 3 leaves [.., result]. */
+                if (ts3_run_init_atom == JS_ATOM_NULL) {
+                    ts3_run_init_atom = JS_NewAtom(ctx, "__runInitializers");
+                    if (ts3_run_init_atom == JS_ATOM_NULL)
+                        goto fail;
+                }
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, JS_ATOM_Object);
+                emit_u16(s, s->cur_func->scope_level);
+                emit_op(s, OP_get_field);
+                emit_atom(s, ts3_run_init_atom);
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, JS_ATOM_this);
+                emit_u16(s, 0);
+                {
+                    /* this field's initializers array: read the name
+                       off the first matching entry (all entries of
+                       this field share the same atoms, set at the
+                       attach site above) */
+                    JSTSDecoratorEntry *pe;
+                    JSAtom inits_var = JS_ATOM_NULL;
+                    for (pe = decorator_head; pe; pe = pe->next) {
+                        if (pe->kind == JS_TS_DEC_PROPERTY &&
+                            pe->member_name == name &&
+                            pe->is_static == is_static) {
+                            inits_var = pe->ts3_inits_var;
+                            break;
+                        }
+                    }
+                    if (inits_var == JS_ATOM_NULL) {
+                        js_parse_error(s, "internal: missing ts3 inits var");
+                        goto fail;
+                    }
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, inits_var);
+                    emit_u16(s, s->cur_func->scope_level);
+                }
+            }
             if (s->token.val == '=') {
                 if (next_token(s))
                     goto fail;
@@ -27761,6 +28185,10 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                     goto fail;
             } else {
                 emit_op(s, OP_undefined);
+            }
+            if (ts3_field) {
+                emit_op(s, OP_call);
+                emit_u16(s, 3);
             }
             if (is_private) {
                 set_object_name_computed(s);
@@ -27773,6 +28201,27 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 set_object_name(s, name);
                 emit_op(s, OP_define_field);
                 emit_atom(s, name);
+            }
+            if (ts3_field) {
+                /* TS (stage3): chain this field's extraInitializers to
+                   the next decorated member's initialization point
+                   (or the fields-init tail, see below). Read the
+                   extras name off the first matching entry. */
+                JSTSDecoratorEntry *pe;
+                JSAtom extras_var = JS_ATOM_NULL;
+                for (pe = decorator_head; pe; pe = pe->next) {
+                    if (pe->kind == JS_TS_DEC_PROPERTY &&
+                        pe->member_name == name &&
+                        pe->is_static == is_static) {
+                        extras_var = pe->ts3_extras_var;
+                        break;
+                    }
+                }
+                if (extras_var == JS_ATOM_NULL) {
+                    js_parse_error(s, "internal: missing ts3 extras var");
+                    goto fail;
+                }
+                ts3_prev_extra[is_static] = extras_var;
             }
             s->cur_func = s->cur_func->parent;
             if (js_parse_expect_semi(s))
@@ -27813,10 +28262,28 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             }
             if (func_type != JS_PARSE_FUNC_CLASS_CONSTRUCTOR &&
                 func_type != JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) {
+                BOOL ts3_method = (s->stage3_decorators &&
+                                   pending_member_decorators != NULL);
                 js_ts_attach_pending_decorators(&pending_member_decorators,
                                                 &decorator_head,
                                                 JS_TS_DEC_METHOD, ctx, name,
                                                 is_static);
+                if (ts3_method) {
+                    /* TS (stage3): same shared-extraInitializers
+                       handling as the accessor branch above */
+                    JSTSDecoratorEntry *pe;
+                        for (pe = decorator_head; pe; pe = pe->next) {
+                        if (pe->kind == JS_TS_DEC_METHOD &&
+                            pe->member_name == name &&
+                            pe->is_static == is_static &&
+                            pe->ts3_extras_var == JS_ATOM_NULL) {
+                            pe->ts3_extras_var =
+                                JS_DupAtom(ctx, ts3_method_extra[is_static]);
+                        }
+                    }
+                    /* do NOT touch ts3_prev_extra (see the accessor
+                       branch above) */
+                }
             }
             if (is_private) {
                 class_fields[is_static].need_brand = TRUE;
@@ -27994,6 +28461,67 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             cf->fields_init_fd->byte_code.buf[cf->brand_push_pos] = OP_push_true;
         }
 
+        /* TS (stage3): run the LAST decorated member's
+           extraInitializers at the tail of the fields-init function
+           (after every field initializer, before the constructor body
+           runs -- tsc emits this call at the top of the constructor
+           body, which is exactly this point in QuickJS since the
+           fields-init function is invoked by the constructor before
+           any user code). For a class with NO instance fields at all
+           (only decorated methods), synthesize the fields-init
+           function just to run the shared method extraInitializers
+           (tsc emits an explicit constructor calling
+           __runInitializers for the same purpose). */
+        /* TS (stage3): run the remaining instance extras at the tail
+           of the fields-init function (before the constructor body):
+           the last decorated field's own extras, then the shared
+           method extras if no field consumed it (class with no
+           decorated fields). tsc emits these at the top of the
+           constructor body -- exactly this point in QuickJS since
+           the fields-init function runs before any constructor code.
+           A class with NO instance fields at all (only decorated
+           methods) synthesizes the fields-init function for this. */
+        if (s->stage3_decorators &&
+            (ts3_prev_extra[0] != JS_ATOM_NULL ||
+             (ts3_method_extra[0] != JS_ATOM_NULL &&
+              !ts3_method_extra_consumed[0]))) {
+            JSAtom tail_extra[2];
+            int tail_count = 0, ti;
+            if (!cf->fields_init_fd) {
+                if (emit_class_init_start(s, cf))
+                    goto fail;
+            }
+            if (ts3_prev_extra[0] != JS_ATOM_NULL)
+                tail_extra[tail_count++] = ts3_prev_extra[0];
+            if (ts3_method_extra[0] != JS_ATOM_NULL &&
+                !ts3_method_extra_consumed[0])
+                tail_extra[tail_count++] = ts3_method_extra[0];
+            s->cur_func = cf->fields_init_fd;
+            for (ti = 0; ti < tail_count; ti++) {
+                if (ts3_run_init_atom == JS_ATOM_NULL) {
+                    ts3_run_init_atom = JS_NewAtom(ctx, "__runInitializers");
+                    if (ts3_run_init_atom == JS_ATOM_NULL)
+                        goto fail;
+                }
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, JS_ATOM_Object);
+                emit_u16(s, s->cur_func->scope_level);
+                emit_op(s, OP_get_field);
+                emit_atom(s, ts3_run_init_atom);
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, JS_ATOM_this);
+                emit_u16(s, 0);
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, tail_extra[ti]);
+                emit_u16(s, s->cur_func->scope_level);
+                emit_op(s, OP_call);
+                emit_u16(s, 2);
+                emit_op(s, OP_drop);
+            }
+            s->cur_func = s->cur_func->parent;
+            ts3_prev_extra[0] = JS_ATOM_NULL;
+            ts3_method_extra_consumed[0] = 1;
+        }
         /* store the function to initialize the fields to that it can be
            referenced by the constructor */
         var_idx = define_var(s, fd, JS_ATOM_class_fields_init,
@@ -28028,6 +28556,64 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         emit_op(s, OP_scope_put_var_init);
         emit_atom(s, class_name);
         emit_u16(s, fd->scope_level);
+    }
+
+    /* TS (stage3): define all initializers/extraInitializers arrays
+       BEFORE the static fields-init function runs (its field
+       initializer rewrites reference them; static fields are
+       initialized at class-construction time, before the decorator
+       apply point further below) */
+    if (s->stage3_decorators && decorator_head) {
+        if (js_ts_apply_stage3_define_arrays(s, decorator_head,
+                                             decorator_scope_level,
+                                             ts3_method_extra))
+            goto fail;
+    }
+    /* TS (stage3): apply decorators HERE (before the static fields
+       init runs) -- the static fields' initializer rewrites call
+       __runInitializers on arrays that __esDecorate must have filled
+       already. tsc's shape is: static block (__esDecorate fills) ->
+       static field initializers -> trailing static block (static
+       extraInitializers), so the apply point must precede the static
+       fields-init invocation below. The legacy path stays at its
+       original later position. */
+    if (s->stage3_decorators && decorator_head) {
+        if (js_ts_apply_stage3_decorators(s, decorator_head,
+                                          class_var_name,
+                                          decorator_scope_level))
+            goto fail;
+    }
+
+    /* TS (stage3): run the LAST decorated static member's
+       extraInitializers at the tail of the static fields-init
+       function (tsc's static block; a class with no static fields
+       but decorated static methods leaves the chain to
+       js_ts_apply_stage3_decorators, which runs it at class tail) */
+    if (s->stage3_decorators && ts3_prev_extra[1] != JS_ATOM_NULL &&
+        class_fields[1].fields_init_fd != NULL) {
+        ClassFieldsDef *cf = &class_fields[1];
+        s->cur_func = cf->fields_init_fd;
+        if (ts3_run_init_atom == JS_ATOM_NULL) {
+            ts3_run_init_atom = JS_NewAtom(ctx, "__runInitializers");
+            if (ts3_run_init_atom == JS_ATOM_NULL)
+                goto fail;
+        }
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, JS_ATOM_Object);
+        emit_u16(s, s->cur_func->scope_level);
+        emit_op(s, OP_get_field);
+        emit_atom(s, ts3_run_init_atom);
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, JS_ATOM_this);
+        emit_u16(s, 0);
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, ts3_prev_extra[1]);
+        emit_u16(s, s->cur_func->scope_level);
+        emit_op(s, OP_call);
+        emit_u16(s, 2);
+        emit_op(s, OP_drop);
+        s->cur_func = s->cur_func->parent;
+        ts3_prev_extra[1] = JS_ATOM_NULL;
     }
 
     /* initialize the static fields */
@@ -28106,12 +28692,49 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
            returns a replacement constructor). */
         if (decorator_head) {
             if (s->stage3_decorators) {
-                /* TS stage-3 semantics (like tsc
-                   experimentalDecorators=false) */
-                if (js_ts_apply_stage3_decorators(s, decorator_head,
-                                                  class_var_name,
-                                                  decorator_scope_level))
-                    goto fail;
+                /* TS stage-3 semantics: __esDecorate calls were
+                   emitted before the static fields-init (see above) */
+                /* TS (stage3): run the static members' remaining
+                   extraInitializers at class tail (tsc's trailing
+                   static block): the shared static-method extras
+                   array when no static field consumed it (class with
+                   decorated static methods but no static fields), and
+                   any last static field's own extras. 'this' at class
+                   tail is the class object itself. */
+                if (ts3_prev_extra[1] != JS_ATOM_NULL ||
+                    (ts3_method_extra[1] != JS_ATOM_NULL &&
+                     !ts3_method_extra_consumed[1])) {
+                    JSAtom tail_extra[2];
+                    int tail_count = 0, ti;
+                    if (ts3_prev_extra[1] != JS_ATOM_NULL)
+                        tail_extra[tail_count++] = ts3_prev_extra[1];
+                    if (ts3_method_extra[1] != JS_ATOM_NULL &&
+                        !ts3_method_extra_consumed[1])
+                        tail_extra[tail_count++] = ts3_method_extra[1];
+                    for (ti = 0; ti < tail_count; ti++) {
+                        if (ts3_run_init_atom == JS_ATOM_NULL) {
+                            ts3_run_init_atom = JS_NewAtom(ctx, "__runInitializers");
+                            if (ts3_run_init_atom == JS_ATOM_NULL)
+                                goto fail;
+                        }
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, JS_ATOM_Object);
+                        emit_u16(s, fd->scope_level);
+                        emit_op(s, OP_get_field);
+                        emit_atom(s, ts3_run_init_atom);
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, class_var_name);
+                        emit_u16(s, fd->scope_level);
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, tail_extra[ti]);
+                        emit_u16(s, fd->scope_level);
+                        emit_op(s, OP_call);
+                        emit_u16(s, 2);
+                        emit_op(s, OP_drop);
+                    }
+                    ts3_prev_extra[1] = JS_ATOM_NULL;
+                    ts3_method_extra_consumed[1] = 1;
+                }
             } else {
                 /* legacy experimentalDecorators semantics (M6a) */
                 if (js_ts_apply_decorators(s, decorator_head, class_var_name))

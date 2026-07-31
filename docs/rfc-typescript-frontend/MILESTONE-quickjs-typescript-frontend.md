@@ -498,8 +498,8 @@ TODO refs: TS-60 ~ TS-63
 
 
 # Milestone M6b: 装饰器 stage 3 (标准生态)
-Status: **Done(TS-66/TS-68) + Partial(TS-67 范围限制)**
-Progress: 90%
+Status: **Done(TS-66/TS-67/TS-68)**
+Progress: 100%
 Depends on: M6a
 RFC refs: §D3.4
 TODO refs: TS-66 ~ TS-68
@@ -530,7 +530,8 @@ TODO refs: TS-66 ~ TS-68
 
 - 迭代目的：stage3 装饰器标准生态支持（对齐现代 TS 项目）。
 - 现状：C helper 与 emit 层全部打通，`--ts-stage3` 全场景（方法/属性/静态/多装饰器/顺序/替换/context）验证通过，`tests/test_ts_stage3.js` 挂入 make test 全绿，内存无泄漏。
-- 已知限制（记录，非隐藏）：字段初始化改写与构造函数 extraInitializers 注入未实现（addInitializer 收集但不运行）；`accessor` 关键字未实现；metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
+- **TS-67 补完（A1，2026-07-31）**：字段初始化改写（`x = __runInitializers(this, _inits, init)`）、构造函数 extraInitializers 注入（fields_init 末尾）、静态 extra（类尾）、方法共享 `_instanceExtraInitializers`（第一个字段初始化点消费，tsc 语义）全部实现，与真实 tsc 逐字符对照一致。修复 4 类真实 bug：①fields_init_fd 内用外层 scope_level 导致 resolve_scope_var 越界死循环（sample 抓栈定位）②数组必须 `OP_array_from 0`（OP_object 无 unshift/push）③字段装饰器 ctor 必须传 null（传类导致 defineProperty 污染类对象）④方法 extra 覆盖字段 prev（共享 extras 数组改为开头预留 + 无条件定义）。
+- 已知限制（记录，非隐藏）：`accessor` 关键字未实现；metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
 
 # Milestone M7: 集成与端到端
 Status: **Done(TS-70/TS-71/TS-72)**

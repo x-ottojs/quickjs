@@ -4114,6 +4114,12 @@ static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
 static JSValue js_ts_run_initializers(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv)
 {
+        {
+        JSValue lv = JS_GetPropertyStr(ctx, argv[1], "length");
+        uint32_t ln = 0;
+        JS_ToUint32(ctx, &ln, lv);
+                JS_FreeValue(ctx, lv);
+    }
     /* function(thisArg, initializers[, value]) {
          var useValue = arguments.length > 2;
          for (var i = 0; i < initializers.length; i++)
@@ -4129,7 +4135,7 @@ static JSValue js_ts_run_initializers(JSContext *ctx, JSValueConst this_val,
 
     if (use_value)
         value = argv[2];
-    ret = JS_GetPropertyStr(ctx, init_array, "length");
+    ret = JS_GetPropertyStr(ctx, argv[1], "length");
     if (JS_IsException(ret))
         return JS_EXCEPTION;
     if (JS_ToUint32(ctx, &len, ret)) {
@@ -4207,7 +4213,7 @@ static int js_ts_copy_own_props(JSContext *ctx, JSValue dst, JSValue src)
 static JSValue js_ts_es_decorate(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
-    /* function(ctor, descriptorIn, decorators, contextIn, initializers,
+        /* function(ctor, descriptorIn, decorators, contextIn, initializers,
                 extraInitializers) { ... } -- full semantics reproduced
        from tsc's __esDecorate.
        REFERENCE-COUNTING CONTRACT (verified against quickjs.c):
@@ -4569,9 +4575,15 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
         /* JS_SetPropertyStr CONSUMES its value argument on every path
            (success or failure) -- do NOT JS_FreeValue(fn) after it */
         JSValue o = JS_GetPropertyStr(ctx, global_obj, "Object");
-        JSValue fn = JS_GetPropertyStr(ctx, global_obj, "__esDecorate");
-        if (!JS_IsException(o) && JS_IsObject(o) && !JS_IsException(fn))
-            JS_SetPropertyStr(ctx, o, "__esDecorate", fn);
+        JSValue fn;
+        if (!JS_IsException(o) && JS_IsObject(o)) {
+            fn = JS_GetPropertyStr(ctx, global_obj, "__esDecorate");
+            if (!JS_IsException(fn))
+                JS_SetPropertyStr(ctx, o, "__esDecorate", fn);
+            fn = JS_GetPropertyStr(ctx, global_obj, "__runInitializers");
+            if (!JS_IsException(fn))
+                JS_SetPropertyStr(ctx, o, "__runInitializers", fn);
+        }
         JS_FreeValue(ctx, o);
     }
 
