@@ -533,7 +533,15 @@ TODO refs: TS-66 ~ TS-68
 - **TS-67 补完（A1，2026-07-31）**：字段初始化改写（`x = __runInitializers(this, _inits, init)`）、构造函数 extraInitializers 注入（fields_init 末尾）、静态 extra（类尾）、方法共享 `_instanceExtraInitializers`（第一个字段初始化点消费，tsc 语义）全部实现，与真实 tsc 逐字符对照一致。修复 4 类真实 bug：①fields_init_fd 内用外层 scope_level 导致 resolve_scope_var 越界死循环（sample 抓栈定位）②数组必须 `OP_array_from 0`（OP_object 无 unshift/push）③字段装饰器 ctor 必须传 null（传类导致 defineProperty 污染类对象）④方法 extra 覆盖字段 prev（共享 extras 数组改为开头预留 + 无条件定义）。
 - **accessor 关键字（A2，2026-07-31）**：`@dec accessor x = 10` 完整实现——backing 私有字段（`#x<accessor>`）+ 合成 get/set 函数（`js_new_function_def` + 手工 emit `scope_get/put_private_field`）+ kind="accessor" 装饰（C helper is_accessor 分支） + init 链/extra 链（复用 A1 机制）。消歧：`accessor` 后跟 `;`/`}`/`(`/`=` 时是普通字段名。顺带修复 A1 隐藏 bug：prev extra 消费扩展到**未装饰**字段/accessor（tsc 语义：`plain = (__runInitializers(this, _a_extraInitializers), 5)`）。与真实 tsc 逐字符一致。
 - **abstract 类/成员（B1，2026-07-31，RFC 范围外补充）**：`abstract class` / `abstract m(): T;` / `abstract get/set` / `abstract field` 纯擦除实现——abstract class 即普通 class（tsc 语义），abstract 成员完全删除（消费参数表/类型注解/`;`，零字节码）。消歧：`abstract` 后跟 `;`/`}`/`(`/`=` 为普通标识符（字段/方法名）。识别用 buf_ptr 文本匹配（peek_token 对关键字返回 TOK_IDENT——S9(b) 陷阱）。与 tsc 输出一致。
-- **`using` 声明（B2，2026-08-01，TS 5.2 显式资源管理）——已回滚**：`Symbol.dispose`/`Symbol.asyncDispose` 注册**保留**（无害）；`js_parse_ts_using` 的手写 try/finally 字节码**回滚**——**缺陷**：无 return 的函数体触发检查器 `inconsistent stack size`（OP_catch 标签处 goto 栈与 fallthrough 差 1：first=3 now=2），根因是 `emit_goto(OP_catch)` 前有 6 字节来源不明的常量（两个 push_i16 式指令），在预算内未定位。**教训**：手写 try/finally 必须完全复刻 TOK_TRY 的 emit 路径（js_parse_block + push_break_entry + label_catch/label_finally 布局），或采用 tsc 式 helper（__addDisposableResource/__disposeResources C 实现）。现状：`using` 明确报"not supported (rolled back)"，不崩溃。
+- **`using` 声明（B2，2026-08-01，TS 5.2 显式资源管理）——第六次尝试成功**：`using Name = expr;` 编译为原生 try/finally（不引入 tsc helper）。**成功关键**（前五次失败的根因）：
+  1. **`TOK_IDENT = -125`**（负值！）——`using`/`a` 的 token 完全正常，-125 之谜是枚举误读
+  2. **try 体必须 push_scope/pop_scope 配对**（如 js_parse_block）——缺失导致检查器基线破坏
+  3. **finally 体入口值（undefined/catch offset）留在栈底**，gosub 调用方在 OP_ret 后 drop（TOK_TRY 形态）——开头 drop 会弹掉返回地址（"invalid ret value"）
+  4. **finally 体的变量读取用 try 体 scope**（pop_scope 后 fd->scope_level 已恢复外层）
+  5. **js_parse_ts_using 开头先消费 `using`**（调用方留下它）
+  - 语义：LIFO（嵌套 try 天然）、异常路径（dispose 后 rethrow）、块作用域、嵌套 using、消歧（`using` 后跟标识符/`[`/`{` 才是声明）——与真实 tsc 逐字符一致（`d:b d:a caught:boom after`）
+  - 已知差异（记录）：非 dispose 值（null/undefined/数字）在 dispose 时抛 TypeError（tsc helper 静默跳过——TS 类型系统禁止，已记录）；`await using` 未实现（async disposal 需 async 上下文机制）
+  - `Symbol.dispose`/`Symbol.asyncDispose` 注册（前次保留）
 - 已知限制（记录，非隐藏）：metadata 字段为 undefined（QuickJS 无 Symbol.metadata，与 tsc 在无该符号运行时一致）。
 
 # Milestone M7: 集成与端到端

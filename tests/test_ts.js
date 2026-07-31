@@ -568,3 +568,31 @@ print("ALL TS TESTS PASSED");
 print("ALL TS TESTS PASSED");
 
 print("ALL TS TESTS PASSED");
+
+// B2: using 声明 (TS 5.2 显式资源管理)
+{
+    function mkRes(name) {
+        return { [Symbol.dispose]() { print("d:" + name); }, name };
+    }
+    function usingF() {
+        using ua = mkRes("a");
+        using ub = mkRes("b");
+        print("using-body");
+    }
+    usingF(); // 期望: using-body, d:b, d:a (LIFO)
+    function usingThrow() {
+        using ua = mkRes("t");
+        throw new Error("boom");
+    }
+    try { usingThrow(); } catch (e) { print("caught:" + e.message); }
+    function usingBlock() {
+        { using ua = mkRes("in"); print("inner"); }
+        print("outer");
+    }
+    usingBlock(); // 期望: inner, d:in, outer
+    var using = 5; // 消歧
+    print(using === 5);
+    print(typeof Symbol.dispose === "symbol");
+    print(typeof Symbol.asyncDispose === "symbol");
+}
+print("ALL TS TESTS PASSED");

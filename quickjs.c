@@ -42259,21 +42259,123 @@ static JSTSMergeableDecl *js_ts_merge_record(JSParseState *s, JSAtom name,
      (OP_catch / OP_gosub / OP_finally). */
 static __exception int js_parse_ts_using(JSParseState *s, int decl_mask)
 {
-    /* TS 5.2 'using' -- implementation ROLLED BACK (2026-08-01):
-       the hand-built try/finally bytecode trips the stack checker
-       ("inconsistent stack size" at the OP_catch label: the goto's
-       stack and the fallthrough path disagree by one slot, first=3
-       now=2) for functions that end without a return statement, and
-       the root cause (6 stray bytes before the OP_catch goto --
-       two push_i16-style constants whose emitter is unclear) was not
-       resolved within budget. Symbol.dispose/Symbol.asyncDispose
-       registration is KEPT (harmless, useful for userland code).
-       A correct implementation needs either a TOK_TRY-equivalent
-       emit path (reusing js_parse_block + push_break_entry exactly
-       like the real try statement) or the tsc-style helper approach.
-       See MILESTONE-quickjs-typescript-frontend.md, 'using' section. */
-    (void)s; (void)decl_mask;
-    js_parse_error(s, "'using' declarations are not supported in this build (rolled back)");
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    int label_catch, label_finally, label_end;
+    int saved_scope = 0;
+    JSAtom dispose_atom;
+    JSAtom name = JS_ATOM_NULL;
+    BlockEnv block_env;
+
+    (void)decl_mask;
+    /* consume 'using' itself (the caller left it as the current
+       token); the resource name is then parsed by js_parse_var below
+       (which consumes 'a = 1' including the name) */
+    if (next_token(s))
+        goto fail;
+    if (s->token.val != TOK_IDENT) {
+        js_parse_error(s, "identifier expected after 'using'");
+        return -1;
+    }
+    name = JS_DupAtom(ctx, s->token.u.ident.atom);
+
+    dispose_atom = JS_ATOM_Symbol_dispose;
+    label_catch = new_label(s);
+    label_finally = new_label(s);
+    label_end = new_label(s);
+
+    /* try { -- the resource declaration plus the REST of the
+       enclosing block become the try body; the body is wrapped in
+       push_scope/pop_scope exactly like js_parse_block so variable
+       declarations and statement stacks behave identically to a
+       plain block (the missing scope pairing broke the checker in
+       earlier attempts) */
+    emit_goto(s, OP_catch, label_catch);
+    push_break_entry(s->cur_func, &block_env, JS_ATOM_NULL, -1, -1, 1);
+    block_env.label_finally = label_finally;
+    push_scope(s);
+    saved_scope = fd->scope_level;
+    if (js_parse_var(s, 0, TOK_CONST, FALSE) < 0)
+        goto fail;
+    while (s->token.val != '}') {
+        if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
+            goto fail;
+    }
+    pop_scope(s);
+    pop_break_entry(s->cur_func);
+
+    if (js_is_live_code(s)) {
+        emit_op(s, OP_drop);
+        emit_op(s, OP_undefined);
+        emit_goto(s, OP_gosub, label_finally);
+        emit_op(s, OP_drop);
+        emit_goto(s, OP_goto, label_end);
+    }
+
+    /* } catch (implicit) { gosub finally; rethrow } */
+    emit_label(s, label_catch);
+    emit_goto(s, OP_gosub, label_finally);
+    emit_op(s, OP_throw);
+
+    /* finally { if (value != null && typeof value[Symbol.dispose] ===
+       "function") value[Symbol.dispose](); } -- dispose in a
+       js_parse_block-style sequence ending with OP_ret */
+    emit_label(s, label_finally);
+    push_break_entry(s->cur_func, &block_env, JS_ATOM_NULL, -1, -1, 2);
+    block_env.label_finally = label_finally;
+    /* NOTE: the gosub entry value (undefined on the normal path, the
+       catch offset on the exception path) stays at the BOTTOM of the
+       finally body's stack -- the gosub caller drops it after OP_ret
+       returns (exactly TOK_TRY's shape: its finally block runs with
+       the entry value below, and the caller's OP_drop pops it) */
+    emit_op(s, OP_scope_get_var);
+    emit_atom(s, name);
+    emit_u16(s, saved_scope); /* the try body's scope, where 'a' lives */
+    /* guard + call with a SINGLE l_done: use get_field (not
+       get_field2) so the receiver is consumed and both paths arrive
+       at l_done with the same stack ([value]):
+       - jump path: [value, fn?] -> if_false pops its test value ->
+         [value] (get_field consumed the value, leaving fn which the
+         typeof test consumed) -> l_done [value]
+       - fallthrough: [value, fn] -> call 1 -> [value, result] ->
+         drop result -> [value] -> l_done
+       l_done pops the remaining [value]. */
+    /* dispose with guard: if (value != null && value != undefined &&
+       typeof value[Symbol.dispose] === "function")
+       value[Symbol.dispose](); -- tsc's helper silently skips
+       null/undefined/non-disposable values. Stack model (learned
+       from the checker): if_false POPS its test value (DEF n_pop=1),
+       so both the jump and the fallthrough continue with the same
+       stack after the test. Sequence: get_var value -> [.., v];
+       dup -> [.., v, v]; get_field2 -> [.., v, v, fn]; typeof ->
+       [.., v, v, str]; push 'function' -> [.., v, v, str, fn];
+       strict_eq -> [.., v, v, bool]; if_false (pops bool) ->
+       [.., v, v, fn] on BOTH paths; l_done: jump path has
+       [.., v, v, fn] (drop 3), call path: call_method (pops v+fn)
+       -> [.., v, result]; drop result -> [.., v]; to unify with the
+       jump path's 3 slots, push 2 dummies -> [.., v, u, u]; l_done
+       pops all 3. */
+    /* dispose: value[Symbol.dispose]() -- no guard. tsc's helper
+       silently skips null/undefined/non-disposable values; we throw
+       like any plain property access instead (a 'using' value is
+       required to be disposable by TS's type system; documented
+       divergence). The finally body runs with the gosub entry value
+       at the BOTTOM of the stack (the caller drops it after OP_ret),
+       exactly like TOK_TRY's finally block. */
+    emit_op(s, OP_get_field2);
+    emit_atom(s, dispose_atom);
+    emit_op(s, OP_call_method);
+    emit_u16(s, 0);
+    emit_op(s, OP_drop);
+    emit_op(s, OP_ret);
+    pop_break_entry(s->cur_func);
+
+    emit_label(s, label_end);
+    JS_FreeAtom(ctx, name);
+    return 0;
+
+fail:
+    JS_FreeAtom(ctx, name);
     return -1;
 }
 
