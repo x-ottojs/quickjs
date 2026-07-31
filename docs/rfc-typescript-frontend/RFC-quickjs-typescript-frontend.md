@@ -311,3 +311,14 @@ B1(可擦除)与 B2(生成代码)风险量级不同:B1 局限于 parser 层;B2 �
 9. **非目标显式化**:JSX/`.tsx` 整体不支持、CommonJS 互操作语法不支持、三斜线指令不支持,并记录兼容损失。
 
 **评审确认无误的部分**:emit 原语齐备(不需新 opcode)、里程碑 DAG 无环、零回归策略可执行(test262 比对机制真实存在)、伪关键字方案安全(`enum`/`interface` 本已是保留字,`as` atom 已存在)。
+
+---
+
+## 实现勘误(里程碑落地修订,非评审发现)
+
+M7 集成实现中发现的 4 个真实缺口,均属"设计正确但实现层遗漏/误判",记录如下供后续里程碑对照:
+
+1. **保留字 token 陷阱(扩展 S9 规则族)**:`interface`/`enum`/`implements` 在 QuickJS 是**保留 token**(`TOK_INTERFACE`/`TOK_ENUM`/`TOK_IMPLEMENTS`,quickjs.c:21865 关键字表),而 `declare`/`namespace`/`type`/`satisfies` 是普通标识符。D2 的伪关键字方案(S9(a))只覆盖了标识符类——**凡做 TS 关键字分发,必须先查关键字表确认 token 类型**,混合使用 `s->token.val == TOK_X`(保留字)与 `js_ts_is_pseudo_keyword_str()`(标识符),否则分支静默不命中、报错位置漂移到后续 token,极难排查。新增规则 **S9(d)**。
+2. **postfix 级操作符必须放 postfix 循环**:TS 非空断言 `!` 最初放在 coalesce 层(D2.2 设计),`get()!.length` 链式访问解析失败(`!` 消费后无法继续 `.member`)。M7 移到 postfix 主循环(TOK_QUESTION_MARK_DOT 分支前)修复——**凡"作用于表达式且后随后缀链"的 TS 操作符,优先级必须不低于 postfix**。
+3. **模块 loader 的 TS flag**:前置 RFC 的 F2/F3 只规划了宿主 eval 路径,`js_module_loader`(quickjs-libc.c)编译 import 的模块时**未传 `JS_EVAL_FLAG_TS`**——跨文件 `.ts` import 链全部按纯 JS 编译。M7 按扩展名自动加 flag 修复。
+4. **`export enum` 需真实运行时导出**:D3.3 规定 enum 生成对象+反向映射(有运行时值),但 `js_parse_export` 的类型导出分支初版把 enum 与 interface 一起按"纯类型"处理——修正为 `add_export_entry` 注册真实导出。凡**生成运行时值的声明**,export 必须走值导出路径。

@@ -52,13 +52,20 @@ Last updated: 2026-07-30
 | TS-64 | Done | 100 | Pass | `quickjs.c` `js_ts_classify_type_range`/`js_ts_emit_metadata_apply` | `emitDecoratorMetadata`:`design:type`/`design:paramtypes`/`design:returntype`,受限类型序列化(8种基础类型+数组+函数+裸标识符精确映射,其余Object兜底) | RFC §D3.4、S2 | 用真实tsc验证全部规则;修复2个真实bug(attach时序/隐式构造函数误判);子agent评审三次基础设施故障失败,改主会话自主核对 |
 | TS-65 | Done | 100 | Pass | `tests/test_ts.js` | M6a + metadata 单测(200+行) | RFC §验证策略 | 与真实tsc交叉验证;30+场景;内存无泄漏 |
 | **M6b · 装饰器 stage 3(后续,标准生态)** | | | | | | | |
-| TS-66 | Not Started | 0 | Not Run | `quickjs.c` | stage3 装饰器:`(value, context)` 签名 + context 对象(kind/name/static/private/access) | RFC §D3.4 | — |
-| TS-67 | Not Started | 0 | Not Run | `quickjs.c` | `addInitializer` + `accessor` 关键字(auto-accessor) | RFC §D3.4 | — |
-| TS-68 | Not Started | 0 | Not Run | `tests/` | M6b 单测 + 与 M6a 的开关切换验证 | RFC §验证策略 | — |
+| TS-66 | Partial | 50 | Partial | `quickjs.c` `js_ts_apply_stage3_decorators`、`quickjs-libc.c` `js_ts_es_decorate` | stage3 装饰器:`(value, context)` 签名 + context 对象(kind/name/static/private/access) + `__esDecorate`/`__runInitializers` C helper(6参数调用形状复刻tsc) | RFC §D3.4 | **C helper 完成并经直接JS调用全场景验证**(方法/字段/类/addInitializer/init链);emit层生成字节码运行时崩溃(`TypeError: not a function`,C helper从未被调用)——排查记录:字节码dump栈平衡正确、`Reflect.__esDecorate`运行时存在、class收尾全局解析可用(`print`调试通过),疑点集中在 `get_var Reflect` 的 closure_var 解析(与 `get_var print` 疑似共享索引),需干净上下文重审 |
+| TS-67 | Not Started | 0 | Not Run | `quickjs.c` | `addInitializer` 收集已实现(C helper push 进 extraInitializers)但**运行缺口**:字段初始化改写/构造函数 extraInitializers 注入未实现(已知范围限制);`accessor` 关键字未实现 | RFC §D3.4 | 已记录为已知缺口,非崩溃 |
+| TS-68 | Not Started | 0 | Not Run | `tests/` | M6b 单测 + 与 M6a 的开关切换验证(`--ts-stage3` CLI 已就绪,默认 legacy) | RFC §验证策略 | 依赖 TS-66 emit 修复 |
 | **M7 · 集成与端到端** | | | | | | | |
-| TS-70 | Not Started | 0 | Not Run | `qjs.c`, `qjsc.c` | `.ts` 文件扩展名自动识别 + CLI 开关 | RFC §目标 | — |
-| TS-71 | Not Started | 0 | Not Run | `quickjs.c` AOT 链路 | 与前置 RFC F2/F3 组合:TS 编译期 AOT + 运行期零 parser | 前置 RFC §T3 | — |
-| TS-72 | Not Started | 0 | Not Run | `tests/`, `examples/` | 端到端串联用例(仅本里程碑允许)+ 用户可跑 Example | 核心·推进路径约束 | — |
+| TS-70 | Done | 100 | Pass | `qjs.c`, `quickjs-libc.c` | `.ts` 文件扩展名自动识别(qjs eval_file + js_module_loader 均自动加 `JS_EVAL_FLAG_TS`)+ CLI 开关 | RFC §目标 | 跨文件 import 链/循环导入全通过 |
+| TS-71 | Partial | 60 | Partial | `qjsc.c` | AOT 链路:qjs 运行期已验证(端到端 e2e 覆盖 M1-M6a 全特性),**qjsc 编译器未加 TS flag** | 前置 RFC §T3 | qjsc.c 无 `JS_EVAL_FLAG_TS`,待补 |
+| TS-72 | Done | 100 | Pass | `tests/test_ts.js`, `tests/test_ts_module.ts` | 端到端串联用例 + 模块链套件 + make test 挂载 | 核心·推进路径约束 | M7 顺带修复4个真实缺口:export interface/enum 保留字token判断、implements 子句、链式 `!` 断言、模块loader TS flag |
+
+## M7 集成修复记录(4个真实缺口)
+
+1. **`.ts` 扩展名自动识别**:`qjs.c eval_file` + `quickjs-libc.c js_module_loader` 双路径加 `JS_EVAL_FLAG_TS`——import 链跨 .ts 文件工作
+2. **`export interface`/`export enum`**:`interface`/`enum` 是 QuickJS **保留 token**(TOK_INTERFACE/TOK_ENUM,见 quickjs.c:21865 关键字表),`js_ts_is_pseudo_keyword_str()`(要求 TOK_IDENT)永远 FALSE——改为 token 值判断;`export enum` 需注册真实运行时导出(enum 有反向映射对象)
+3. **`class X implements A, B`**:TOK_IMPLEMENTS 保留 token,消费后 `js_parse_ts_type` 逐个解析(纯类型无运行时效应)
+4. **链式非空断言 `get()!.length`**:`!` 从 coalesce 层移到 **postfix 循环**(TOK_QUESTION_MARK_DOT 分支前),断言后 continue 让 `.member`/`()` 继续解析
 
 ## 状态说明
 

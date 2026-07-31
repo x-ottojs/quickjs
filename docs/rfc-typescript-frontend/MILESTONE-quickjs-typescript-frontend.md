@@ -497,14 +497,75 @@ TODO refs: TS-60 ~ TS-63
 ---
 
 
+# Milestone M6b: 装饰器 stage 3 (标准生态)
+Status: **Partial(C helper 完成并验证 / emit 层未完成)**
+Progress: 50%
+Depends on: M6a
+RFC refs: §D3.4
+TODO refs: TS-66 ~ TS-68
+
+## 目标与非目标
+
+- 目标：TC39 stage3 装饰器 `(value, context)` 语义，与 legacy（M6a）通过 CLI 开关并存（`--ts-stage3`，默认 legacy，对齐 tsc `experimentalDecorators`）。
+- 范围限制（用户 grill 确认）：字段初始化改写（tsc `__runInitializers` 包装）与构造函数 extraInitializers 注入未实现——addInitializer 收集但不运行（已知缺口，非崩溃）。
+
+## 实现
+
+1. **C helper（完成，验证通过）**：`quickjs-libc.c` 实现 `__esDecorate`/`__runInitializers`，6 参数调用形状完整复刻 tsc（ctor/descriptorIn/decorators/contextIn/initializers/extraInitializers）；context 支持 kind=method/field/accessor/getter/setter/class；`context.addInitializer` 经 `JS_NewCFunctionData` 闭包 push 进 extraInitializers。**直接 JS 调用全场景验证通过**（方法/字段/类装饰器、addInitializer、init 链、descriptor 更新、类替换）。
+2. **引用计数契约（本次调试核心收获）**：`JS_GetProperty`/`JS_GetGlobalObject`/`JS_New*`/`JS_Call` 返回新引用归调用者；`JS_SetProperty(Str)` 消费值参数（所有路径）；`JS_Call` 不消费 argv（COPY_ARGV）；`JS_GetOwnPropertyNames` 返回 atom 须逐个 `JS_FreeAtom`；**`JS_GetGlobalObject` 返回值必须显式 `JS_FreeValue`**（漏释放泄漏整个对象图，曾表现为 552 个对象假泄漏 + 断言崩溃）。
+3. **CLI 链路（完成）**：`JS_EVAL_FLAG_TS_STAGE3 (1<<9)` + `JSParseState.stage3_decorators` + `qjs --ts-stage3` + `js_parse_class` 应用点分支（stage3 走 `js_ts_apply_stage3_decorators`，跳过 legacy 两函数）。
+4. **emit 层（未完成）**：`js_ts_apply_stage3_decorators` 生成 `__esDecorate` 调用字节码——context 对象构建（kind/name/static/private/access/metadata 七字段）、decorators 数组打包存隐藏变量、6 参数按 argv 顺序 push、callee 经 `Reflect.__esDecorate` 获取。**运行时报 `TypeError: not a function`（at @dec 行），C helper 从未被调用**。
+
+## 未解决 bug 排查记录（供干净上下文重审）
+
+- 字节码 dump 逐行核对：栈平衡正确、参数顺序正确（argv[0]=ctor...argv[5]=extra）、`array_from` 后立即 `put_var_init` 存隐藏变量
+- `Reflect.__esDecorate` 运行时存在且为 function；class 收尾的全局解析验证可用（`get_var print` + call 调试打印成功）
+- C helper 入口打印从未出现 → `call 6` 的 callee（`get_field __esDecorate` 结果）运行时非函数
+- **最大疑点**：`get_var N: Reflect` 与主流程 `get_var N: print` 疑似**共享 closure_var 索引**（不同 dump 中均见索引 4/5 附近的相邻分配）——`get_field` 在错误对象上读 `__esDecorate` 得 undefined → call undefined → "not a function"。需验证 `resolve_variables` 对动态 atom（`JS_NewAtom("Reflect")`）的 `JS_CLOSURE_GLOBAL` fallback 去重是否按 atom 正确进行
+- 已尝试且无效：预定义 atom 替代动态 atom（atom.h 末尾新增 7 个 atom）；不释放 `refl_atom`/`es_dec_atom`；`get_var globalThis`/`Object`/`Reflect` 三种桥接对象
+- 已提交为 wip commit（`023f99e`/`5af95d9`/`06b2322`），双端均已推送（JD 为 weiyanhai 版）
+
+## 结案
+
+- 迭代目的：stage3 装饰器标准生态支持（对齐现代 TS 项目）。
+- 现状：C helper 与开关链路就绪且验证；emit 层 1 个运行时 bug 未解（已记录全部线索）。**M6b 标记为未完成**，不阻塞 M7（已完成）与 legacy 路径（零回归）。
+- 建议：新会话/干净上下文重审 emit 层，优先验证 closure_var 索引疑点。
+
 # Milestone M7: 集成与端到端
-Status: Not Started
-Progress: 0%
+Status: **Done(TS-70/TS-72) + Partial(TS-71 qjsc)**
+Progress: 80%
 Depends on: M1-M6 全部
 RFC refs: §目标、前置 RFC §T3
-Context budget: 约 60k / 120k
 TODO refs: TS-70 ~ TS-72
 
-`.ts` 扩展名识别 + CLI 开关(`qjs.c`/`qjsc.c`);与前置 RFC F2/F3 组合实现"TS 编译期 AOT + 运行期零 parser"。
+## 目标与非目标
 
-**唯一允许端到端串联用例的里程碑**(→ 核心·推进路径约束)。Example:用户拿一个真实 TS 项目片段(含 enum + 装饰器 + 泛型),`./qjsc` 编译为字节码,再用零-parser 宿主执行。
+- 目标：`.ts` 扩展名自动识别运行；跨文件 import 链；端到端 e2e 覆盖 M1-M6a 全特性。
+- 非目标：qjsc 字节码编译器 TS 支持（TS-71 部分，见下）。
+
+## 实现（4 个真实缺口修复）
+
+1. **`.ts` 扩展名自动识别**：`qjs.c eval_file` + `quickjs-libc.c js_module_loader` 双路径自动加 `JS_EVAL_FLAG_TS`——`qjs foo.ts` 与 `import "./x.ts"` 均无需显式 `--ts`。
+2. **`export interface`/`export enum`**：发现 `interface`/`enum` 是 QuickJS **保留 token**（TOK_INTERFACE/TOK_ENUM，quickjs.c:21865 关键字表），`js_ts_is_pseudo_keyword_str()` 要求 TOK_IDENT 永远 FALSE——改为 token 值判断；`export enum` 补真实运行时导出（add_export_entry，enum 有反向映射对象，区别于纯类型）。
+3. **`class X implements A, B`**：TOK_IMPLEMENTS 保留 token；`js_parse_ts_type` 逐个消费 heritage 类型（纯类型无运行时效应）。M5 缺口补完。
+4. **链式非空断言 `get()!.length`**：`!` 从 coalesce 层移到 **postfix 主循环**（TOK_QUESTION_MARK_DOT 分支前），断言后 continue 继续解析后缀链。M2b 缺口补完。
+
+## 验证结果
+
+- `make test` 全绿（新增 `tests/test_ts.js` 链式断言/implements 用例 + `tests/test_ts_module.ts` 模块链套件 + `tests/ts_lib/shapes.ts` 模块库，均挂入 Makefile）
+- 综合 e2e `.ts` 文件自动识别运行：类型注解/泛型/嵌套泛型+链式断言/as/interface+重载/enum+const enum/参数属性+namespace 合并/legacy 装饰器+metadata 全部通过
+- 跨模块：export enum/interface/class/implements/`import type`/循环导入全通
+- 内存：`-d` atom 计数稳定无泄漏
+
+## 已知限制（记录，非隐藏）
+
+- **TS-71 未完成**：`qjsc.c` 无 `JS_EVAL_FLAG_TS`——AOT 编译 `.ts` 文件尚不支持（qjs 运行期已验证）。待补：qjsc 加 TS flag + 与前置 RFC F2/F3 组合验证。
+
+## 结案
+
+- 迭代目的：把 M1-M6a 的 TS 前端能力串成用户可直接使用的形态（`qjs foo.ts`）。
+- 如何迭代：摸底发现 4 个真实缺口（均为保留字 token 或 postfix 优先级问题）→ 逐项修复 → 双套件挂入 make test。
+- 最终结果：TS-70/TS-72 完成，TS-71（qjsc）留待后续。
+
+---
+
