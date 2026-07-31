@@ -15,13 +15,13 @@ Last updated: 2026-07-30
 | TS-05 | Done | 100 | Pass | RFC | 委派 2 个不同模型对抗式独立评审 | 核心·应用点 A | Opus-4.8 判 PARTIAL、GPT-5.5 判"严重低估";二者独立同证 D2 核心断言不成立 |
 | TS-06 | Done | 100 | Pass | RFC 全文 | 按评审完成 9 项修订:D2 重写、D3.1 时序修正、D3.2-D3.4、S2/S4 边界修订、B1/B2 清单补齐、非目标显式化 | RFC §独立评审记录 | 三份文档状态一致 |
 | **M1 · ts_mode 骨架与类型注解** | | | | | | | |
-| TS-10 | Not Started | 0 | Not Run | `quickjs.h`, `quickjs.c` | 新增 `JS_EVAL_FLAG_TS` 标志 + `JSParseState.ts_mode` 字段与传递链路 | RFC §D1 | — |
-| TS-11 | Not Started | 0 | Not Run | `quickjs.c` | 新增 `js_parse_ts_type` 函数族:基础类型、联合/交叉、数组、元组、函数类型、字面量类型、括号 | RFC §D1、S4 | — |
-| TS-12 | Not Started | 0 | Not Run | `quickjs.c:28515` | 变量声明类型注解 `let x: T` | RFC §D1 | — |
-| TS-13 | Not Started | 0 | Not Run | `quickjs.c:24455` | 函数参数/返回值注解 + 可选参数 `x?: T` | RFC §D1、D2 | — |
-| TS-14 | Not Started | 0 | Not Run | `quickjs.c:25274` | 类成员注解、`readonly`、访问修饰符、可选成员 | RFC §D1 | — |
-| TS-15 | Not Started | 0 | Not Run | `quickjs.c:26338` | 解构类型注解 | RFC §D1 | — |
-| TS-16 | Not Started | 0 | Not Run | `tests/` | M1 单测 + `make test` + test262 零新增失败 | RFC §S1 | — |
+| TS-10 | Done | 100 | Pass | `quickjs.h`, `quickjs.c` | 新增 `JS_EVAL_FLAG_TS` 标志 + `JSParseState.ts_mode` 字段与传递链路 | RFC §D1 | M1 实现并验证 |
+| TS-11 | Done | 100 | Pass | `quickjs.c` | 新增 `js_parse_ts_type` 函数族:基础类型、联合/交叉、数组、元组、函数类型、字面量类型、括号 | RFC §D1、S4 | M1 实现并验证 |
+| TS-12 | Done | 100 | Pass | `quickjs.c:28515` | 变量声明类型注解 `let x: T` | RFC §D1 | M1 实现并验证 |
+| TS-13 | Done | 100 | Pass | `quickjs.c:24455` | 函数参数/返回值注解 + 可选参数 `x?: T` | RFC §D1、D2 | M1 实现并验证 |
+| TS-14 | Done | 100 | Pass | `quickjs.c:25274` | 类成员注解、`readonly`、访问修饰符、可选成员 | RFC §D1 | M1 实现并验证 |
+| TS-15 | Done | 100 | Pass | `quickjs.c:26338` | 解构类型注解 | RFC §D1 | M1 实现并验证 |
+| TS-16 | Done | 100 | Pass | `tests/` | M1 单测 + `make test` + test262 零新增失败 | RFC §S1 | 全量测试挂入 make test 全绿 |
 | **M2a · `>` token 重扫(阻断级前置,评审发现)** | | | | | | | |
 | TS-20 | Done | 100 | Pass | `quickjs.c:23125-23145` lexer(未改) + 新增 `js_ts_rescan_greater` | **`>` token 重扫机制**:O(1) 词法重解释,把 `TOK_SAR`/`TOK_SHR`/`TOK_SAR_ASSIGN`/`TOK_SHR_ASSIGN`/`TOK_GTE` 重扫为单个 `>` | RFC §D2.2(b)、S4 | 子 agent(Opus-4.8)独立核对 PASS;发现并修复 `TOK_GTE`(`>=`)遗漏 |
 | TS-21 | Done | 100 | Pass | `tests/test_ts.js` | 重扫单测:2/3/4 层嵌套泛型、泛型内数组后缀、无空格闭合 `Array<number>=x`;确认 JS 位移(`>>`/`>>>`/`>>=`/`>>>=`/`>=`)零回归 | RFC §S1、S4 | `make test` 零失败;子 agent 追踪 4 层嵌套时序全部正确 |
