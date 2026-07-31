@@ -24773,7 +24773,8 @@ static __exception int js_parse_ts_declare(JSParseState *s);
 static __exception int js_parse_ts_namespace(JSParseState *s);
 static BOOL js_ts_declare_looks_like_decl(JSParseState *s);
 static BOOL js_ts_is_pseudo_keyword_str(JSParseState *s, const char *str);
-static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const);
+static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const,
+                                   BOOL is_export);
 static void js_ts_free_const_enum_table(JSParseState *s);
 static void js_ts_free_merge_table(JSParseState *s);
 static JSTSMergeableDecl *js_ts_merge_lookup(JSParseState *s, JSAtom name);
@@ -27178,6 +27179,24 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         emit_op(s, OP_undefined);
     }
 
+    /* TS: 'class X implements A, B { ... }' -- heritage types are
+       compile-time only (type-level), no runtime effect. The clause
+       may appear with or without an extends clause. 'implements' is
+       TOK_IMPLEMENTS (a reserved keyword in QuickJS), so test the
+       token directly, not as a pseudo-keyword. */
+    if (s->ts_mode && s->token.val == TOK_IMPLEMENTS) {
+        if (next_token(s)) /* consume 'implements' */
+            goto fail;
+        for (;;) {
+            if (js_parse_ts_type(s))
+                goto fail;
+            if (s->token.val != ',')
+                break;
+            if (next_token(s))
+                goto fail;
+        }
+    }
+
     /* add a 'const' definition for the class name */
     if (class_name != JS_ATOM_NULL) {
         class_name_var_idx = define_var(s, fd, class_name, JS_VAR_DEF_CONST);
@@ -29363,6 +29382,17 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             }
         }
 
+        if (s->ts_mode && s->token.val == '!' && !s->got_lf) {
+            /* TS: non-null assertion 'x!' -- no bytecode, and the
+               loop continues so a following '.member'/'()'/'[idx]'
+               keeps parsing (M7: 'get()!.length' chains). Moved here
+               from js_parse_coalesce_expr so the assertion sits at
+               postfix precedence and chains correctly. */
+            if (next_token(s))
+                return -1;
+            continue;
+        }
+
         if (s->token.val == TOK_QUESTION_MARK_DOT) {
             if ((parse_flags & PF_POSTFIX_CALL) == 0)
                 return js_parse_error(s, "new keyword cannot be used with an optional chain");
@@ -30216,12 +30246,6 @@ static __exception int js_parse_coalesce_expr(JSParseState *s, int parse_flags)
        stack; the type annotation is parsed and discarded. */
     if (s->ts_mode) {
         for (;;) {
-            if (s->token.val == '!' && !s->got_lf) {
-                /* non-null assertion: 'x!' */
-                if (next_token(s))
-                    return -1;
-                continue;
-            }
             if ((token_is_pseudo_keyword(s, JS_ATOM_as) ||
                  js_ts_is_pseudo_keyword_str(s, "satisfies")) &&
                 !s->got_lf) {
@@ -31441,7 +31465,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             if (is_const_enum) {
                 if (next_token(s)) /* consume 'const' (for real) */
                     goto fail;
-                if (js_parse_ts_enum(s, TRUE))
+                if (js_parse_ts_enum(s, TRUE, FALSE))
                     goto fail;
                 break;
             }
@@ -32074,7 +32098,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             js_unsupported_keyword(s, s->token.u.ident.atom);
             goto fail;
         }
-        if (js_parse_ts_enum(s, FALSE))
+        if (js_parse_ts_enum(s, FALSE, FALSE))
             goto fail;
         break;
 
@@ -34233,6 +34257,31 @@ static __exception int js_parse_export(JSParseState *s)
                                        JS_FUNC_NORMAL, JS_ATOM_NULL,
                                        s->token.ptr,
                                        JS_PARSE_EXPORT_NAMED, NULL);
+    }
+    /* TS: 'export interface X {...}', 'export declare ...',
+       'export enum X {...}' and 'export namespace X {...}' are
+       type-only (or ambient-only) exports: parse them like their
+       non-exported forms and record nothing in the module's export
+       table, since none of them contribute a runtime binding. */
+    if (s->ts_mode &&
+        (s->token.val == TOK_INTERFACE ||
+         s->token.val == TOK_ENUM ||
+         js_ts_is_pseudo_keyword_str(s, "declare") ||
+         js_ts_is_pseudo_keyword_str(s, "namespace") ||
+         js_ts_is_pseudo_keyword_str(s, "type"))) {
+        /* NOTE: 'interface' is TOK_INTERFACE and 'enum' is TOK_ENUM
+           (reserved keywords in QuickJS), while 'declare'/'namespace'/
+           'type' are plain identifiers -- hence the mixed checks. */
+        if (s->token.val == TOK_INTERFACE)
+            return js_parse_ts_interface(s);
+        if (js_ts_is_pseudo_keyword_str(s, "declare"))
+            return js_parse_ts_declare(s);
+        if (js_ts_is_pseudo_keyword_str(s, "type"))
+            return js_parse_ts_type_alias(s);
+        if (s->token.val == TOK_ENUM)
+            return js_parse_ts_enum(s, FALSE, TRUE);
+        /* namespace */
+        return js_parse_statement_or_decl(s, 0);
     }
 
     if (next_token(s))
@@ -41149,7 +41198,8 @@ static JSTSMergeableDecl *js_ts_merge_record(JSParseState *s, JSAtom name,
    the whole enum falls back to generating a real object exactly like
    a non-const enum (this still produces fully correct behavior, just
    without the inlining optimization for that particular enum). */
-static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const)
+static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const,
+                                   BOOL is_export)
 {
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
@@ -41358,6 +41408,19 @@ static __exception int js_parse_ts_enum(JSParseState *s, BOOL is_const)
     emit_op(s, OP_scope_put_var_init);
     emit_atom(s, enum_name);
     emit_u16(s, fd->scope_level);
+
+    /* TS: 'export enum' registers a real runtime export (enums are
+       objects with reverse mappings, unlike interfaces/type aliases) */
+    if (is_export) {
+        JSModuleDef *m = fd->module;
+        if (m) {
+            if (!add_export_entry(s, m, enum_name, enum_name,
+                                  JS_EXPORT_TYPE_LOCAL)) {
+                ret = -1;
+                goto done;
+            }
+        }
+    }
 
     ret = 0;
     goto done;

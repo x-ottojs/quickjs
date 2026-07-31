@@ -514,4 +514,28 @@ class NoMeta {
 }
 print(new NoMeta().m());
 
+// M7: postfix non-null assertion chains ('get()!.length')
+{
+    var m7map = new Map();
+    m7map.set("row", [1, 2, 3]);
+    print(m7map.get("row")!.length === 3);
+    print(m7map.get("row")![0] === 1);
+    print(m7map.get("row")!.map((x) => x * 2).length === 3);
+}
+
+// M7: class implements clause (type-level, consumed, no runtime effect)
+class ImplBase {
+    baseMethod(): number { return 1; }
+}
+interface IShape { area(): number; }
+class ImplCircle extends ImplBase implements IShape, Iterable<number> {
+    area(): number { return 9; }
+}
+print(new ImplCircle().area() === 9);
+print(new ImplCircle().baseMethod() === 1);
+
+// M7: TS modules (export interface / export enum / import chains)
+// are exercised by tests/test_ts_module.ts run via `qjs -m` -- the
+// .ts extension auto-enables the TS frontend in the module loader.
+
 print("ALL TS TESTS PASSED");

@@ -718,9 +718,14 @@ JSModuleDef *js_module_loader(JSContext *ctx,
                 return NULL;
         } else {
             JSValue func_val;
+            int eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY;
+            /* TS: a .ts module is compiled with the TS frontend on
+               (M7: import chains across .ts files work) */
+            if (has_suffix(module_name, ".ts"))
+                eval_flags |= JS_EVAL_FLAG_TS;
             /* compile the module */
             func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+                               eval_flags);
             js_free(ctx, buf);
             if (JS_IsException(func_val))
                 return NULL;

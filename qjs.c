@@ -94,6 +94,10 @@ static int eval_file(JSContext *ctx, const char *filename, int module, int stric
         module = (has_suffix(filename, ".mjs") ||
                   JS_DetectModule((const char *)buf, buf_len));
     }
+    /* TS: the .ts extension implies TypeScript mode automatically
+       (M7: no explicit --ts flag needed to run .ts sources) */
+    if (has_suffix(filename, ".ts"))
+        ts = 1;
     if (module) {
         eval_flags = JS_EVAL_TYPE_MODULE;
     } else {
