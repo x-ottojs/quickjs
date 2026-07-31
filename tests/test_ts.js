@@ -638,3 +638,20 @@ print("ALL TS TESTS PASSED");
     print(tu[0] === 2);
 }
 print("ALL TS TESTS PASSED");
+
+// B5: declare module (ambient module 声明)
+{
+    declare module "ambient-lib" {
+        export const version: number;
+        export function greet(name: string): string;
+        export interface Config { debug: boolean; }
+        export type Mode = "dev" | "prod";
+        export enum Level { Low, High }
+        export declare const extra: string;
+    }
+    declare module "shorthand-lib";
+    // 普通代码不受 ambient 影响
+    const dmVersion: number = 1;
+    print(dmVersion === 1);
+}
+print("ALL TS TESTS PASSED");

@@ -41816,7 +41816,10 @@ static BOOL js_ts_declare_looks_like_decl(JSParseState *s)
         goto done;
     if (s->token.val == TOK_FUNCTION || s->token.val == TOK_CLASS ||
         s->token.val == TOK_CONST || s->token.val == TOK_VAR ||
-        token_is_pseudo_keyword(s, JS_ATOM_let)) {
+        token_is_pseudo_keyword(s, JS_ATOM_let) ||
+        js_ts_is_pseudo_keyword_str(s, "module") ||
+        js_ts_is_pseudo_keyword_str(s, "namespace") ||
+        js_ts_is_pseudo_keyword_str(s, "global")) {
         ret = TRUE;
     }
 done:
@@ -41836,8 +41839,13 @@ done:
    js_ts_declare_looks_like_decl() returned TRUE. */
 static __exception int js_parse_ts_declare(JSParseState *s)
 {
-    if (next_token(s)) /* consume 'declare' */
-        return -1;
+    /* consume 'declare' IF the current token is it (callers inside
+       an ambient module body may hand us 'export const/function/...'
+       directly with no 'declare' keyword) */
+    if (js_ts_is_pseudo_keyword_str(s, "declare")) {
+        if (next_token(s))
+            return -1;
+    }
 
     if (s->token.val == TOK_FUNCTION) {
         /* 'declare function name(a: T, ...): R;' — reuse the ordinary
@@ -41895,7 +41903,98 @@ static __exception int js_parse_ts_declare(JSParseState *s)
             return -1;
         return 0;
     }
-    js_parse_error(s, "unsupported 'declare' form (only function/const/class are supported)");
+    if (js_ts_is_pseudo_keyword_str(s, "module")) {
+                /* 'declare module "name" { ... }' (or 'declare module
+           "name";' for a shorthand ambient module) -- an ambient
+           module declaration with NO runtime product: the whole body
+           is a type-level environment (export declarations of
+           ambient values/types), so it is parsed and discarded. */
+        if (next_token(s)) /* consume 'module' */
+            return -1;
+        if (s->token.val == TOK_STRING) {
+            if (next_token(s)) /* consume the module name */
+                return -1;
+        } else if (s->token.val == TOK_IDENT) {
+            /* 'declare module Name { ... }' (non-string module name,
+               e.g. a namespace-like form) */
+            if (next_token(s))
+                return -1;
+        } else {
+            js_parse_error(s, "expected module name after 'declare module'");
+            return -1;
+        }
+        if (s->token.val != '{') {
+            /* shorthand: 'declare module "m";' -- nothing to parse */
+            if (js_parse_expect_semi(s))
+                return -1;
+            return 0;
+        }
+        if (next_token(s)) /* consume '{' */
+            return -1;
+        /* ambient module body: export declarations (values, types,
+           nested modules) and import statements -- all type-level;
+           parse each statement and discard. */
+        while (s->token.val != '}' && s->token.val != TOK_EOF) {
+            if (s->token.val == TOK_EXPORT) {
+                if (next_token(s)) /* consume 'export' */
+                    return -1;
+                /* ambient export: 'export declare const/function/
+                   class ...', 'export const/function/class/interface/
+                   type/enum ...' -- the declared thing is ambient
+                   (no runtime product); parse and discard */
+                if (js_ts_is_pseudo_keyword_str(s, "declare")) {
+                    if (js_parse_ts_declare(s))
+                        return -1;
+                } else if (s->token.val == TOK_FUNCTION ||
+                           s->token.val == TOK_CLASS ||
+                           s->token.val == TOK_CONST ||
+                           s->token.val == TOK_VAR ||
+                           token_is_pseudo_keyword(s, JS_ATOM_let)) {
+                    if (js_parse_ts_declare(s))
+                        return -1;
+                } else if (s->token.val == TOK_INTERFACE ||
+                           js_ts_is_pseudo_keyword_str(s, "interface")) {
+                    /* NOTE: in a non-strict context (an ambient
+                       module body) 'interface' lexes as TOK_IDENT
+                       (S9(a) trap) -- accept both */
+                    if (js_parse_ts_interface(s))
+                        return -1;
+                } else if (s->token.val == TOK_ENUM) {
+                    if (js_parse_ts_enum(s, FALSE, FALSE))
+                        return -1;
+                } else if (js_ts_is_pseudo_keyword_str(s, "type")) {
+                    if (js_parse_ts_type_alias(s))
+                        return -1;
+                } else if (js_ts_is_pseudo_keyword_str(s, "module")) {
+                    if (js_parse_ts_declare(s))
+                        return -1;
+                } else {
+                    js_parse_error(s, "unsupported ambient export");
+                    return -1;
+                }
+                /* ambient declarations end with ';' (function/const/
+                   enum/type); the interface form consumes its own
+                   '}' and may be followed by ';' too -- consume it */
+                if (s->token.val == ';') {
+                    if (next_token(s))
+                        return -1;
+                }
+            } else if (s->token.val == TOK_IMPORT) {
+                if (next_token(s))
+                    return -1;
+                if (js_parse_ts_type_name(s))
+                    return -1;
+                if (js_parse_expect_semi(s))
+                    return -1;
+            } else if (js_parse_ts_declare(s)) {
+                return -1;
+            }
+        }
+        if (js_parse_expect(s, '}'))
+            return -1;
+        return 0;
+    }
+    js_parse_error(s, "unsupported 'declare' form (only function/const/class/module are supported)");
     return -1;
 }
 
