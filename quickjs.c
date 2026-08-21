@@ -7612,8 +7612,41 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
     else
         str = JS_NewString(ctx, (char *)dbuf.buf);
     dbuf_free(&dbuf);
-    JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, str,
-                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    /* mininodejs：prepareStackTrace 惰性语义支持（pino 等依赖）。
+     * 原实现把栈字符串写成实例自有数据属性（stack），实例数据属性
+     * 优先于原型 accessor——导致 Error.prototype 上定义的 stack
+     * getter 永远不被调用，V8 的 prepareStackTrace 惰性语义无法实现。
+     * 改为：字符串写到 __rawStack（私有），stack 属性不存在于实例，
+     * 查找落到 Error.prototype 的 accessor（由
+     * QuickJSRuntime::installErrorLazyStack 安装），getter 读
+     * __rawStack 并按需调 prepareStackTrace。未安装 accessor 的
+     * 场景（jsi-testlib 等独立引擎实例）由 getter 缺失时的 fallback
+     * 兜底：getter 不存在时原型上无 stack，读 err.stack 得 undefined
+     * ——为避免裸引擎回归，这里同时保留数据属性写法作为 fallback：
+     * 仅当全局已标记（Error.prototype.__mininode_lazy_stack）时才走
+     * 私有槽路径。 */
+    {
+        JSValue proto = JS_GetPropertyStr(ctx, JS_GetGlobalObject(ctx), "Error");
+        int lazy = 0;
+        if (JS_IsObject(proto)) {
+            JSValue realProto = JS_GetPropertyStr(ctx, proto, "prototype");
+            if (JS_IsObject(realProto)) {
+                JSValue flag = JS_GetProperty(ctx, realProto, JS_ATOM___mininode_lazy_stack);
+                lazy = JS_ToBool(ctx, flag);
+                if (lazy < 0) lazy = 0;
+                JS_FreeValue(ctx, flag);
+            }
+            JS_FreeValue(ctx, realProto);
+        }
+        JS_FreeValue(ctx, proto);
+        if (lazy) {
+            JS_DefinePropertyValue(ctx, error_obj, JS_ATOM___mininode_raw_stack,
+                                   str, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        } else {
+            JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, str,
+                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        }
+    }
 }
 
 /* Note: it is important that no exception is returned by this function */
@@ -8222,6 +8255,19 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
         case JS_TAG_NULL:
             return JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of null", prop);
         case JS_TAG_UNDEFINED:
+            {
+                /* [DIAG] Symbol.iterator 类错误时打印定位信息。
+                 * 仅诊断构建用，定位后即删。
+                 * v2：JS_GetProperty 里构造 Error 取栈会递归触发本函数
+                 * （Error 对象本身没有 Symbol.iterator，但取 .stack 的
+                 * 过程可能碰 undefined），且栈为空说明这里不是 JS 帧。
+                 * 改为只打一个计数器+位置标记，配合外部 wrapper 定位。*/
+                if (prop == JS_ATOM_Symbol_iterator) {
+                    static int diag_count = 0;
+                    diag_count++;
+                    fprintf(stderr, "[DIAG#%d] ", diag_count);
+                }
+            }
             return JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of undefined", prop);
         case JS_TAG_EXCEPTION:
             return JS_EXCEPTION;

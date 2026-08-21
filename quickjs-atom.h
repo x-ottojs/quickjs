@@ -102,6 +102,10 @@ DEF(value, "value")
 DEF(get, "get")
 DEF(set, "set")
 DEF(of, "of")
+/* mininodejs 自定义：prepareStackTrace 惰性栈（见 quickjs.c
+ * js_build_backtrace 的 mininodejs 分支与 ErrorLazyStack.cpp） */
+DEF(__mininode_lazy_stack, "__mininode_lazy_stack")
+DEF(__mininode_raw_stack, "__mininode_raw_stack")
 DEF(__proto__, "__proto__")
 DEF(undefined, "undefined")
 DEF(number, "number")
