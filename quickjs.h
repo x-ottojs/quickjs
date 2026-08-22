@@ -911,6 +911,10 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
                                size_t *pbyte_offset,
                                size_t *pbyte_length,
                                size_t *pbytes_per_element);
+/* mininode: 一次拿到 TypedArray 的数据指针与长度（不走 JS 属性路径）。
+   返回 NULL 表示不是 TypedArray 或 buffer 已 detach。见 .c 的说明。 */
+uint8_t *JS_GetTypedArrayData(JSContext *ctx, JSValueConst obj,
+                              size_t *pbyte_length);
 typedef struct {
     void *(*sab_alloc)(void *opaque, size_t size);
     void (*sab_free)(void *opaque, void *ptr);

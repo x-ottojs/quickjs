@@ -63748,6 +63748,44 @@ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
 /* Return the buffer associated to the typed array or an exception if
    it is not a typed array or if the buffer is detached. pbyte_offset,
    pbyte_length or pbytes_per_element can be NULL. */
+/* mininode 新增：一次调用拿到 TypedArray 的数据指针与字节长度。
+
+   宿主实现 Buffer 方法时，每个操作都要知道"这块内存在哪、多长"。
+   走 JS 属性路径（.buffer / .byteOffset / .byteLength 三次
+   JS_GetProperty + 三次 atom 查找 + 一次 ArrayBuffer 取用）在
+   buf.equals / buf.copy 这类每次调用两个 Buffer 的方法上尤其贵：
+   实测 buf.equals 475ns/op，慢 node 93 倍，Buffer 全族 15-93 倍。
+
+   这些字段都在 JSTypedArray 结构体里，直接读即可，无需经过 JS 对象
+   属性系统。返回 NULL 表示 obj 不是 TypedArray 或其 buffer 已 detach
+   （调用方据此抛 TypeError，与走属性路径时的行为一致）。
+
+   注意 detach 检查：typed_array_is_oob 覆盖 detached 与
+   resizable-ArrayBuffer 越界两种情况，与 JS_GetTypedArrayBuffer 保持
+   同一判据。 */
+uint8_t *JS_GetTypedArrayData(JSContext *ctx, JSValueConst obj,
+                              size_t *pbyte_length)
+{
+    JSObject *p;
+    JSTypedArray *ta;
+    JSArrayBuffer *abuf;
+
+    p = get_typed_array(ctx, obj);
+    if (!p) {
+        JS_FreeValue(ctx, JS_GetException(ctx)); /* 不留 pending 异常 */
+        return NULL;
+    }
+    if (typed_array_is_oob(p))
+        return NULL;
+    ta = p->u.typed_array;
+    abuf = ta->buffer->u.array_buffer;
+    if (abuf->detached)
+        return NULL;
+    if (pbyte_length)
+        *pbyte_length = ta->length;
+    return abuf->data + ta->offset;
+}
+
 JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
                                size_t *pbyte_offset,
                                size_t *pbyte_length,
