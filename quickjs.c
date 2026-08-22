@@ -7660,6 +7660,14 @@ static BOOL is_backtrace_needed(JSContext *ctx, JSValueConst obj)
         return FALSE;
     if (find_own_property1(p, JS_ATOM_stack))
         return FALSE;
+    /* mininode lazy-stack 修复：lazy 模式下 build_backtrace 把栈写进
+     * __mininode_raw_stack（而不是 stack 自有属性），这里必须一并
+     * 检查——否则异常传播的每一层 exception 标签都会误判"无栈"并
+     * 重建 backtrace，层层覆盖，最终 catch 到的错误只剩 1 帧（且指向
+     * catch 点而非 throw 点）。这个 bug 让 otto 崩溃排查在错误文件里
+     * 绕了整整一轮。 */
+    if (find_own_property1(p, JS_ATOM___mininode_raw_stack))
+        return FALSE;
     return TRUE;
 }
 
