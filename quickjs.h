@@ -915,6 +915,9 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
    返回 NULL 表示不是 TypedArray 或 buffer 已 detach。见 .c 的说明。 */
 uint8_t *JS_GetTypedArrayData(JSContext *ctx, JSValueConst obj,
                               size_t *pbyte_length);
+/* mininode: O(1) class_id 判定（语义对齐 node 的内部槽判定，见 .c） */
+int JS_IsTypedArray(JSValueConst obj);
+int JS_IsUint8Array(JSValueConst obj);
 typedef struct {
     void *(*sab_alloc)(void *opaque, size_t size);
     void (*sab_free)(void *opaque, void *ptr);

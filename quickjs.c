@@ -63763,6 +63763,35 @@ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
    注意 detach 检查：typed_array_is_oob 覆盖 detached 与
    resizable-ArrayBuffer 越界两种情况，与 JS_GetTypedArrayBuffer 保持
    同一判据。 */
+/* mininode 新增：TypedArray/Uint8Array 的 O(1) 类型判定。
+
+   jsi 中间层的默认 isTypedArray 实现是：查 global 的 Uint8Array →
+   取 __proto__ 得 %TypedArray% → instanceOf —— 每次 4-6 个 JS 对象
+   操作。类型信息就在 JSObject 的 class_id 里，直接比对即可。
+   注意 class_id 判定与 instanceof 的语义差异：修改过原型链的对象
+   （Object.setPrototypeOf(u8, null)）class_id 判定仍为 true，
+   instanceof 为 false——node 的 util.types.isUint8Array 用的是
+   内部槽判定（与 class_id 行为一致），所以这里更贴 node 语义。 */
+int JS_IsTypedArray(JSValueConst obj)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    return p->class_id >= JS_CLASS_UINT8C_ARRAY &&
+           p->class_id <= JS_CLASS_FLOAT64_ARRAY;
+}
+
+int JS_IsUint8Array(JSValueConst obj)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    return p->class_id == JS_CLASS_UINT8_ARRAY ||
+           p->class_id == JS_CLASS_UINT8C_ARRAY;
+}
+
 uint8_t *JS_GetTypedArrayData(JSContext *ctx, JSValueConst obj,
                               size_t *pbyte_length)
 {
