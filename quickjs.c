@@ -6925,6 +6925,21 @@ static void compute_value_size(JSValueConst val, JSMemoryUsage_helper *hp)
     }
 }
 
+/* mininode 新增：只读分配器计数器，不遍历堆。
+   JS_ComputeMemoryUsage 会 list_for_each 遍历所有 context/shape/对象
+   链表统计精确占用——宿主只想知道"用了多少内存"时那是巨大的浪费
+   （实测 process.memoryUsage() 因此 11µs/次，v8.getHeapStatistics
+   叠加到 648µs/次）。malloc_size/malloc_count 由分配器实时维护，
+   O(1) 读取即可。 */
+void JS_GetMallocCounters(JSRuntime *rt, uint64_t *pmalloc_size,
+                          uint64_t *pmalloc_count)
+{
+    if (pmalloc_size)
+        *pmalloc_size = rt->malloc_ctx.malloc_state.malloc_size;
+    if (pmalloc_count)
+        *pmalloc_count = rt->malloc_ctx.malloc_state.malloc_count;
+}
+
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
 {
     struct list_head *el, *el1;

@@ -452,6 +452,9 @@ typedef struct JSMemoryUsage {
 } JSMemoryUsage;
 
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
+/* mininode: O(1) 读分配器计数器（不遍历堆，见 .c 里的说明） */
+void JS_GetMallocCounters(JSRuntime *rt, uint64_t *pmalloc_size,
+                          uint64_t *pmalloc_count);
 void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
 
 /* atom support */
