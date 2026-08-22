@@ -17864,7 +17864,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         call_func = rt->class_array[p->class_id].call;
         if (!call_func) {
         not_a_function:
-            return JS_ThrowTypeError(caller_ctx, "not a function");
+            /* 调试增强（mininode）：见 20876 处的说明——带目标描述。 */
+            {
+                const char *desc = JS_ToCString(caller_ctx, JS_ToString(caller_ctx, func_obj));
+                char buf[160];
+                snprintf(buf, sizeof(buf), "not a function (callee is %s)",
+                         desc ? desc : "<unprintable>");
+                if (getenv("MININODE_NAF_DEBUG")) {
+                    JSValue err = JS_NewError(caller_ctx);
+                    JS_SetPropertyStr(caller_ctx, err, "message",
+                                      JS_NewString(caller_ctx, buf));
+                    JSValue st = JS_GetPropertyStr(caller_ctx, err, "stack");
+                    const char *stc = JS_ToCString(caller_ctx, st);
+                    fprintf(stderr, "[NAF] %s\n[NAF] %s\n", buf,
+                            stc ? stc : "<no stack>");
+                    JS_FreeCString(caller_ctx, stc);
+                    JS_FreeValue(caller_ctx, st);
+                    JS_FreeValue(caller_ctx, err);
+                }
+                JS_ThrowTypeError(caller_ctx, "%s", buf);
+                JS_FreeCString(caller_ctx, desc);
+            }
+            return JS_EXCEPTION;
         }
         return call_func(caller_ctx, func_obj, this_obj, argc,
                          (JSValueConst *)argv, flags);
@@ -20873,7 +20894,20 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
         call_func = ctx->rt->class_array[p->class_id].call;
         if (!call_func) {
         not_a_function:
-            return JS_ThrowTypeError(ctx, "not a function");
+            /* 调试增强（mininode）：把被调用值的类型/字符串形态带进错误
+             * 消息。排 otto TUI 的 "not a function" 时，QuickJS 默认
+             * 消息没有任何目标信息（node 是 "x.y is not a function"），
+             * 只能靠逐层插桩反推。带上目标描述后一次就能定位。
+             */
+            {
+                const char *desc = JS_ToCString(ctx, JS_ToString(ctx, func_obj));
+                char buf[128];
+                snprintf(buf, sizeof(buf), "not a function (callee is %s)",
+                         desc ? desc : "<unprintable>");
+                JS_ThrowTypeError(ctx, "%s", buf);
+                JS_FreeCString(ctx, desc);
+            }
+            return JS_EXCEPTION;
         }
         return call_func(ctx, func_obj, new_target, argc,
                          (JSValueConst *)argv, flags);
