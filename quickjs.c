@@ -1791,7 +1791,30 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
         printf("GC: size=%" PRIu64 "\n",
                (uint64_t)rt->malloc_ctx.malloc_state.malloc_size);
 #endif
-        JS_RunGC(rt);
+        /* mininode 诊断（MININODE_GC_STATS=1）：GC 停顿计时。用户真机
+           FROZEN 14.7s 且 js-profile 仅 4 采样（不在 JS 指令）、冻结
+           归因落点在 cjs-compile（编译大量分配触发 GC 的典型点）——
+           GC 长停顿是当前头号嫌疑。>100ms 的单次停顿即时打印。 */
+        {
+            static int gc_stats_enabled = -1;
+            struct timespec gc_t0, gc_t1;
+            if (gc_stats_enabled < 0)
+                gc_stats_enabled = getenv("MININODE_GC_STATS") != NULL;
+            if (gc_stats_enabled)
+                clock_gettime(CLOCK_MONOTONIC, &gc_t0);
+            JS_RunGC(rt);
+            if (gc_stats_enabled) {
+                double ms;
+                clock_gettime(CLOCK_MONOTONIC, &gc_t1);
+                ms = (gc_t1.tv_sec - gc_t0.tv_sec) * 1000.0 +
+                     (gc_t1.tv_nsec - gc_t0.tv_nsec) / 1e6;
+                if (ms > 20.0)
+                    fprintf(stderr,
+                            "[gc] %.0f ms pause (heap %.1f MB)\n", ms,
+                            rt->malloc_ctx.malloc_state.malloc_size /
+                                (1024.0 * 1024.0));
+            }
+        }
         rt->malloc_gc_threshold = rt->malloc_ctx.malloc_state.malloc_size +
             (rt->malloc_ctx.malloc_state.malloc_size >> 1);
     }
