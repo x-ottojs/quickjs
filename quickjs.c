@@ -54386,7 +54386,14 @@ static MininodeReStat mininode_re_stats[256];
 static int mininode_re_stats_n = 0;
 static int mininode_re_stats_enabled = -1;
 
-static void mininode_re_stats_dump(void) {
+/* process.exit 用 _exit 跳过 atexit，导出手动冲刷入口（对齐
+   mininodeJsProfileReport 的先例）。声明在前、定义在后。 */
+static void mininode_re_stats_dump_impl(void);
+void mininode_re_stats_flush(void) {
+    if (mininode_re_stats_enabled == 1) mininode_re_stats_dump_impl();
+}
+static void mininode_re_stats_dump(void) { mininode_re_stats_dump_impl(); }
+static void mininode_re_stats_dump_impl(void) {
     int i, j;
     /* 简单选择排序按 ns 降序输出 TOP20 */
     for (i = 0; i < mininode_re_stats_n && i < 20; i++) {
