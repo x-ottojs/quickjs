@@ -79,6 +79,10 @@ enum {
     JS_TAG_SYMBOL      = -8,
     JS_TAG_STRING      = -7,
     JS_TAG_STRING_ROPE = -6,
+    /* mininode: 字符串切片视图（共享父串内存的 slice 结果），与 rope
+       同族的"非扁平字符串"表示，见 quickjs.c 的 JSStringSlice。
+       tag 空间 -5 此前未被占用；负 tag 自动进入引用计数体系。 */
+    JS_TAG_STRING_SLICE = -5,
     JS_TAG_MODULE      = -3, /* used internally */
     JS_TAG_FUNCTION_BYTECODE = -2, /* used internally */
     JS_TAG_OBJECT      = -1,

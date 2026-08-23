@@ -229,6 +229,7 @@ typedef struct JSObject JSObject;
 #define JS_VALUE_GET_OBJ(v) ((JSObject *)JS_VALUE_GET_PTR(v))
 #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
 #define JS_VALUE_GET_STRING_ROPE(v) ((JSStringRope *)JS_VALUE_GET_PTR(v))
+#define JS_VALUE_GET_STRING_SLICE(v) ((JSStringSlice *)JS_VALUE_GET_PTR(v))
 
 typedef enum {
     JS_GC_PHASE_NONE,
@@ -597,6 +598,23 @@ struct JSString {
         uint16_t str16[0];
     } u;
 };
+
+/* mininode 字符串切片视图（JS_TAG_STRING_SLICE）。
+   动机：V8 的 SlicedString 让 `buf = buf.slice(k)` O(1)，而 QuickJS 的
+   js_sub_string 永远 memcpy —— 流式行切分退化 O(n²)（实测 4MB/2万行
+   618ms vs node 1ms）。
+   不变式：
+   - parent 必须是**扁平** JSString（不嵌套 view/rope），持一份引用
+   - 仅当切片 >= JS_STRING_SLICE_MIN_LEN 且父串非 atom 时创建
+   - 第 1 步：除 length/索引/hash 外的所有读取路径先 linearize */
+typedef struct JSStringSlice {
+    uint32_t len;         /* 与 JSString.len 同偏移（便于调试比对） */
+    uint8_t is_wide_char;
+    uint32_t offset;      /* 相对 parent 的起始字符下标 */
+    JSValue parent;       /* JS_TAG_STRING，扁平 */
+} JSStringSlice;
+
+#define JS_STRING_SLICE_MIN_LEN 512
 
 typedef struct JSStringRope {
     uint32_t len;
@@ -3294,7 +3312,11 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
     }
 
     if (str) {
-        if (str->atom_type == 0) {
+        /* mininode slice-view：就地 atom 化会把正被 view 当作 parent
+           持有的普通串变成 atom，两套生命周期管理冲突（实测
+           JS_FreeAtomStruct assert(i != 0) 失败）。refcount > 1 时走
+           下面的拷贝分支，语义一致。 */
+        if (str->atom_type == 0 && js_rc(str)->ref_count == 1) {
             p = str;
             p->atom_type = atom_type;
         } else {
@@ -3984,11 +4006,65 @@ static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
     }
 }
 
+/* mininode slice-view：构造视图。parent 必须扁平且非 atom。 */
+static JSValue js_new_string_slice(JSContext *ctx, JSString *p, uint32_t start,
+                                   uint32_t len)
+{
+    JSStringSlice *s;
+    s = js_malloc(ctx, sizeof(*s));
+    if (!s)
+        return JS_EXCEPTION;
+    js_rc(s)->ref_count = 1;
+    s->len = len;
+    s->is_wide_char = p->is_wide_char;
+    s->offset = start;
+    /* 必须走 JS_DupValue：手写 js_rc(p)->ref_count++ 曾导致父串提前
+       回收（EXC_BAD_ACCESS，第一次尝试的教训） */
+    s->parent = JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, p));
+    return JS_MKPTR(JS_TAG_STRING_SLICE, s);
+}
+
+/* 视图 → 扁平串（消费传入的引用）。与 js_linearize_string_rope 同角色。 */
+static JSValue js_linearize_string_slice(JSContext *ctx, JSValue val)
+{
+    JSStringSlice *s;
+    JSString *p;
+    JSValue res;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING_SLICE)
+        return val;
+    s = JS_VALUE_GET_STRING_SLICE(val);
+    p = JS_VALUE_GET_STRING(s->parent);
+    if (p->is_wide_char)
+        res = js_new_string16_len(ctx, p->u.str16 + s->offset, s->len);
+    else
+        res = js_new_string8_len(ctx, (const char *)p->u.str8 + s->offset,
+                                 s->len);
+    JS_FreeValue(ctx, val);
+    return res;
+}
+
 static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
 {
     int len = end - start;
     if (start == 0 && end == p->len) {
         return JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, p));
+    }
+    /* mininode slice-view：大切片返回共享父串的视图（O(1)）。
+       MININODE_NO_SLICE_VIEW=1 关闭（双路径纪律）。 */
+    {
+        /* 第 1 步默认**关闭**：此阶段所有读取路径都先 linearize，
+           每个 view 一被读就被拷贝，建 view 反而成了纯开销——实测
+           切尾基准 569ms -> 1064ms（1.9x 倒退）。收益要等第 4 步
+           （indexOf/slice/charAt 等读取路径原生支持 view）才兑现。
+           MININODE_SLICE_VIEW=1 显式开启用于开发验证。 */
+        static int slice_view_enabled = -1;
+        if (slice_view_enabled < 0)
+            slice_view_enabled = getenv("MININODE_SLICE_VIEW") != NULL &&
+                                 !getenv("MININODE_NO_SLICE_VIEW");
+        if (slice_view_enabled && len >= JS_STRING_SLICE_MIN_LEN &&
+            !p->atom_type) {
+            return js_new_string_slice(ctx, p, start, len);
+        }
     }
     if (p->is_wide_char && len > 0) {
         JSString *str;
@@ -6491,6 +6567,14 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
             js_free_rt(rt, p);
         }
         break;
+    case JS_TAG_STRING_SLICE:
+        /* mininode slice-view：释放对父串的引用 */
+        {
+            JSStringSlice *p = JS_VALUE_GET_STRING_SLICE(v);
+            JS_FreeValueRT(rt, p->parent);
+            js_free_rt(rt, p);
+        }
+        break;
     case JS_TAG_OBJECT:
     case JS_TAG_FUNCTION_BYTECODE:
     case JS_TAG_MODULE:
@@ -8087,6 +8171,7 @@ static JSValueConst JS_GetPrototypePrimitive(JSContext *ctx, JSValueConst val)
         break;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view */
         val = ctx->class_proto[JS_CLASS_STRING];
         break;
     case JS_TAG_SYMBOL:
@@ -8328,6 +8413,22 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     }
                 } else if (prop == JS_ATOM_length) {
                     return JS_NewInt32(ctx, p1->len);
+                }
+            }
+            break;
+        case JS_TAG_STRING_SLICE:
+            /* mininode slice-view：length 与索引直接落在父串缓冲上 */
+            {
+                JSStringSlice *sl = JS_VALUE_GET_STRING_SLICE(obj);
+                if (__JS_AtomIsTaggedInt(prop)) {
+                    uint32_t idx = __JS_AtomToUInt32(prop);
+                    if (idx < sl->len) {
+                        JSString *par = JS_VALUE_GET_STRING(sl->parent);
+                        return js_new_string_char(
+                            ctx, string_get(par, sl->offset + idx));
+                    }
+                } else if (prop == JS_ATOM_length) {
+                    return JS_NewInt32(ctx, sl->len);
                 }
             }
             break;
@@ -11273,6 +11374,13 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
             JS_FreeValue(ctx, val);
             return ret;
         }
+    case JS_TAG_STRING_SLICE:
+        /* mininode slice-view：长度即可判真假 */
+        {
+            BOOL ret = JS_VALUE_GET_STRING_SLICE(val)->len != 0;
+            JS_FreeValue(ctx, val);
+            return ret;
+        }
     case JS_TAG_SHORT_BIG_INT:
         return JS_VALUE_GET_SHORT_BIG_INT(val) != 0;
     case JS_TAG_BIG_INT:
@@ -13071,6 +13179,7 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
         goto redo;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view：ToCString 会扁平化 */
         {
             const char *str;
             const char *p;
@@ -13688,6 +13797,8 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val, BOOL is_ToP
         return JS_DupValue(ctx, val);
     case JS_TAG_STRING_ROPE:
         return js_linearize_string_rope(ctx, JS_DupValue(ctx, val));
+    case JS_TAG_STRING_SLICE:
+        return js_linearize_string_slice(ctx, JS_DupValue(ctx, val));
     case JS_TAG_INT:
         {
             size_t len;
@@ -14436,6 +14547,7 @@ static void js_print_value(JSPrintValueState *s, JSValueConst val)
         break;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view：打印走 ToString */
         if (s->options.raw_dump && tag == JS_TAG_STRING_ROPE) {
             JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
             js_printf(s, "[rope len=%d depth=%d]", r->len, r->depth);
@@ -14756,6 +14868,7 @@ static JSValue JS_ToBigIntFree(JSContext *ctx, JSValue val)
         break;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view */
         val = JS_StringToBigIntErr(ctx, val);
         if (JS_IsException(val))
             return val;
@@ -15184,7 +15297,9 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
 
 static inline BOOL tag_is_string(uint32_t tag)
 {
-    return tag == JS_TAG_STRING || tag == JS_TAG_STRING_ROPE;
+    /* mininode slice-view 也属字符串族 */
+    return tag == JS_TAG_STRING || tag == JS_TAG_STRING_ROPE ||
+           tag == JS_TAG_STRING_SLICE;
 }
 
 static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
@@ -15885,7 +16000,23 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValueConst op1, JSValueConst op2,
         break;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:
         {
+            /* mininode slice-view：先扁平化再比较（js_string_rope_compare
+               不认识 SLICE tag）。**必须先 JS_DupValue**——op1/op2 在此
+               是借用引用（调用方仍持有），而 linearize 会消费一个引用，
+               直接传入导致 double-free（第4轮由 view 登记表定位）。 */
+            JSValue sv_tmp1 = JS_UNDEFINED, sv_tmp2 = JS_UNDEFINED;
+            if (tag1 == JS_TAG_STRING_SLICE) {
+                sv_tmp1 = js_linearize_string_slice(ctx, JS_DupValue(ctx, op1));
+                op1 = sv_tmp1;
+                tag1 = JS_VALUE_GET_NORM_TAG(op1);
+            }
+            if (tag2 == JS_TAG_STRING_SLICE) {
+                sv_tmp2 = js_linearize_string_slice(ctx, JS_DupValue(ctx, op2));
+                op2 = sv_tmp2;
+                tag2 = JS_VALUE_GET_NORM_TAG(op2);
+            }
             if (!tag_is_string(tag2)) {
                 res = FALSE;
             } else if (tag1 == JS_TAG_STRING && tag2 == JS_TAG_STRING) {
@@ -15894,6 +16025,8 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValueConst op1, JSValueConst op2,
             } else {
                 res = (js_string_rope_compare(ctx, op1, op2, TRUE) == 0);
             }
+            JS_FreeValue(ctx, sv_tmp1);
+            JS_FreeValue(ctx, sv_tmp2);
         }
         break;
     case JS_TAG_SYMBOL:
@@ -16133,6 +16266,7 @@ static __exception int js_operator_typeof(JSContext *ctx, JSValueConst op1)
         break;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view：typeof === "string" */
         atom = JS_ATOM_string;
         break;
     case JS_TAG_OBJECT:
@@ -44436,6 +44570,7 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
         }
         break;
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view：序列化前扁平化 */
         {
             JSValue str;
             int ret;
@@ -46194,6 +46329,7 @@ static JSValue JS_ToObject(JSContext *ctx, JSValueConst val)
         goto set_value;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view：同 rope */
         /* XXX: should call the string constructor */
         {
             JSValue str;
@@ -56446,6 +56582,7 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
             break;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view */
     case JS_TAG_INT:
     case JS_TAG_FLOAT64:
     case JS_TAG_BOOL:
@@ -56626,6 +56763,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     switch (JS_VALUE_GET_NORM_TAG(val)) {
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view */
         return JS_ToQuotedStringFree(ctx, jsc->b, val);
     case JS_TAG_FLOAT64:
         if (!isfinite(JS_VALUE_GET_FLOAT64(val))) {
@@ -58347,6 +58485,20 @@ static uint32_t map_hash_key(JSValueConst key, int hash_bits)
         break;
     case JS_TAG_STRING_ROPE:
         h = map_hash32(hash_string_rope(key, 0) ^ JS_TAG_STRING, hash_bits);
+        break;
+    case JS_TAG_STRING_SLICE:
+        /* mininode slice-view：hash 必须与等值扁平串一致——直接在父串
+           的 [offset, offset+len) 区间上跑 hash_string 的同一算法 */
+        {
+            JSStringSlice *sl = JS_VALUE_GET_STRING_SLICE(key);
+            JSString *par = JS_VALUE_GET_STRING(sl->parent);
+            uint32_t hh;
+            if (par->is_wide_char)
+                hh = hash_string16(par->u.str16 + sl->offset, sl->len, 0);
+            else
+                hh = hash_string8(par->u.str8 + sl->offset, sl->len, 0);
+            h = map_hash32(hh ^ JS_TAG_STRING, hash_bits);
+        }
         break;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
@@ -62625,6 +62777,7 @@ static JSValue JS_ToBigIntCtorFree(JSContext *ctx, JSValue val)
         break;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+    case JS_TAG_STRING_SLICE:  /* mininode slice-view */
         val = JS_StringToBigIntErr(ctx, val);
         break;
     case JS_TAG_OBJECT:
