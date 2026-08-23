@@ -56055,12 +56055,45 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     return JS_EXCEPTION;
 }
 
+/* mininode 诊断探针（MININODE_JSON_STATS=1）：JSON.parse 的累计耗时/
+   调用数/字节数，atexit 时打到 stderr。用于真实负载（otto 启动）下
+   量化 parse 占比——合成基准显示 QuickJS 的 JSON.parse 比 V8 慢
+   5.2x，是 session 恢复的最大单项，需要真实数据佐证。 */
+static double mininode_json_parse_ms = 0;
+static long mininode_json_parse_calls = 0;
+static long long mininode_json_parse_bytes = 0;
+static long mininode_json_bucket_small = 0;  /* <1KB：配置/元数据级 */
+static long mininode_json_bucket_mid = 0;    /* 1-16KB：普通 message */
+static long mininode_json_bucket_big = 0;    /* >16KB：大 tool_result 等 */
+static int mininode_json_stats_enabled = -1;
+
+static void mininode_json_stats_report(void)
+{
+    fprintf(stderr,
+            "[json-stats] parse: %ld calls, %.1f MB, %.1f ms total | "
+            "buckets: <1KB x%ld, 1-16KB x%ld, >16KB x%ld\n",
+            mininode_json_parse_calls,
+            mininode_json_parse_bytes / (1024.0 * 1024.0),
+            mininode_json_parse_ms,
+            mininode_json_bucket_small, mininode_json_bucket_mid,
+            mininode_json_bucket_big);
+}
+
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
     JSValue obj;
     const char *str;
     size_t len;
+    struct timespec mn_t0;
+
+    if (mininode_json_stats_enabled < 0) {
+        mininode_json_stats_enabled = getenv("MININODE_JSON_STATS") != NULL;
+        if (mininode_json_stats_enabled)
+            atexit(mininode_json_stats_report);
+    }
+    if (mininode_json_stats_enabled)
+        clock_gettime(CLOCK_MONOTONIC, &mn_t0);
     
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
@@ -56102,6 +56135,28 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
         obj = JS_ParseJSON3(ctx, str, len, "<input>", 0, NULL);
     }
     JS_FreeCString(ctx, str);
+    if (mininode_json_stats_enabled) {
+        struct timespec mn_t1;
+        double mn_ms;
+        clock_gettime(CLOCK_MONOTONIC, &mn_t1);
+        mn_ms = (mn_t1.tv_sec - mn_t0.tv_sec) * 1000.0 +
+                (mn_t1.tv_nsec - mn_t0.tv_nsec) / 1e6;
+        mininode_json_parse_ms += mn_ms;
+        mininode_json_parse_calls++;
+        mininode_json_parse_bytes += (long long)len;
+        /* 大小分桶（区分"海量小 parse（元数据）" vs "大 parse（message
+           data 列）"——用户要判定 otto 启动到底 parse 的是什么） */
+        if (len < 1024)
+            mininode_json_bucket_small++;
+        else if (len < 16384)
+            mininode_json_bucket_mid++;
+        else {
+            mininode_json_bucket_big++;
+            /* >16KB 的每条都打（带耗时），直接看到大 parse 的分布 */
+            fprintf(stderr, "[json-big] %.1f KB in %.2f ms\n",
+                    len / 1024.0, mn_ms);
+        }
+    }
     return obj;
  fail:
     JS_FreeCString(ctx, str);
