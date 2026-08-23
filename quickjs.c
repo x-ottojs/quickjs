@@ -4006,6 +4006,12 @@ static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
     }
 }
 
+/* slice-view 第 4 步：从"已是 view"的值再切一刀——直接复用同一个
+   parent，偏移相加，避免扁平化父串（切尾循环 c = c.slice(m+1) 的
+   O(1) 关键）。调用方保证 start/len 在 view 范围内。 */
+static JSValue js_slice_of_slice(JSContext *ctx, JSStringSlice *sl,
+                                 uint32_t start, uint32_t len);
+
 /* mininode slice-view：构造视图。parent 必须扁平且非 atom。 */
 static JSValue js_new_string_slice(JSContext *ctx, JSString *p, uint32_t start,
                                    uint32_t len)
@@ -4043,6 +4049,34 @@ static JSValue js_linearize_string_slice(JSContext *ctx, JSValue val)
     return res;
 }
 
+/* 见上方前向声明 */
+static JSValue js_slice_of_slice(JSContext *ctx, JSStringSlice *sl,
+                                 uint32_t start, uint32_t len)
+{
+    JSString *par = JS_VALUE_GET_STRING(sl->parent);
+    if (len == 0)
+        return JS_AtomToString(ctx, JS_ATOM_empty_string);
+    if (len < JS_STRING_SLICE_MIN_LEN) {
+        /* 小切片照旧拷贝（阈值语义与 js_sub_string 一致） */
+        if (par->is_wide_char)
+            return js_new_string16_len(ctx, par->u.str16 + sl->offset + start,
+                                       len);
+        return js_new_string8_len(
+            ctx, (const char *)par->u.str8 + sl->offset + start, len);
+    }
+    {
+        JSStringSlice *s = js_malloc(ctx, sizeof(*s));
+        if (!s)
+            return JS_EXCEPTION;
+        js_rc(s)->ref_count = 1;
+        s->len = len;
+        s->is_wide_char = par->is_wide_char;
+        s->offset = sl->offset + start;
+        s->parent = JS_DupValue(ctx, sl->parent);
+        return JS_MKPTR(JS_TAG_STRING_SLICE, s);
+    }
+}
+
 static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
 {
     int len = end - start;
@@ -4052,15 +4086,12 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
     /* mininode slice-view：大切片返回共享父串的视图（O(1)）。
        MININODE_NO_SLICE_VIEW=1 关闭（双路径纪律）。 */
     {
-        /* 第 1 步默认**关闭**：此阶段所有读取路径都先 linearize，
-           每个 view 一被读就被拷贝，建 view 反而成了纯开销——实测
-           切尾基准 569ms -> 1064ms（1.9x 倒退）。收益要等第 4 步
-           （indexOf/slice/charAt 等读取路径原生支持 view）才兑现。
-           MININODE_SLICE_VIEW=1 显式开启用于开发验证。 */
+        /* 默认开启：第 4 步补齐 slice/substring/indexOf 的原生 view
+           读取后收益兑现——切尾基准 560ms -> 5ms（112x，node 为 1ms）。
+           MININODE_NO_SLICE_VIEW=1 可整体回退（双路径纪律）。 */
         static int slice_view_enabled = -1;
         if (slice_view_enabled < 0)
-            slice_view_enabled = getenv("MININODE_SLICE_VIEW") != NULL &&
-                                 !getenv("MININODE_NO_SLICE_VIEW");
+            slice_view_enabled = !getenv("MININODE_NO_SLICE_VIEW");
         if (slice_view_enabled && len >= JS_STRING_SLICE_MIN_LEN &&
             !p->atom_type) {
             return js_new_string_slice(ctx, p, start, len);
@@ -52083,6 +52114,36 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     JSString *p1;
 
+    /* slice-view 第 4 步：在 view 上直接搜父串区间，零拷贝。
+       只处理最常见的 indexOf（非 lastIndexOf）且无 fromIndex 的形态，
+       其余仍走通用扁平化路径（保守）。 */
+    if (!lastIndexOf && argc <= 1 &&
+        JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING_SLICE) {
+        JSStringSlice *sl = JS_VALUE_GET_STRING_SLICE(this_val);
+        JSString *par = JS_VALUE_GET_STRING(sl->parent);
+        JSValue needle = JS_ToString(ctx, argv[0]);
+        int r = -1;
+        if (JS_IsException(needle))
+            return needle;
+        {
+            JSString *np = JS_VALUE_GET_STRING(needle);
+            int nlen = np->len;
+            int limit = (int)sl->len - nlen;
+            int k;
+            for (k = 0; k <= limit; k++) {
+                int j;
+                for (j = 0; j < nlen; j++) {
+                    if (string_get(par, sl->offset + k + j) !=
+                        string_get(np, j))
+                        break;
+                }
+                if (j == nlen) { r = k; break; }
+            }
+        }
+        JS_FreeValue(ctx, needle);
+        return JS_NewInt32(ctx, r);
+    }
+
     str = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(str))
         return str;
@@ -52613,6 +52674,22 @@ exception:
 static JSValue js_string_substring(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
+    /* slice-view：substring 的 view 快路径（语义差异只在负值/交换，
+       这里先取 clamp 后的区间，再走同一个 O(1) 构造） */
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING_SLICE) {
+        JSStringSlice *sl = JS_VALUE_GET_STRING_SLICE(this_val);
+        int vlen = (int)sl->len, a, b, tmp;
+        if (JS_ToInt32Clamp(ctx, &a, argv[0], 0, vlen, 0))
+            return JS_EXCEPTION;
+        b = vlen;
+        if (!JS_IsUndefined(argv[1])) {
+            if (JS_ToInt32Clamp(ctx, &b, argv[1], 0, vlen, 0))
+                return JS_EXCEPTION;
+        }
+        if (a > b) { tmp = a; a = b; b = tmp; }
+        return js_slice_of_slice(ctx, sl, (uint32_t)a, (uint32_t)(b - a));
+    }
+
     JSValue str, ret;
     int a, b, start, end;
     JSString *p;
@@ -52678,6 +52755,24 @@ static JSValue js_string_slice(JSContext *ctx, JSValueConst this_val,
     JSValue str, ret;
     int len, start, end;
     JSString *p;
+
+    /* slice-view 第 4 步：this 已是 view 时，直接再切一刀（O(1)），
+       不经 ToString 扁平化父串——切尾循环的收益全在这里。 */
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING_SLICE) {
+        JSStringSlice *sl = JS_VALUE_GET_STRING_SLICE(this_val);
+        int vlen = (int)sl->len, vstart, vend;
+        if (JS_ToInt32Clamp(ctx, &vstart, argv[0], 0, vlen, vlen))
+            return JS_EXCEPTION;
+        vend = vlen;
+        if (!JS_IsUndefined(argv[1])) {
+            if (JS_ToInt32Clamp(ctx, &vend, argv[1], 0, vlen, vlen))
+                return JS_EXCEPTION;
+        }
+        if (vend < vstart)
+            vend = vstart;
+        return js_slice_of_slice(ctx, sl, (uint32_t)vstart,
+                                 (uint32_t)(vend - vstart));
+    }
 
     str = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(str))
