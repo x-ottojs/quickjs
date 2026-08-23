@@ -3347,6 +3347,9 @@ typedef struct {
     uint32_t bc_hash;
     uint16_t n_ranges;   /* 0xFFFF = 不可预筛（哨兵） */
     uint16_t lru_tick;
+    uint16_t min_len;    /* EatsAtLeast（V8 同名概念）：整个 pattern 的
+                            最小消费字符数；剩余输入短于它直接判负。
+                            0 = 未知/nullable（不启用该检查）。 */
     uint32_t (*ranges)[2];
 } LreFirstSetEntry;
 #define LRE_FS_CACHE_SIZE 64
@@ -3466,6 +3469,84 @@ static int lre_first_set_collect(const uint8_t *bc_buf, int pc,
     return n;
 }
 
+/* EatsAtLeast（V8 regexp-compiler 的同名概念）：从 pc 起到 match 的
+   最小消费字符数**保守下界**。剩余输入长度低于它时整个匹配必败——
+   O(1) 提前拒绝。分支取最小值；遇到循环/未知指令立即返回已累计值
+   （低估安全，高估危险）。递归深度含 split 展开，用小预算防病态。 */
+static int lre_eats_at_least_rec(const uint8_t *bc_buf, int pc, int depth)
+{
+    int total = 0;
+    if (depth > 24)
+        return 0;
+    for (;;) {
+        int opcode = bc_buf[pc];
+        switch (opcode) {
+        case REOP_save_start:
+        case REOP_save_end:
+            pc += 2; continue;
+        case REOP_save_reset:
+            pc += 3; continue;
+        case REOP_set_i32:
+            pc += 6; continue;
+        case REOP_set_char_pos:
+            pc += 2; continue;
+        case REOP_line_start:
+        case REOP_line_start_m:
+        case REOP_line_end:
+        case REOP_line_end_m:
+            pc += 1; continue;
+        case REOP_char:
+        case REOP_char_i:
+            total += 1; pc += 3; continue;
+        case REOP_char32:
+        case REOP_char32_i:
+            total += 1; pc += 5; continue;
+        case REOP_dot:
+        case REOP_any:
+        case REOP_space:
+        case REOP_not_space:
+            total += 1; pc += 1; continue;
+        case REOP_range:
+        case REOP_range_i: {
+            int cnt = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8);
+            total += 1;
+            pc += 3 + cnt * 4;
+            continue;
+        }
+        case REOP_range32:
+        case REOP_range32_i: {
+            int cnt = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8);
+            total += 1;
+            pc += 3 + cnt * 8;
+            continue;
+        }
+        case REOP_split_goto_first:
+        case REOP_split_next_first: {
+            uint32_t diff = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8) |
+                            (bc_buf[pc + 3] << 16) |
+                            ((uint32_t)bc_buf[pc + 4] << 24);
+            int target = pc + 5 + (int32_t)diff;
+            int a = lre_eats_at_least_rec(bc_buf, target, depth + 1);
+            int b = lre_eats_at_least_rec(bc_buf, pc + 5, depth + 1);
+            return total + (a < b ? a : b);
+        }
+        case REOP_goto: {
+            uint32_t diff = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8) |
+                            (bc_buf[pc + 3] << 16) |
+                            ((uint32_t)bc_buf[pc + 4] << 24);
+            if ((int32_t)diff < 0)
+                return total; /* 循环：停止累计（保守） */
+            pc = pc + 5 + (int32_t)diff;
+            continue;
+        }
+        case REOP_match:
+            return total;
+        default:
+            return total; /* 未知指令：停止累计（保守下界安全） */
+        }
+    }
+}
+
 static int lre_fs_cmp(const void *a, const void *b)
 {
     const uint32_t *ra = (const uint32_t *)a, *rb = (const uint32_t *)b;
@@ -3517,9 +3598,14 @@ static int lre_first_char_prefilter(const uint8_t *bc_buf, const uint8_t *cbuf,
                 }
             }
         }
-        if (start_pc >= 0)
+        int min_len = 0;
+        if (start_pc >= 0) {
             n = lre_first_set_collect(bc, start_pc, tmp_ranges,
                                       LRE_FS_MAX_RANGES);
+            min_len = lre_eats_at_least_rec(bc, start_pc, 0);
+            if (min_len > 0xFFFF)
+                min_len = 0xFFFF;
+        }
         /* 装入缓存（LRU：找空位或最旧） */
         {
             int victim = 0;
@@ -3543,6 +3629,7 @@ static int lre_first_char_prefilter(const uint8_t *bc_buf, const uint8_t *cbuf,
             }
             e->bc = bc_buf;
             e->bc_hash = h;
+            e->min_len = (uint16_t)min_len;
             if (n < 0) {
                 e->n_ranges = 0xFFFF; /* 不可预筛 */
             } else {
@@ -3573,6 +3660,10 @@ static int lre_first_char_prefilter(const uint8_t *bc_buf, const uint8_t *cbuf,
         }
     }
     e->lru_tick = ++lre_fs_tick;
+    /* EatsAtLeast：剩余输入不够最小消费数 → 必败（对 ^ 锚定型成立；
+       非锚定型 min_len 为 0 不触发） */
+    if (e->min_len > 0 && clen - cindex < (int)e->min_len)
+        return 0;
     if (e->n_ranges == 0xFFFF)
         return 1; /* 不可预筛 */
 
