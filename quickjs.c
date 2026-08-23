@@ -4056,7 +4056,11 @@ static JSValue js_slice_of_slice(JSContext *ctx, JSStringSlice *sl,
     JSString *par = JS_VALUE_GET_STRING(sl->parent);
     if (len == 0)
         return JS_AtomToString(ctx, JS_ATOM_empty_string);
-    if (len < JS_STRING_SLICE_MIN_LEN) {
+    /* 内存闸必须与 js_sub_string 一致（review 抓到的真实缺口：从大
+       view 再切小切片可绕过 1/8 比率闸，20 个 700B slice-of-slice
+       依旧钉住 20x2MB 父串，RSS 58.8MB）。比率按**父串全长**算——
+       决定内存滞留量的是父串的大小，不是上一层 view 的大小。 */
+    if (len < JS_STRING_SLICE_MIN_LEN || len < par->len / 8) {
         /* 小切片照旧拷贝（阈值语义与 js_sub_string 一致） */
         if (par->is_wide_char)
             return js_new_string16_len(ctx, par->u.str16 + sl->offset + start,
