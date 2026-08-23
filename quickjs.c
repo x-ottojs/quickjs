@@ -7779,7 +7779,14 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
      * 仅当全局已标记（Error.prototype.__mininode_lazy_stack）时才走
      * 私有槽路径。 */
     {
-        JSValue proto = JS_GetPropertyStr(ctx, JS_GetGlobalObject(ctx), "Error");
+        /* 真实 bug（quickjs 官方自测基线 git bisect 定位）：
+           JS_GetGlobalObject 返回**新引用**，内联传给 JS_GetPropertyStr
+           后无人释放——每次 build_backtrace 泄漏一次 globalThis 引用，
+           退出时 JS_FreeRuntime 的 assert(list_empty(&rt->gc_obj_list))
+           必然失败（qjs --std 下 100% 复现）。改为显式持有并释放。 */
+        JSValue global_obj = JS_GetGlobalObject(ctx);
+        JSValue proto = JS_GetPropertyStr(ctx, global_obj, "Error");
+        JS_FreeValue(ctx, global_obj);
         int lazy = 0;
         if (JS_IsObject(proto)) {
             JSValue realProto = JS_GetPropertyStr(ctx, proto, "prototype");
