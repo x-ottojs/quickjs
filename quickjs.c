@@ -54372,6 +54372,70 @@ static force_inline int js_regexp_set_lastIndex(JSContext *ctx, JSValueConst thi
     return 0;
 }
 
+/* mininode 诊断（MININODE_RE_STATS=1）：正则执行耗时按 pattern 聚合，
+   atexit 打 TOP20。滚动掉帧归因：栈采样显示 lre_exec 占滚动段 CPU ~1/3，
+   需要定位具体正则才能在应用层修（缓存/预编译/换写法）。
+   记录：pattern 前 64 字节 + 调用次数 + 总 ns + 输入总字节。 */
+typedef struct MininodeReStat {
+    char pat[65];
+    long long calls;
+    long long ns;
+    long long input_bytes;
+} MininodeReStat;
+static MininodeReStat mininode_re_stats[256];
+static int mininode_re_stats_n = 0;
+static int mininode_re_stats_enabled = -1;
+
+static void mininode_re_stats_dump(void) {
+    int i, j;
+    /* 简单选择排序按 ns 降序输出 TOP20 */
+    for (i = 0; i < mininode_re_stats_n && i < 20; i++) {
+        int best = i;
+        for (j = i + 1; j < mininode_re_stats_n; j++)
+            if (mininode_re_stats[j].ns > mininode_re_stats[best].ns)
+                best = j;
+        if (best != i) {
+            MininodeReStat tmp = mininode_re_stats[i];
+            mininode_re_stats[i] = mininode_re_stats[best];
+            mininode_re_stats[best] = tmp;
+        }
+        fprintf(stderr, "[re-stats] %8.1fms %9lld calls %8.1fMB in  /%s/\n",
+                mininode_re_stats[i].ns / 1e6,
+                mininode_re_stats[i].calls,
+                mininode_re_stats[i].input_bytes / 1e6,
+                mininode_re_stats[i].pat);
+    }
+}
+
+static void mininode_re_stats_add(JSContext *ctx, JSValueConst pattern_val,
+                                  long long ns, long long input_len) {
+    const char *cpat;
+    int i;
+    if (mininode_re_stats_enabled < 0) {
+        mininode_re_stats_enabled = getenv("MININODE_RE_STATS") != NULL;
+        if (mininode_re_stats_enabled) atexit(mininode_re_stats_dump);
+    }
+    if (!mininode_re_stats_enabled) return;
+    cpat = JS_ToCString(ctx, pattern_val);
+    if (!cpat) return;
+    for (i = 0; i < mininode_re_stats_n; i++) {
+        if (strncmp(mininode_re_stats[i].pat, cpat, 64) == 0) break;
+    }
+    if (i == mininode_re_stats_n) {
+        if (mininode_re_stats_n >= 256) { JS_FreeCString(ctx, cpat); return; }
+        mininode_re_stats_n++;
+        snprintf(mininode_re_stats[i].pat, sizeof(mininode_re_stats[i].pat),
+                 "%s", cpat);
+        mininode_re_stats[i].calls = 0;
+        mininode_re_stats[i].ns = 0;
+        mininode_re_stats[i].input_bytes = 0;
+    }
+    mininode_re_stats[i].calls++;
+    mininode_re_stats[i].ns += ns;
+    mininode_re_stats[i].input_bytes += input_len;
+    JS_FreeCString(ctx, cpat);
+}
+
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
@@ -54423,9 +54487,17 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     if (last_index > str->len) {
         rc = 2;
     } else {
+        struct timespec mrs_t0, mrs_t1;
+        clock_gettime(CLOCK_MONOTONIC, &mrs_t0);
         rc = lre_exec(capture, re_bytecode,
                       str_buf, last_index, str->len,
                       shift, ctx);
+        clock_gettime(CLOCK_MONOTONIC, &mrs_t1);
+        mininode_re_stats_add(
+            ctx, JS_MKPTR(JS_TAG_STRING, re->pattern),
+            (long long)(mrs_t1.tv_sec - mrs_t0.tv_sec) * 1000000000LL +
+                (mrs_t1.tv_nsec - mrs_t0.tv_nsec),
+            (long long)str->len);
     }
     if (rc != 1) {
         if (rc >= 0) {
@@ -54650,8 +54722,16 @@ static JSValue js_regexp_replace(JSContext *ctx, JSValueConst this_val, JSValueC
         if (last_index > str->len) {
             ret = 0;
         } else {
+            struct timespec mrr_t0, mrr_t1;
+            clock_gettime(CLOCK_MONOTONIC, &mrr_t0);
             ret = lre_exec(capture, re_bytecode,
                            str_buf, last_index, str->len, shift, ctx);
+            clock_gettime(CLOCK_MONOTONIC, &mrr_t1);
+            mininode_re_stats_add(
+                ctx, JS_MKPTR(JS_TAG_STRING, re->pattern),
+                (long long)(mrr_t1.tv_sec - mrr_t0.tv_sec) * 1000000000LL +
+                    (mrr_t1.tv_nsec - mrr_t0.tv_nsec),
+                (long long)str->len);
         }
         if (ret != 1) {
             if (ret >= 0) {
