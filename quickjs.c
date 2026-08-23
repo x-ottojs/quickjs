@@ -4092,8 +4092,13 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
         static int slice_view_enabled = -1;
         if (slice_view_enabled < 0)
             slice_view_enabled = !getenv("MININODE_NO_SLICE_VIEW");
+        /* 内存闸（实测驱动）：小 view 钉住大父串会造成内存放大——
+           20 个 700B view 钉住 20×2MB 父串时 RSS 58.8MB vs 无 view
+           的 11.1MB（5.3x）。规则：切片占父串比例过小时（< 1/8）不建
+           视图，直接拷贝；这既保住流式切尾场景（那里比例接近 1），
+           又消除长期持有小切片的放大风险。 */
         if (slice_view_enabled && len >= JS_STRING_SLICE_MIN_LEN &&
-            !p->atom_type) {
+            !p->atom_type && (uint32_t)len >= p->len / 8) {
             return js_new_string_slice(ctx, p, start, len);
         }
     }
@@ -54056,10 +54061,19 @@ static JSValue js___date_create(JSContext *ctx, JSValueConst this_val,
 
 /* RegExp */
 
+/* mininode: 释放正则字节码前失效首字符预筛缓存（key 是字节码地址，
+   地址被新字节码复用会误命中）。只在最后一个引用消失时失效。 */
+static void js_regexp_bytecode_release_hook(JSString *bc)
+{
+    if (bc != NULL && __js_rc(bc)->ref_count == 1)
+        lre_prefilter_invalidate(bc->u.str8);
+}
+
 static void js_regexp_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JSRegExp *re = &p->u.regexp;
+    js_regexp_bytecode_release_hook(re->bytecode);
     if (re->bytecode != NULL)
         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, re->bytecode));
     if (re->pattern != NULL)
@@ -54344,6 +54358,7 @@ static JSValue js_regexp_compile(JSContext *ctx, JSValueConst this_val,
             goto fail;
     }
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
+    js_regexp_bytecode_release_hook(re->bytecode);
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->bytecode));
     re->pattern = JS_VALUE_GET_STRING(pattern);
     re->bytecode = JS_VALUE_GET_STRING(bc);
