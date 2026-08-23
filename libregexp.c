@@ -3323,6 +3323,312 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
 /* Return 1 if match, 0 if not match or < 0 if error (see LRE_RET_x). cindex is the
    starting position of the match and must be such as 0 <= cindex <=
    clen. */
+/* mininode 优化：首字符预筛（first-character prefilter）。
+   动机（真实归因）：otto TUI 渲染对每个字符跑 /^\p{RGI_Emoji}$/v
+   ——lre 无首字符预筛时每次 11.2µs（v 模式字符串属性编译成巨型
+   alternation 全量回溯），V8 irregexp 对非 emoji 输入 25ns 直接拒，
+   450 倍差距、滚动掉帧主因（96% 正则时间）。V8/RE2 均有此类优化
+   （irregexp quick-check / RE2 Prefilter），bellard 上游至今未做。
+
+   原理：从字节码起点遍历**非消费**指令（save/锚定/lookahead 入口等），
+   到达第一个消费字符的指令（char/range 系）时检查输入首字符是否可被
+   接受；split 则任一分支可接受即放行。遇到 nullable 路径（能不消费
+   字符直接 match）、反向引用、lookbehind、复杂 loop 等一律**放弃预筛**
+   （返回"可能匹配"）——宁可少优化，绝不误拒。语义零变化。
+
+   MININODE_NO_RE_PREFILTER=1 可整体关闭（双路径纪律）。 */
+/* first-set 结果缓存：迭代遍历数百分支的 alternation 仍要 ~6µs/次
+   （RGI_Emoji 实测），把"字节码 → 可接受首码点区间表"缓存下来后查询
+   只剩二分 ~50ns。key 用 bc 指针 + 长度 + 首 8 字节散列（防 GC 后
+   指针复用误命中）。单线程事件循环无并发问题；worker 各持独立
+   JSRuntime 但本缓存是进程级——用 __thread 线程局部避免跨线程写竞争。 */
+typedef struct {
+    const uint8_t *bc;
+    uint32_t bc_hash;
+    uint16_t n_ranges;   /* 0xFFFF = 不可预筛（哨兵） */
+    uint16_t lru_tick;
+    uint32_t (*ranges)[2];
+} LreFirstSetEntry;
+#define LRE_FS_CACHE_SIZE 64
+#define LRE_FS_MAX_RANGES 4096
+static __thread LreFirstSetEntry lre_fs_cache[LRE_FS_CACHE_SIZE];
+static __thread uint16_t lre_fs_tick;
+
+static uint32_t lre_fs_hash(const uint8_t *bc_buf)
+{
+    uint32_t h = 2166136261u;
+    int i;
+    uint32_t len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
+    h = (h ^ len) * 16777619u;
+    for (i = 0; i < 8; i++)
+        h = (h ^ bc_buf[RE_HEADER_LEN + i]) * 16777619u;
+    return h;
+}
+
+/* 收集 first-set 区间：与 lre_first_char_test_rec 同构，但输出集合而
+   不是判定单字符。返回区间数；-1 = 不可预筛。 */
+static int lre_first_set_collect(const uint8_t *bc_buf, int pc,
+                                 uint32_t (*out)[2], int max_ranges)
+{
+    int stack[1024];
+    int sp = 0;
+    int n = 0;
+    stack[sp++] = pc;
+    while (sp > 0) {
+        pc = stack[--sp];
+        for (;;) {
+            int opcode = bc_buf[pc];
+            switch (opcode) {
+            case REOP_save_start:
+            case REOP_save_end:
+                pc += 2; continue;
+            case REOP_save_reset:
+                pc += 3; continue;
+            case REOP_set_i32:
+                pc += 6; continue;
+            case REOP_set_char_pos:
+                pc += 2; continue;
+            case REOP_line_start:
+            case REOP_line_start_m:
+                pc += 1; continue;
+            case REOP_char:
+            case REOP_char_i: {
+                uint32_t v = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8);
+                if (n >= max_ranges) return -1;
+                out[n][0] = v; out[n][1] = v; n++;
+                break;
+            }
+            case REOP_char32:
+            case REOP_char32_i: {
+                uint32_t v = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8) |
+                             (bc_buf[pc + 3] << 16) |
+                             ((uint32_t)bc_buf[pc + 4] << 24);
+                if (n >= max_ranges) return -1;
+                out[n][0] = v; out[n][1] = v; n++;
+                break;
+            }
+            case REOP_range:
+            case REOP_range_i: {
+                int cnt = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8);
+                const uint8_t *p = bc_buf + pc + 3;
+                int k;
+                for (k = 0; k < cnt; k++) {
+                    if (n >= max_ranges) return -1;
+                    out[n][0] = p[k * 4] | (p[k * 4 + 1] << 8);
+                    out[n][1] = p[k * 4 + 2] | (p[k * 4 + 3] << 8);
+                    n++;
+                }
+                break;
+            }
+            case REOP_range32:
+            case REOP_range32_i: {
+                int cnt = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8);
+                const uint8_t *p = bc_buf + pc + 3;
+                int k;
+                for (k = 0; k < cnt; k++) {
+                    if (n >= max_ranges) return -1;
+                    out[n][0] = p[k * 8] | (p[k * 8 + 1] << 8) |
+                                (p[k * 8 + 2] << 16) |
+                                ((uint32_t)p[k * 8 + 3] << 24);
+                    out[n][1] = p[k * 8 + 4] | (p[k * 8 + 5] << 8) |
+                                (p[k * 8 + 6] << 16) |
+                                ((uint32_t)p[k * 8 + 7] << 24);
+                    n++;
+                }
+                break;
+            }
+            case REOP_split_goto_first:
+            case REOP_split_next_first: {
+                uint32_t diff = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8) |
+                                (bc_buf[pc + 3] << 16) |
+                                ((uint32_t)bc_buf[pc + 4] << 24);
+                int target = pc + 5 + (int32_t)diff;
+                if (sp >= (int)(sizeof(stack) / sizeof(stack[0])))
+                    return -1;
+                stack[sp++] = target;
+                pc += 5;
+                continue;
+            }
+            case REOP_goto: {
+                uint32_t diff = bc_buf[pc + 1] | (bc_buf[pc + 2] << 8) |
+                                (bc_buf[pc + 3] << 16) |
+                                ((uint32_t)bc_buf[pc + 4] << 24);
+                if ((int32_t)diff < 0) return -1;
+                pc = pc + 5 + (int32_t)diff;
+                continue;
+            }
+            default:
+                return -1;
+            }
+            break; /* 消费指令处理完：本分支贡献完毕，弹栈 */
+        }
+    }
+    return n;
+}
+
+static int lre_fs_cmp(const void *a, const void *b)
+{
+    const uint32_t *ra = (const uint32_t *)a, *rb = (const uint32_t *)b;
+    if (ra[0] < rb[0]) return -1;
+    if (ra[0] > rb[0]) return 1;
+    return 0;
+}
+
+static int lre_first_char_prefilter(const uint8_t *bc_buf, const uint8_t *cbuf,
+                                    int cindex, int clen, int cbuf_type,
+                                    int re_flags)
+{
+    uint32_t c;
+    LreFirstSetEntry *e = NULL;
+    uint32_t h;
+    int k, is_anchored = 0;
+
+    if (cindex >= clen)
+        return 1; /* 空输入：nullable 正则可匹配空，交给完整引擎 */
+
+    /* 缓存查找 */
+    h = lre_fs_hash(bc_buf);
+    for (k = 0; k < LRE_FS_CACHE_SIZE; k++) {
+        if (lre_fs_cache[k].bc == bc_buf && lre_fs_cache[k].bc_hash == h) {
+            e = &lre_fs_cache[k];
+            break;
+        }
+    }
+    if (!e) {
+        /* miss：识别搜索前缀循环 + ^ 锚定，收集 first-set */
+        const uint8_t *bc = bc_buf + RE_HEADER_LEN;
+        int start_pc = -1;
+        static __thread uint32_t tmp_ranges[LRE_FS_MAX_RANGES][2];
+        int n = -1;
+        if (bc[0] == REOP_split_goto_first && bc[5] == REOP_any &&
+            bc[6] == REOP_goto) {
+            uint32_t sd = bc[1] | (bc[2] << 8) | (bc[3] << 16) |
+                          ((uint32_t)bc[4] << 24);
+            uint32_t gd = bc[7] | (bc[8] << 8) | (bc[9] << 16) |
+                          ((uint32_t)bc[10] << 24);
+            int target = 5 + (int32_t)sd;
+            if (11 + (int32_t)gd == 0 && target > 0) {
+                int p = target;
+                while (bc[p] == REOP_save_start)
+                    p += 2;
+                if (bc[p] == REOP_line_start) {
+                    is_anchored = 1;
+                    start_pc = target;
+                }
+            }
+        }
+        if (start_pc >= 0)
+            n = lre_first_set_collect(bc, start_pc, tmp_ranges,
+                                      LRE_FS_MAX_RANGES);
+        /* 装入缓存（LRU：找空位或最旧） */
+        {
+            int victim = 0;
+            uint16_t oldest = 0xFFFF;
+            for (k = 0; k < LRE_FS_CACHE_SIZE; k++) {
+                if (!lre_fs_cache[k].bc) { victim = k; break; }
+                /* tick 距离（wrap 安全的近似） */
+                {
+                    uint16_t age = (uint16_t)(lre_fs_tick -
+                                              lre_fs_cache[k].lru_tick);
+                    if (oldest == 0xFFFF || age > oldest) {
+                        oldest = age;
+                        victim = k;
+                    }
+                }
+            }
+            e = &lre_fs_cache[victim];
+            if (e->ranges) {
+                free(e->ranges);
+                e->ranges = NULL;
+            }
+            e->bc = bc_buf;
+            e->bc_hash = h;
+            if (n < 0) {
+                e->n_ranges = 0xFFFF; /* 不可预筛 */
+            } else {
+                /* 排序 + 合并重叠区间 */
+                int m = 0;
+                qsort(tmp_ranges, n, sizeof(tmp_ranges[0]), lre_fs_cmp);
+                for (k = 0; k < n; k++) {
+                    if (m > 0 && tmp_ranges[k][0] <= tmp_ranges[m - 1][1] + 1) {
+                        if (tmp_ranges[k][1] > tmp_ranges[m - 1][1])
+                            tmp_ranges[m - 1][1] = tmp_ranges[k][1];
+                    } else {
+                        tmp_ranges[m][0] = tmp_ranges[k][0];
+                        tmp_ranges[m][1] = tmp_ranges[k][1];
+                        m++;
+                    }
+                }
+                e->ranges = malloc(sizeof(uint32_t) * 2 * (m > 0 ? m : 1));
+                if (!e->ranges) {
+                    e->n_ranges = 0xFFFF;
+                } else {
+                    for (k = 0; k < m; k++) {
+                        e->ranges[k][0] = tmp_ranges[k][0];
+                        e->ranges[k][1] = tmp_ranges[k][1];
+                    }
+                    e->n_ranges = (uint16_t)m;
+                }
+            }
+        }
+    }
+    e->lru_tick = ++lre_fs_tick;
+    if (e->n_ranges == 0xFFFF)
+        return 1; /* 不可预筛 */
+
+    /* 取首字符（代理对合并；不完整代理保守放行） */
+    if (cbuf_type == 0) {
+        c = cbuf[cindex];
+    } else {
+        const uint16_t *b16 = (const uint16_t *)cbuf;
+        c = b16[cindex];
+        if (c >= 0xD800 && c <= 0xDBFF) {
+            if (cindex + 1 < clen) {
+                uint32_t lo = b16[cindex + 1];
+                if (lo >= 0xDC00 && lo <= 0xDFFF)
+                    c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                else
+                    return 1;
+            } else {
+                return 1;
+            }
+        }
+    }
+    /* ignore_case：与收集端一致做 canonicalize（收集端存的是字节码里的
+       已 canonical 值——range_i/char_i 系；非 _i 指令存原值。混存时对
+       输入同时试原值与 canonical 值，保守起见都查。 */
+    {
+        int lo_i = 0, hi_i = (int)e->n_ranges - 1;
+        uint32_t cand[2];
+        int nc = 1, t;
+        cand[0] = c;
+        if (re_flags & LRE_FLAG_IGNORECASE) {
+            uint32_t cc = lre_canonicalize(
+                c, (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0);
+            if (cc != c) {
+                cand[1] = cc;
+                nc = 2;
+            }
+        }
+        for (t = 0; t < nc; t++) {
+            uint32_t cc = cand[t];
+            lo_i = 0;
+            hi_i = (int)e->n_ranges - 1;
+            while (lo_i <= hi_i) {
+                int mid = (lo_i + hi_i) / 2;
+                if (cc < e->ranges[mid][0])
+                    hi_i = mid - 1;
+                else if (cc > e->ranges[mid][1])
+                    lo_i = mid + 1;
+                else
+                    return 1;
+            }
+        }
+        (void)is_anchored;
+        return 0;
+    }
+}
+
 int lre_exec(uint8_t **capture,
              const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
              int cbuf_type, void *opaque)
@@ -3332,6 +3638,20 @@ int lre_exec(uint8_t **capture,
     const uint8_t *cptr;
 
     re_flags = lre_get_flags(bc_buf);
+
+    /* 首字符预筛（见上方 lre_first_char_prefilter 注释）。
+       返回"不匹配"= -1？不——lre_exec 的返回约定：1=匹配 0=不匹配
+       （下方 ret 处理可见）。miss 时直接返回 0，语义与完整执行一致。 */
+    {
+        static int prefilter_enabled = -1;
+        if (prefilter_enabled < 0)
+            prefilter_enabled = !getenv("MININODE_NO_RE_PREFILTER");
+        if (prefilter_enabled &&
+            !lre_first_char_prefilter(bc_buf, cbuf, cindex, clen, cbuf_type,
+                                      re_flags))
+            return 0;
+    }
+
     s->is_unicode = (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
     s->capture_count = bc_buf[RE_HEADER_CAPTURE_COUNT];
     s->cbuf = cbuf;
