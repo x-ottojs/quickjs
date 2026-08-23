@@ -664,8 +664,12 @@ static inline JS_BOOL JS_IsUninitialized(JSValueConst v)
 
 static inline JS_BOOL JS_IsString(JSValueConst v)
 {
+    /* mininode slice-view：JS_TAG_STRING_SLICE 同属字符串族。漏掉它会
+       让所有走 C API 的宿主模块（Buffer.from / fs.writeFile / ...）把
+       视图当成非字符串——实测 Buffer.from(view) 返回长度 0。 */
     return JS_VALUE_GET_TAG(v) == JS_TAG_STRING ||
-        JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE;
+        JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE ||
+        JS_VALUE_GET_TAG(v) == JS_TAG_STRING_SLICE;
 }
 
 static inline JS_BOOL JS_IsSymbol(JSValueConst v)
