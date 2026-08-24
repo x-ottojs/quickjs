@@ -23938,12 +23938,67 @@ static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
     return atom;
 }
 
+/* mininode: JSON 字符串扫描标志表（参照 V8 的
+   character_json_scan_flags）。bit0 = 该字节会终止/中断普通扫描
+   （'"'、'\\'、控制字符 < 0x20、以及 >= 0x80 的非 ASCII）。
+   一次查表替代多次比较，且让"跳过普通字符"成为紧凑循环。 */
+#define JSON_SCAN_STOP 1
+static const uint8_t json_scan_flags[256] = {
+    /* 0x00-0x1F: 控制字符全部 stop */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    /* 0x20-0x2F: 0x22 = '"' */
+    0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x30-0x3F */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x40-0x4F */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x50-0x5F: 0x5C = '\\' */
+    0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,
+    /* 0x60-0x6F */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x70-0x7F */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x80-0xFF: 非 ASCII 需要 UTF-8 解码，全部 stop */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+};
+
 static int json_parse_string(JSParseState *s, const uint8_t **pp, int sep)
 {
     const uint8_t *p, *p_next;
     int i;
     uint32_t c;
     StringBuffer b_s, *b = &b_s;
+
+    /* mininode 快路径（参照 V8 ScanJsonString 的"不构造、只记区间"）：
+       用扫描表跳过普通 ASCII 字符；若在遇到结束引号之前没有碰到任何
+       转义/控制/非 ASCII 字节，则整段直接从源缓冲建串，完全跳过
+       StringBuffer 的逐字符写入。JSON 里绝大多数字符串是这种形态。 */
+    if (sep == '\"') {
+        const uint8_t *q = *pp;
+        const uint8_t *end = s->buf_end;
+        while (q < end && !json_scan_flags[*q])
+            q++;
+        if (q < end && *q == '\"') {
+            JSValue str_val = js_new_string8_len(s->ctx, (const char *)*pp,
+                                                 (int)(q - *pp));
+            if (JS_IsException(str_val))
+                return -1;
+            s->token.val = TOK_STRING;
+            s->token.u.str.sep = sep;
+            s->token.u.str.str = str_val;
+            *pp = q + 1;
+            return 0;
+        }
+        /* 有转义/非 ASCII/控制字符/未终止：落回通用路径（语义不变） */
+    }
 
     if (string_buffer_init(s->ctx, b, 32))
         goto fail;
