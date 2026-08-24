@@ -24032,7 +24032,38 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
     int radix;
     double d;
     JSATODTempMem atod_mem;
-    
+
+    /* mininode 快路径：`-?\d+`（不带小数点/指数）且位数在 int32 安全
+       范围内时，直接累加成整数并产出 JS_TAG_INT——跳过 js_atod 的通用
+       浮点解析，也避免小整数被存成 double（下游做数组索引/属性名时
+       还要再转一次）。任何不符合形态的输入原样落回通用路径。 */
+    if (!s->ext_json) {
+        const uint8_t *q = p;
+        int neg = 0;
+        if (*q == '-') { neg = 1; q++; }
+        if (is_digit(*q) && !(*q == '0' && is_digit(q[1]))) {
+            uint32_t acc = 0;
+            int ndigits = 0;
+            const uint8_t *dstart = q;
+            while (is_digit(*q) && ndigits < 9) {
+                acc = acc * 10 + (uint32_t)(*q - '0');
+                q++; ndigits++;
+            }
+            /* 只在「数字已结束」且位数 <= 9（必然落在 int32）时接受 */
+            /* -0 必须产出 -0.0（IEEE 负零），整数路径表达不了，
+               落回通用路径（实测：JSON.parse('-0') 应为 -0） */
+            if (ndigits > 0 && !is_digit(*q) && *q != '.' && *q != 'e' &&
+                *q != 'E' && !(neg && acc == 0)) {
+                (void)dstart;
+                s->token.val = TOK_NUMBER;
+                s->token.u.num.val =
+                    JS_NewInt32(s->ctx, neg ? -(int32_t)acc : (int32_t)acc);
+                *pp = q;
+                return 0;
+            }
+        }
+    }
+
     if (*p == '+' || *p == '-')
         p++;
 
@@ -24116,9 +24147,9 @@ static __exception int json_next_token(JSParseState *s)
     int c;
     JSAtom atom;
 
-    if (js_check_stack_overflow(s->ctx->rt, 0)) {
-        return js_parse_error(s, "stack overflow");
-    }
+    /* mininode: 原本每个 token 都做一次栈溢出检查，但 token 扫描本身
+       不递归——真正加深 C 栈的是 json_parse_value 进入 '{' / '[' 时的
+       递归，检查已移到那里（语义等价，深层嵌套仍被拦截）。 */
 
     free_token(s, &s->token);
 
@@ -24216,11 +24247,48 @@ static __exception int json_next_token(JSParseState *s)
             goto def_token;
         }
         break;
+    /* mininode: JSON 里标识符只可能是 true/false/null，原实现却为每一个
+       都走 json_parse_ident -> JS_NewAtomLen（atom 表哈希查找 + 可能分配
+       + 调用方 JS_FreeAtom）。直接字节比较即可。ext_json（JSON5 裸键）
+       保持原路径。缓冲区以 NUL 结尾，越界读安全。 */
+    case 'f':
+        if (!s->ext_json && p[1] == 'a' && p[2] == 'l' && p[3] == 's' &&
+            p[4] == 'e' && !lre_is_id_continue_byte(p[5])) {
+            p += 5;
+            s->token.u.ident.atom = JS_ATOM_false;
+            s->token.u.ident.has_escape = FALSE;
+            s->token.u.ident.is_reserved = FALSE;
+            s->token.val = TOK_IDENT;
+            break;
+        }
+        goto json_parse_ident_slow;
+    case 't':
+        if (!s->ext_json && p[1] == 'r' && p[2] == 'u' && p[3] == 'e' &&
+            !lre_is_id_continue_byte(p[4])) {
+            p += 4;
+            s->token.u.ident.atom = JS_ATOM_true;
+            s->token.u.ident.has_escape = FALSE;
+            s->token.u.ident.is_reserved = FALSE;
+            s->token.val = TOK_IDENT;
+            break;
+        }
+        goto json_parse_ident_slow;
+    case 'n':
+        if (!s->ext_json && p[1] == 'u' && p[2] == 'l' && p[3] == 'l' &&
+            !lre_is_id_continue_byte(p[4])) {
+            p += 4;
+            s->token.u.ident.atom = JS_ATOM_null;
+            s->token.u.ident.has_escape = FALSE;
+            s->token.u.ident.is_reserved = FALSE;
+            s->token.val = TOK_IDENT;
+            break;
+        }
+        goto json_parse_ident_slow;
     case 'a': case 'b': case 'c': case 'd':
-    case 'e': case 'f': case 'g': case 'h':
+    case 'e': case 'g': case 'h':
     case 'i': case 'j': case 'k': case 'l':
-    case 'm': case 'n': case 'o': case 'p':
-    case 'q': case 'r': case 's': case 't':
+    case 'm': case 'o': case 'p':
+    case 'q': case 'r': case 's':
     case 'u': case 'v': case 'w': case 'x':
     case 'y': case 'z':
     case 'A': case 'B': case 'C': case 'D':
@@ -24232,6 +24300,7 @@ static __exception int json_next_token(JSParseState *s)
     case 'Y': case 'Z':
     case '_':
     case '$':
+    json_parse_ident_slow:
         p++;
         atom = json_parse_ident(s, &p, c);
         if (atom == JS_ATOM_NULL)
@@ -56102,6 +56171,14 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         pr->value = JS_UNDEFINED;
     }
     
+    /* mininode: 栈溢出检查从 token 扫描搬到这里——只有进入嵌套容器才会
+       加深 C 栈（本函数递归），扫描 token 不会。 */
+    if ((s->token.val == '{' || s->token.val == '[') &&
+        js_check_stack_overflow(s->ctx->rt, 0)) {
+        js_parse_error(s, "stack overflow");
+        goto fail;
+    }
+
     switch(s->token.val) {
     case '{':
         {
