@@ -24022,6 +24022,32 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp, int sep)
                     w = sp->u.str16;
                     while (rp < rend) {
                         if (*rp < 0x80) { *w++ = *rp++; continue; }
+                        /* mininode：3 字节序列（U+0800..U+FFFF，涵盖全部
+                           CJK/假名/谚文——JSON 里最常见的非 ASCII 形态）
+                           内联展开，避开 unicode_from_utf8 的 256 路
+                           switch + 循环 + 两次范围检查。校验与通用函数
+                           等价：续字节须为 10xxxxxx，且拒绝过长编码
+                           （< 0x800）与代理区码点（D800-DFFF）。 */
+                        if ((*rp & 0xF0) == 0xE0 && rend - rp >= 3 &&
+                            (rp[1] & 0xC0) == 0x80 && (rp[2] & 0xC0) == 0x80) {
+                            /* 连续 3 字节序列成块处理：CJK 文本里这类
+                               序列往往连成一片，紧凑循环让编译器能做
+                               展开/向量化，也摊薄了外层 while 的分支。 */
+                            do {
+                                uint32_t cp3 =
+                                    ((uint32_t)(rp[0] & 0x0F) << 12) |
+                                    ((uint32_t)(rp[1] & 0x3F) << 6) |
+                                    (uint32_t)(rp[2] & 0x3F);
+                                if (cp3 < 0x800 ||
+                                    (cp3 >= 0xD800 && cp3 <= 0xDFFF))
+                                    break;  /* 非法：交给通用路径报错 */
+                                *w++ = (uint16_t)cp3;
+                                rp += 3;
+                            } while (rend - rp >= 3 && (*rp & 0xF0) == 0xE0 &&
+                                     (rp[1] & 0xC0) == 0x80 &&
+                                     (rp[2] & 0xC0) == 0x80);
+                            continue;
+                        }
                         cp = unicode_from_utf8(rp, UTF8_CHAR_LEN_MAX, &rnext);
                         if (cp > 0x10FFFF) {
                             js_free_string(s->ctx->rt, sp);
