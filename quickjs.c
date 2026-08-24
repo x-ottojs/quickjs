@@ -24061,6 +24061,20 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp, int sep)
 
     p = *pp;
     for(;;) {
+        /* mininode（参照 V8：普通段整体拷贝，逐字符只用于转义处）：
+           先用扫描表跳过一段普通 ASCII，整段一次写入缓冲。稀疏转义的
+           字符串（LLM 消息的典型形态：每几十上百字符一个 \n 或 \"）
+           因此不再为每个普通字符付一次 string_buffer_putc。 */
+        if (sep == '"') {
+            const uint8_t *run = p;
+            while (run < s->buf_end && !json_scan_flags[*run])
+                run++;
+            if (run > p) {
+                if (string_buffer_write8(b, p, (int)(run - p)))
+                    goto fail;
+                p = run;
+            }
+        }
         if (p >= s->buf_end) {
             goto end_of_input;
         }
