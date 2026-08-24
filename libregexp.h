@@ -53,6 +53,9 @@ const char *lre_get_groupnames(const uint8_t *bc_buf);
 int lre_exec(uint8_t **capture,
              const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
              int cbuf_type, void *opaque);
+/* mininode: 首字符预筛缓存的失效钩子。宿主释放正则字节码前必须调用，
+   否则新字节码复用同一地址时会误命中旧缓存条目（见实现处注释）。 */
+void lre_prefilter_invalidate(const uint8_t *bc_buf);
 
 int lre_parse_escape(const uint8_t **pp, int allow_utf16);
 

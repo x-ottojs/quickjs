@@ -3357,6 +3357,22 @@ typedef struct {
 static __thread LreFirstSetEntry lre_fs_cache[LRE_FS_CACHE_SIZE];
 static __thread uint16_t lre_fs_tick;
 
+/* 缓存失效：正则字节码即将释放时必须调用。key 是「bc 指针 + 长度和首
+   8 字节的散列」，不足以区分被释放后地址被复用的新字节码——实测
+   `/^[^`]/` 释放后 `/^[^a]/` 分配到同一地址即误命中旧 first-set，
+   把 '`' 误判为不匹配。由 quickjs.c 的 regexp 字节码释放路径调用。 */
+void lre_prefilter_invalidate(const uint8_t *bc_buf)
+{
+    int k;
+    for (k = 0; k < LRE_FS_CACHE_SIZE; k++) {
+        if (lre_fs_cache[k].bc == bc_buf) {
+            if (lre_fs_cache[k].ranges)
+                free(lre_fs_cache[k].ranges);
+            memset(&lre_fs_cache[k], 0, sizeof(lre_fs_cache[k]));
+        }
+    }
+}
+
 static uint32_t lre_fs_hash(const uint8_t *bc_buf)
 {
     uint32_t h = 2166136261u;
@@ -3419,6 +3435,12 @@ static int lre_first_set_collect(const uint8_t *bc_buf, int pc,
                     if (n >= max_ranges) return -1;
                     out[n][0] = p[k * 4] | (p[k * 4 + 1] << 8);
                     out[n][1] = p[k * 4 + 2] | (p[k * 4 + 3] << 8);
+                    /* 16 位 range 的约定（见 REOP_range 执行体）：最后一个
+                       区间的 high == 0xffff 表示 +∞，即包含所有 >= 0xffff
+                       的码点。收集端必须同样展开，否则 [^`] 之类的否定字符
+                       类会把 0x10000 以上的码点（emoji）误拒。 */
+                    if (k == cnt - 1 && out[n][1] == 0xffff)
+                        out[n][1] = 0x10FFFF;
                     n++;
                 }
                 break;
@@ -3667,13 +3689,18 @@ static int lre_first_char_prefilter(const uint8_t *bc_buf, const uint8_t *cbuf,
     if (e->n_ranges == 0xFFFF)
         return 1; /* 不可预筛 */
 
-    /* 取首字符（代理对合并；不完整代理保守放行） */
+    /* 取首字符（代理对合并；不完整代理保守放行）。
+       注意：只有 unicode 模式（u/v）才把代理对合并成码点——这与
+       lre_exec 里 `cbuf_type == 1 && is_unicode -> cbuf_type = 2` 的
+       语义必须严格一致。非 unicode 模式下引擎按单个 UTF-16 码元匹配，
+       预筛若擅自合并会把 /^\uD83C/ 之类的模式误拒。 */
     if (cbuf_type == 0) {
         c = cbuf[cindex];
     } else {
         const uint16_t *b16 = (const uint16_t *)cbuf;
         c = b16[cindex];
-        if (c >= 0xD800 && c <= 0xDBFF) {
+        if ((re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) &&
+            c >= 0xD800 && c <= 0xDBFF) {
             if (cindex + 1 < clen) {
                 uint32_t lo = b16[cindex + 1];
                 if (lo >= 0xDC00 && lo <= 0xDFFF)
