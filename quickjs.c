@@ -19577,6 +19577,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atom = get_u32(pc);
                 pc += 4;
 
+                /* mininode 快路径（profile：每字段 27ns vs node --jitless
+                   3.6ns，7.5x，全部在通用分派上）：对象字面量的场景是
+                   确定的——刚建的普通对象、属性必不存在、flags 固定
+                   C_W_E。这些条件成立时直接 add_property，跳过
+                   JS_DefineProperty 的 getter/setter/Proxy/typed-array/
+                   可扩展性/flag 合并等全部通用分支。任一条件不满足即
+                   落回原路径，语义不变。 */
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                    JSObject *p_lit = JS_VALUE_GET_OBJ(sp[-2]);
+                    if (p_lit->class_id == JS_CLASS_OBJECT &&
+                        p_lit->extensible && !p_lit->is_exotic &&
+                        p_lit->fast_array == 0) {
+                        JSShapeProperty *prs_lit;
+                        JSProperty *pr_lit;
+                        prs_lit = find_own_property(&pr_lit, p_lit, atom);
+                        if (!prs_lit) {
+                            pr_lit = add_property(ctx, p_lit, atom,
+                                                  JS_PROP_C_W_E);
+                            if (unlikely(!pr_lit))
+                                goto exception;
+                            pr_lit->u.value = sp[-1];
+                            sp--;
+                            BREAK;
+                        }
+                    }
+                }
+
                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
                                              JS_PROP_C_W_E | JS_PROP_THROW);
                 sp--;
