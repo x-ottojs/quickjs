@@ -7518,6 +7518,31 @@ void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt)
     }
 }
 
+/* mininodejs extension: expose Proxy target/handler/revoked for
+   internalBinding('util').getProxyDetails */
+int JS_GetProxyDetails(JSContext *ctx, JSValueConst obj,
+                        JSValue *target, JSValue *handler)
+{
+    JSObject *p;
+    JSProxyData *s;
+    if (!JS_IsObject(obj))
+        return -1;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_PROXY)
+        return -1;
+    s = p->u.proxy_data;
+    if (!s)
+        return -1;
+    if (s->is_revoked) {
+        if (target) *target = JS_NULL;
+        if (handler) *handler = JS_NULL;
+        return 1;
+    }
+    if (target) *target = JS_DupValue(ctx, s->target);
+    if (handler) *handler = JS_DupValue(ctx, s->handler);
+    return 0;
+}
+
 JSValue JS_GetGlobalObject(JSContext *ctx)
 {
     return JS_DupValue(ctx, ctx->global_obj);

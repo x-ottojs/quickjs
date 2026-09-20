@@ -878,6 +878,11 @@ int JS_DefinePropertyGetSet(JSContext *ctx, JSValueConst this_obj,
                             int flags);
 void JS_SetOpaque(JSValue obj, void *opaque);
 void *JS_GetOpaque(JSValueConst obj, JSClassID class_id);
+
+/* mininodejs extension: -1 not a proxy, 1 revoked, 0 live (dups values) */
+int JS_GetProxyDetails(JSContext *ctx, JSValueConst obj,
+                       JSValue *target, JSValue *handler);
+
 void *JS_GetOpaque2(JSContext *ctx, JSValueConst obj, JSClassID class_id);
 void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id);
 
