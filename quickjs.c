@@ -364,6 +364,12 @@ struct JSRuntime {
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
 
+    /* mininodejs addition (L-b): see JS_SetJobContextHooks in quickjs.h */
+    JSJobEnqueueHook *job_on_enqueue;
+    JSJobRestoreHook *job_on_restore;
+    JSJobReleaseHook *job_on_release;
+    void *job_hooks_opaque;
+
     struct list_head job_list; /* list of JSJobEntry.link */
 
     JSModuleNormalizeFunc *module_normalize_func;
@@ -958,6 +964,11 @@ typedef struct JSJobEntry {
     struct list_head link;
     JSContext *realm;
     JSJobFunc *job_func;
+    /* mininodejs addition (L-b): async-context snapshot captured by
+       job_on_enqueue at JS_EnqueueJob2 time, restored by job_on_restore
+       right before job_func runs and freed by job_on_release right after.
+       NULL if no hooks are installed or the hook returned NULL. */
+    void *ctx_snapshot;
     int argc;
     JSValue argv[0];
 } JSJobEntry;
@@ -2320,6 +2331,13 @@ static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
     for(i = 0; i < argc; i++) {
         e->argv[i] = JS_DupValue(ctx, argv[i]);
     }
+    /* mininodejs addition (L-b): capture the host's "current async context"
+       at the point this continuation is scheduled, so job_on_restore can
+       reinstall it when the continuation actually runs (possibly much
+       later, after unrelated code has run and changed whatever "current"
+       means). */
+    e->ctx_snapshot = rt->job_on_enqueue ? rt->job_on_enqueue(ctx, rt->job_hooks_opaque)
+                                          : NULL;
     list_add_tail(&e->link, &rt->job_list);
     return 0;
 }
@@ -2358,7 +2376,14 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->realm;
+    /* mininodejs addition (L-b): reinstall the async context that was
+       "current" when this job was scheduled, for the duration of the job
+       function only -- mirrors how a real call stack would see it. */
+    if (rt->job_on_restore)
+        rt->job_on_restore(ctx, e->ctx_snapshot, rt->job_hooks_opaque);
     res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
+    if (rt->job_on_release)
+        rt->job_on_release(ctx, e->ctx_snapshot, rt->job_hooks_opaque);
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
@@ -2452,6 +2477,14 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        /* mininodejs addition (L-b): a job that never got to run (runtime
+           torn down with jobs still pending) still owns a snapshot from
+           job_on_enqueue -- release it here so job_on_release is called
+           exactly once per successful job_on_enqueue, matching the
+           contract documented in quickjs.h regardless of which path a job
+           entry is destroyed through. */
+        if (rt->job_on_release)
+            rt->job_on_release(e->realm, e->ctx_snapshot, rt->job_hooks_opaque);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
         JS_FreeContext(e->realm);
@@ -60406,6 +60439,19 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt,
 {
     rt->host_promise_rejection_tracker = cb;
     rt->host_promise_rejection_tracker_opaque = opaque;
+}
+
+/* mininodejs addition (L-b): see JS_SetJobContextHooks in quickjs.h */
+void JS_SetJobContextHooks(JSRuntime *rt,
+                            JSJobEnqueueHook *on_enqueue,
+                            JSJobRestoreHook *on_restore,
+                            JSJobReleaseHook *on_release,
+                            void *opaque)
+{
+    rt->job_on_enqueue = on_enqueue;
+    rt->job_on_restore = on_restore;
+    rt->job_on_release = on_release;
+    rt->job_hooks_opaque = opaque;
 }
 
 static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,

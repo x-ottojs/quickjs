@@ -956,6 +956,48 @@ typedef void JSHostPromiseRejectionTracker(JSContext *ctx, JSValueConst promise,
                                            JS_BOOL is_handled, void *opaque);
 void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTracker *cb, void *opaque);
 
+/* Job (microtask) context propagation hooks (mininodejs addition, L-b).
+ *
+ * QuickJS enqueues promise reactions and await-continuations through a
+ * single internal mechanism (JS_EnqueueJob / the rt->job_list processed by
+ * JS_ExecutePendingJob) -- there is no other point where a host can observe
+ * "a continuation was scheduled" or "a continuation is about to run" for
+ * async control flow (await desugars to the same job queue, it is not a
+ * separate user-visible .then() call a JS-level monkeypatch could catch).
+ * This is exactly the hook AsyncLocalStorage/async_hooks need: without it,
+ * a host-side "current async context" has no way to survive a `.then()` or
+ * `await` boundary.
+ *
+ * - onEnqueue(ctx, opaque) is called synchronously inside JS_EnqueueJob2,
+ *   right when a job is queued (i.e. at the call site of the code that is
+ *   *scheduling* the continuation, so it observes whatever context is
+ *   "current" there). It must return a snapshot pointer (host-owned,
+ *   opaque to the engine) to be attached to that job, or NULL for none.
+ * - onRestore(ctx, snapshot, opaque) is called immediately before the job
+ *   function runs, with the snapshot returned by onEnqueue for that job (or
+ *   NULL if none was captured).
+ * - onRelease(ctx, snapshot, opaque) is called immediately after the job
+ *   function returns (job's context reference already dropped by then is
+ *   fine -- release only needs to free/refcount-decrement the snapshot the
+ *   host itself allocated in onEnqueue). Always called exactly once per
+ *   onEnqueue call that returned non-NULL, even if the job entry is
+ *   discarded unexecuted (e.g. JS_FreeRuntime with jobs still pending).
+ *
+ * All three are optional (any may be NULL) and default to no-ops. There is
+ * a single global slot (not per-JSContext) -- mininodejs uses one host
+ * runtime per process/worker thread, this matches the existing
+ * JS_SetHostPromiseRejectionTracker/JS_SetInterruptHandler shape (both
+ * also single global-per-JSRuntime slots).
+ */
+typedef void *JSJobEnqueueHook(JSContext *ctx, void *opaque);
+typedef void JSJobRestoreHook(JSContext *ctx, void *snapshot, void *opaque);
+typedef void JSJobReleaseHook(JSContext *ctx, void *snapshot, void *opaque);
+void JS_SetJobContextHooks(JSRuntime *rt,
+                            JSJobEnqueueHook *on_enqueue,
+                            JSJobRestoreHook *on_restore,
+                            JSJobReleaseHook *on_release,
+                            void *opaque);
+
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
